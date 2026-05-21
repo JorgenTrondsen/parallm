@@ -6,8 +6,8 @@ __pycache__/
 *.so
 *.egg
 *.egg-info/
-dist/
-build/
+/dist/
+/build/
 *.dist-info/
 
 # Virtual environment
@@ -19,11 +19,9 @@ env/
 .pytest_cache/
 .coverage
 htmlcov/
-*.pytest_cache
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
 # Editors
 .vscode/
