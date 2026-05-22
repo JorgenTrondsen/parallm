@@ -106,7 +106,21 @@ def distill_step(
     # ----- Block-wise teacher-forced MSE -----
     tm = student.text_model
     # We need to recompute student-side scaffolding (rotary, masks) once.
-    inputs_embeds = tm.embed_tokens(input_ids)
+    # `embed_tokens` lives only on the owner track; peers allocate a zero
+    # placeholder and the SyncBoundary all-reduce broadcasts the owner's
+    # embedding to every track (mirrors PTTrackTextModel.forward).
+    if tm.embed_tokens is not None:
+        inputs_embeds = tm.embed_tokens(input_ids)
+    else:
+        B, S = input_ids.shape
+        inputs_embeds = torch.zeros(
+            B,
+            S,
+            tm.config.hidden_size,
+            device=input_ids.device,
+            dtype=tm.norm.weight.dtype,
+        )
+    inputs_embeds = tm.sync_module(inputs_embeds, torch.zeros_like(inputs_embeds))
     position_ids, text_position_ids = tm._resolve_position_ids(inputs_embeds, None)
     from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask  # local import
 
@@ -146,13 +160,20 @@ def distill_step(
         prev_teacher_h = teacher_hiddens[end]
 
     # ----- Final-logit KL + LM CE (full student forward, no teacher forcing) -----
+    # All ranks call the full forward so the cross-track SyncBoundary
+    # all-reduces line up. Only the lm_head owner has logits to score; peer
+    # tracks contribute zero KL/CE for this step.
     student_logits, _ = student(
         input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=False
     )
-    kl_loss = logit_kl(
-        student_logits, teacher_logits.detach(), attention_mask=attention_mask, temperature=cfg.kl_temperature
-    )
-    ce_loss = lm_cross_entropy(student_logits, labels)
+    if student_logits is not None:
+        kl_loss = logit_kl(
+            student_logits, teacher_logits.detach(), attention_mask=attention_mask, temperature=cfg.kl_temperature
+        )
+        ce_loss = lm_cross_entropy(student_logits, labels)
+    else:
+        kl_loss = torch.zeros((), device=input_ids.device)
+        ce_loss = torch.zeros((), device=input_ids.device)
 
     total = cfg.lambda_block * block_loss + cfg.lambda_kl * kl_loss + cfg.lambda_ce * ce_loss
     return {

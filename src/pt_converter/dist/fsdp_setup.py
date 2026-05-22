@@ -49,12 +49,21 @@ def wrap_student_with_fsdp(
 
 
 def wrap_teacher_with_fsdp(
-    teacher: nn.Module,
+    text_model: nn.Module,
+    lm_head: nn.Module,
     *,
     param_dtype: torch.dtype = torch.bfloat16,
-) -> nn.Module:
-    """Shard the frozen teacher across the global group. Caller has already set
-    `requires_grad=False` and `eval()`."""
+) -> None:
+    """Shard the frozen teacher across the global group.
+
+    HookedTeacher invokes `text_model(...)` and `lm_head(...)` directly, so the
+    FSDP boundaries (which install the DTensor input-conversion hooks) must be
+    on those exact modules — not on a parent wrapper. We also shard each
+    decoder layer individually so only one layer's parameters are
+    all-gathered at a time during the forward pass.
+    """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=param_dtype)
-    fully_shard(teacher, mp_policy=mp_policy)
-    return teacher
+    for layer in text_model.layers:
+        fully_shard(layer, mp_policy=mp_policy)
+    fully_shard(text_model, mp_policy=mp_policy)
+    fully_shard(lm_head, mp_policy=mp_policy)

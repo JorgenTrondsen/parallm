@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import time
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from safetensors.torch import save_file as save_safetensors
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -93,7 +95,7 @@ def main() -> int:
         sync_layer_indices=manifest.sync_layer_indices,
     )
     teacher_model = teacher_model.to(torch.cuda.current_device())
-    wrap_teacher_with_fsdp(teacher_model)
+    wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
 
     # ----- Build per-rank student and load its track shard -----
     _log(rank, f"[init] building PT student for track {layout.track_id}…")
@@ -106,7 +108,7 @@ def main() -> int:
     )
     track_state = load_track(args.tracks_dir, layout.track_id)
     student.load_track_state_dict(track_state, strict=True)
-    student = student.to(torch.cuda.current_device())
+    student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
     wrap_student_with_fsdp(student, layout)
 
     # ----- Data -----
@@ -158,9 +160,23 @@ def main() -> int:
 
         if step > 0 and step % args.save_every == 0:
             _log(rank, f"[save] step {step}")
-            # FSDP2 full-state-dict save for the per-track shard.
-            # Each rank within a track group saves its shard; rank-0 of each track
-            # writes a combined .safetensors. Left as TODO once FSDP2 save API is finalized.
+            step_dir = Path(args.out_dir) / f"step_{step}"
+            if rank == 0:
+                step_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(
+                    Path(args.tracks_dir) / "manifest.json",
+                    step_dir / "manifest.json",
+                )
+            dist.barrier()
+            track_state = {
+                k: v.detach().contiguous().clone().cpu()
+                for k, v in student.state_dict().items()
+            }
+            save_safetensors(
+                track_state,
+                str(step_dir / f"track_{layout.track_id}.safetensors"),
+            )
+            dist.barrier()
 
         step += 1
 

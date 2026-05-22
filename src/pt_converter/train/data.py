@@ -16,7 +16,7 @@ from torch.utils.data import IterableDataset
 
 @dataclass
 class CalibrationDataConfig:
-    dataset_name: str = "wikitext"
+    dataset_name: str = "Salesforce/wikitext"
     dataset_config: str = "wikitext-103-raw-v1"
     split: str = "train"
     seq_len: int = 4096
