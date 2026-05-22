@@ -18,7 +18,6 @@ from typing import Any
 import torch
 
 from pt_converter.slicer.base import LayerSpec, SlicerSpec
-from pt_converter.slicer.qwen3_5 import decoder_layer_specs, top_level_specs
 
 
 @dataclass
@@ -92,11 +91,21 @@ def slice_model_to_tracks(
         obj = getattr(obj, part)
     text_cfg = obj
 
-    model_type = getattr(text_cfg, "model_type", None) or getattr(model.config, "model_type", "unknown")
+    # Late import to avoid a slicer→adapters→slicer cycle at module load time.
+    from pt_converter.adapters import get_adapter_for_config
+
+    adapter = get_adapter_for_config(text_cfg)
+    model_type = adapter.model_type
     num_layers = int(text_cfg.num_hidden_layers)
-    layer_types: list[str] = list(text_cfg.layer_types)
+    layer_types: list[str] = adapter.get_layer_types(text_cfg)
     if len(layer_types) != num_layers:
         raise ValueError(f"layer_types len {len(layer_types)} != num_hidden_layers {num_layers}")
+    unknown = set(layer_types) - set(adapter.valid_layer_types)
+    if unknown:
+        raise ValueError(
+            f"Adapter {model_type!r} declared valid_layer_types={adapter.valid_layer_types}, "
+            f"but config produced unknown types {sorted(unknown)}"
+        )
 
     sync_indices = _resolve_sync_schedule(num_layers, sync_block_depth)
     manifest = PTManifest(
@@ -114,7 +123,7 @@ def slice_model_to_tracks(
     # Top-level: embeddings, final norm, lm_head. These live at
     # `model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight` for
     # CausalLM wrappers. We probe both naming conventions.
-    top_specs = top_level_specs(text_cfg)
+    top_specs = adapter.top_level_specs(text_cfg)
     top_key_candidates = {
         "embed_tokens.weight": [
             "embed_tokens.weight",
@@ -152,7 +161,7 @@ def slice_model_to_tracks(
 
     for layer_idx, layer_type in enumerate(layer_types):
         prefix = f"{layers_prefix}.{layer_idx}"
-        specs = decoder_layer_specs(text_cfg, layer_type)
+        specs = adapter.layer_specs(text_cfg, layer_type)
         per_track_layer = _apply_layer_specs(source_state, prefix, specs, n_tracks, manifest)
         for t in range(n_tracks):
             for sub_key, val in per_track_layer[t].items():

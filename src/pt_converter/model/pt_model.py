@@ -4,21 +4,34 @@ One PTWrappedModel instance per *rank*. Holds the rank's track of the text
 decoder plus a (replicated) `lm_head`. Exposes a forward that returns
 `(logits, sync_hiddens)` for use by the distillation loop.
 
-This class is intentionally thin: the heavy lifting lives in
-`PTTrackTextModel`. PTWrappedModel adds the LM head and provides a
-convenience `load_track_state_dict` that consumes the slicer output.
+The model-specific decoder layer assembly is provided by a `ModelAdapter`
+(see `pt_converter.adapters`). PTWrappedModel itself holds no model-family
+knowledge: it looks up the adapter by `text_config.model_type`, calls its
+per-track config builder, and instantiates its `track_text_model_cls`.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 
 from pt_converter.model.sync import SyncBoundary
-from pt_converter.model.tracks.qwen3_5 import (
-    PTTrackTextModel,
-    PTTrackTextModelConfig,
-    build_per_track_text_config,
-)
+
+
+@dataclass
+class PTTrackTextModelConfig:
+    """The engine→adapter contract for instantiating a per-track text model.
+
+    Every adapter's `track_text_model_cls` accepts the constructor signature
+    `(per_track_text_config, pt_cfg: PTTrackTextModelConfig, sync_module: SyncBoundary)`.
+    Fields here are model-agnostic; per-track-specific dim changes live in
+    `per_track_text_config` produced by the adapter.
+    """
+
+    n_tracks: int
+    sync_after_layers: tuple[int, ...]
+    track_id: int = 0
 
 
 class PTWrappedModel(nn.Module):
@@ -32,14 +45,22 @@ class PTWrappedModel(nn.Module):
         track_group: "torch.distributed.ProcessGroup | None" = None,
     ):
         super().__init__()
-        per_track_cfg = build_per_track_text_config(text_config, n_tracks)
+        # Late import: pt_converter.adapters imports its registered adapters,
+        # which in turn import model/tracks/<model>.py — those import this
+        # module for `PTTrackTextModelConfig`. Importing the registry lazily
+        # here breaks the cycle without losing the import-time registration.
+        from pt_converter.adapters import get_adapter_for_config
+
+        adapter = get_adapter_for_config(text_config)
+        per_track_cfg = adapter.build_per_track_text_config(text_config, n_tracks)
         self.text_config = text_config
         self.per_track_text_config = per_track_cfg
         self.n_tracks = n_tracks
         self.track_id = track_id
+        self._adapter = adapter  # held for `load_track_state_dict` remap
 
         sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
-        self.text_model = PTTrackTextModel(
+        self.text_model = adapter.track_text_model_cls(
             per_track_cfg,
             PTTrackTextModelConfig(
                 n_tracks=n_tracks,
@@ -72,32 +93,35 @@ class PTWrappedModel(nn.Module):
     def load_track_state_dict(self, track_state: dict[str, torch.Tensor], strict: bool = True):
         """Load a per-track state_dict produced by `slicer.convert.slice_model_to_tracks`.
 
-        Slicer keys look like:
+        Slicer keys look like (model-agnostic top level + model-specific layer
+        sub-prefixes declared by the adapter):
             embed_tokens.weight, norm.weight, lm_head.weight,
-            layers.{i}.input_layernorm.weight,
-            layers.{i}.self_attn.q_proj.weight, ...
-            layers.{i}.linear_attn.in_proj_qkv.weight, ...
-            layers.{i}.mlp.gate_proj.weight, ...
+            layers.{i}.<adapter.state_dict_layer_prefixes[k]>.*
 
         We rewrite them to this module's namespace:
             text_model.embed_tokens.weight, text_model.norm.weight, lm_head.weight,
             text_model.layers.{i}.<...>
         """
         remapped: dict[str, torch.Tensor] = {}
+        # Top-level keys are model-agnostic.
+        top_level_remap = {
+            "embed_tokens.weight": "text_model.embed_tokens.weight",
+            "norm.weight": "text_model.norm.weight",
+            "lm_head.weight": "lm_head.weight",
+        }
         for key, val in track_state.items():
-            if key == "embed_tokens.weight":
-                remapped["text_model.embed_tokens.weight"] = val
-            elif key == "norm.weight":
-                remapped["text_model.norm.weight"] = val
-            elif key == "lm_head.weight":
-                remapped["lm_head.weight"] = val
+            if key in top_level_remap:
+                remapped[top_level_remap[key]] = val
             elif key.startswith("layers."):
+                # Every `layers.{i}.*` key is hosted under `text_model.layers.{i}.*`.
+                # The adapter's `state_dict_layer_prefixes` is informational here —
+                # the slicer only emits keys under those known prefixes anyway —
+                # but we keep the contract explicit so future custom remaps can
+                # live in one place.
                 remapped[f"text_model.{key}"] = val
             else:
                 remapped[key] = val
 
-        # The rotary_emb has no learnable weights but registers buffers; we tolerate
-        # missing keys for it. We DO want to be strict about everything else.
         missing, unexpected = self.load_state_dict(remapped, strict=False)
         if strict:
             # rotary buffer keys (e.g. text_model.rotary_emb.inv_freq) may legitimately

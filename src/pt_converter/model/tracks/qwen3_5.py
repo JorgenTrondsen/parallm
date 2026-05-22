@@ -16,7 +16,6 @@ after each layer index in `sync_after_layers`.
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -29,6 +28,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 )
 
 from pt_converter.model.sync import SyncBoundary
+from pt_converter.model.pt_model import PTTrackTextModelConfig
 
 
 def build_per_track_text_config(text_config, n_tracks: int):
@@ -61,13 +61,6 @@ def build_per_track_text_config(text_config, n_tracks: int):
     cfg.linear_num_value_heads //= n_tracks
     cfg.intermediate_size //= n_tracks
     return cfg
-
-
-@dataclass
-class PTTrackTextModelConfig:
-    n_tracks: int
-    sync_after_layers: tuple[int, ...]
-    track_id: int = 0
 
 
 class PTTrackTextModel(nn.Module):
