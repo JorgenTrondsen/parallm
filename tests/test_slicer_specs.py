@@ -9,6 +9,7 @@ from pt_converter.slicer.base import (
     FusedSegmentColwise,
     GatedQColwise,
     KVReplicatedColwise,
+    OwnerOnly,
     PerHead,
     Replicated,
     Rowwise,
@@ -46,6 +47,28 @@ def test_replicated_returns_full_copy_on_every_track():
         s = spec.slice(full, t, n_tracks=3)
         assert torch.equal(s, full)
         assert s.data_ptr() != full.data_ptr()  # cloned
+
+
+def test_owner_only_returns_full_tensor_on_owner_and_none_elsewhere():
+    spec = OwnerOnly(owner_track=0)
+    full = torch.randn(4, 4)
+    on_owner = spec.slice(full, 0, n_tracks=4)
+    assert torch.equal(on_owner, full)
+    assert on_owner.data_ptr() != full.data_ptr()
+    for t in range(1, 4):
+        assert spec.slice(full, t, n_tracks=4) is None
+
+
+def test_owner_only_reassemble_picks_unique_non_none_slice():
+    spec = OwnerOnly(owner_track=2)
+    full = torch.randn(3, 5)
+    slices = [None, None, full, None]
+    assert torch.equal(spec.reassemble(slices), full)
+
+
+def test_owner_only_per_track_shape_is_full_shape():
+    spec = OwnerOnly(owner_track=0)
+    assert spec.per_track_shape((128, 64), n_tracks=8) == (128, 64)
 
 
 def test_fused_segment_colwise_roundtrip():

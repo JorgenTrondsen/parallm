@@ -80,9 +80,14 @@ def test_n1_slice_preserves_every_value_bit_equal(tiny_model):
     # MLP
     assert torch.equal(track0["layers.3.mlp.gate_proj.weight"], state["layers.3.mlp.gate_proj.weight"])
     assert torch.equal(track0["layers.3.mlp.down_proj.weight"], state["layers.3.mlp.down_proj.weight"])
-    # Embeddings, final norm (replicated)
+    # Track 0 owns embed_tokens; final norm is replicated on every track.
     assert torch.equal(track0["embed_tokens.weight"], state["embed_tokens.weight"])
     assert torch.equal(track0["norm.weight"], state["norm.weight"])
+    # OwnerOnly: at N=1, track 0 still gets lm_head iff source has one. The
+    # tiny Qwen3_5TextModel fixture doesn't ship lm_head, so the slicer skips it.
+    assert "lm_head.weight" not in track0
+    # Manifest records embed_tokens ownership (lm_head only recorded when present).
+    assert manifest.top_level_owners.get("embed_tokens.weight") == 0
 
 
 def test_n2_round_trip_via_per_spec_reassemble(tiny_model):
@@ -124,6 +129,27 @@ def test_n2_round_trip_via_per_spec_reassemble(tiny_model):
                 assert torch.equal(spec.reassemble(track_slices), original), (
                     f"round-trip mismatch at {full_key}"
                 )
+
+
+def test_n2_embed_tokens_is_track0_only(tiny_model):
+    """OwnerOnly: at N>1, embed_tokens lives only on track 0; peer tracks omit it."""
+    n_tracks = 2
+    tracks, manifest = slice_model_to_tracks(
+        tiny_model, n_tracks=n_tracks, sync_block_depth=4, text_config_attr="config"
+    )
+    state = dict(tiny_model.state_dict())
+    # Track 0 (owner) holds the full embedding.
+    assert "embed_tokens.weight" in tracks[0]
+    assert torch.equal(tracks[0]["embed_tokens.weight"], state["embed_tokens.weight"])
+    # All other tracks omit it entirely.
+    for t in range(1, n_tracks):
+        assert "embed_tokens.weight" not in tracks[t]
+    # `norm.weight` (final RMSNorm) is replicated — present on every track.
+    for t in range(n_tracks):
+        assert "norm.weight" in tracks[t]
+        assert torch.equal(tracks[t]["norm.weight"], state["norm.weight"])
+    # Manifest records ownership for embed_tokens.
+    assert manifest.top_level_owners.get("embed_tokens.weight") == 0
 
 
 def test_sync_layer_indices_d4_on_8_layers(tiny_model):

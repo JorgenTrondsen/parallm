@@ -43,11 +43,9 @@ def main() -> int:
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
     print(f"[info] loading {args.hf_model} on {args.device} as {args.dtype}…", flush=True)
 
-    # The vision tower is loaded but we ignore it during slicing. To avoid
-    # accidentally pulling vision weights into the slicer, we load with
-    # `text_config` only via the text-only architecture if available — but for
-    # the first iteration just load the full model and pass `text_config_attr`
-    # to the slicer.
+    # AutoModelForCausalLM for Qwen3.5 returns the text-only causal model whose
+    # `.config` is already the text config (Qwen3_5TextConfig), so we point the
+    # slicer at `config` directly rather than `config.text_config`.
     model = AutoModelForCausalLM.from_pretrained(
         args.hf_model, dtype=dtype, low_cpu_mem_usage=True
     ).to(args.device)
@@ -58,7 +56,7 @@ def main() -> int:
         model,
         n_tracks=n_tracks,
         sync_block_depth=args.sync_block_depth,
-        text_config_attr="config.text_config",
+        text_config_attr="config",
     )
 
     print(f"[info] writing {len(tracks)} track shards to {args.out_dir}", flush=True)

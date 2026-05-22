@@ -17,7 +17,7 @@ from typing import Any
 
 import torch
 
-from pt_converter.slicer.base import LayerSpec, SlicerSpec
+from pt_converter.slicer.base import LayerSpec, OwnerOnly, SlicerSpec
 
 
 @dataclass
@@ -29,6 +29,10 @@ class PTManifest:
     layer_types: list[str]  # one of "full_attention" | "linear_attention"
     sync_layer_indices: list[int]  # indices *after which* an all-reduce fires
     per_track_param_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    # Maps top-level param name -> owner track id for params that live on a
+    # single track only (e.g. embed_tokens, lm_head). Absence means "every
+    # track holds this param" (replicated or sliced).
+    top_level_owners: dict[str, int] = field(default_factory=dict)
 
 
 def _resolve_sync_schedule(num_layers: int, block_depth: int) -> list[int]:
@@ -147,8 +151,14 @@ def slice_model_to_tracks(
             raise KeyError(f"Cannot find top-level param for {canonical!r}; tried {candidates}")
         weight = source_state[chosen]
         for t in range(n_tracks):
-            tracks[t][canonical] = spec.slice(weight, t, n_tracks)
-        manifest.per_track_param_shapes[canonical] = tuple(weight.shape)  # replicated -> full shape
+            sliced = spec.slice(weight, t, n_tracks)
+            if sliced is None:
+                # OwnerOnly: non-owner tracks omit the key entirely.
+                continue
+            tracks[t][canonical] = sliced
+        manifest.per_track_param_shapes[canonical] = tuple(weight.shape)
+        if isinstance(spec, OwnerOnly):
+            manifest.top_level_owners[canonical] = spec.owner_track
 
     # Per-layer slicing.
     layers_prefix_candidates = ["layers", "model.layers", "model.model.layers"]

@@ -64,11 +64,20 @@ def build_per_track_text_config(text_config, n_tracks: int):
 
 
 class PTTrackTextModel(nn.Module):
-    """One track's text decoder. Holds embed_tokens, layers, norm, and rotary.
+    """One track's text decoder. Holds layers, norm, rotary, and (on the owner
+    track only) `embed_tokens`.
 
-    The vocab/embedding/norm are full-size and replicated across tracks. Only
-    the decoder layers are per-track sliced.
+    `embed_tokens` lives on track 0 only. At forward time the owner runs the
+    embedding lookup; peer tracks allocate a zero placeholder and the existing
+    SyncBoundary broadcasts the owner's embedding to all tracks via a single
+    zero-padded all-reduce. After that point every track holds the same
+    `inputs_embeds`, and the rest of the forward proceeds as before.
+
+    The final RMSNorm (`norm`) stays replicated because every track applies it
+    to the (synced) hidden state.
     """
+
+    EMBED_OWNER_TRACK = 0
 
     def __init__(
         self,
@@ -81,11 +90,14 @@ class PTTrackTextModel(nn.Module):
         self.pt_cfg = pt_cfg
         self.sync_after = set(pt_cfg.sync_after_layers)
 
-        self.embed_tokens = nn.Embedding(
-            per_track_text_config.vocab_size,
-            per_track_text_config.hidden_size,
-            getattr(per_track_text_config, "pad_token_id", None),
-        )
+        if pt_cfg.track_id == self.EMBED_OWNER_TRACK:
+            self.embed_tokens = nn.Embedding(
+                per_track_text_config.vocab_size,
+                per_track_text_config.hidden_size,
+                getattr(per_track_text_config, "pad_token_id", None),
+            )
+        else:
+            self.embed_tokens = None
         self.layers = nn.ModuleList(
             [
                 Qwen3_5DecoderLayer(per_track_text_config, layer_idx)
@@ -125,7 +137,23 @@ class PTTrackTextModel(nn.Module):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            if self.embed_tokens is not None:
+                inputs_embeds = self.embed_tokens(input_ids)
+            else:
+                # Non-owner track: allocate a zero placeholder; the sync below
+                # fills it with the owner's embedding via the zero-padded
+                # all-reduce trick (h_pre_block=0, only owner has nonzero h_t).
+                B, S = input_ids.shape
+                inputs_embeds = torch.zeros(
+                    B,
+                    S,
+                    self.config.hidden_size,
+                    device=input_ids.device,
+                    dtype=self.norm.weight.dtype,
+                )
+            # Broadcast owner's embedding to all tracks. Degenerates to a no-op
+            # when N=1 or no track_group is configured (SyncBoundary short-circuits).
+            inputs_embeds = self.sync_module(inputs_embeds, torch.zeros_like(inputs_embeds))
 
         position_ids, text_position_ids = self._resolve_position_ids(inputs_embeds, position_ids)
 

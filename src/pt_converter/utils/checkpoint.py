@@ -40,4 +40,10 @@ def load_track(checkpoint_dir: str | Path, track_id: int) -> dict[str, torch.Ten
 def load_manifest(checkpoint_dir: str | Path) -> PTManifest:
     data = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
     shapes = {k: tuple(v) for k, v in data.pop("per_track_param_shapes").items()}
-    return PTManifest(**data, per_track_param_shapes=shapes)
+    # `top_level_owners` was added later; old manifests omit it.
+    top_level_owners = data.pop("top_level_owners", {})
+    return PTManifest(
+        **data,
+        per_track_param_shapes=shapes,
+        top_level_owners=top_level_owners,
+    )

@@ -21,6 +21,7 @@ from pt_converter.slicer.base import (
     GatedQColwise,
     KVReplicatedColwise,
     LayerSpec,
+    OwnerOnly,
     PerHead,
     Replicated,
     Rowwise,
@@ -110,10 +111,17 @@ def decoder_layer_specs(text_cfg: Any, layer_type: str) -> LayerSpec:
     return out
 
 
-def top_level_specs(text_cfg: Any) -> LayerSpec:
-    """Params that live outside any decoder layer: embeddings, final norm, lm head."""
+def top_level_specs(_text_cfg: Any) -> LayerSpec:
+    """Params that live outside any decoder layer: embeddings, final norm, lm head.
+
+    `embed_tokens` and `lm_head` live on track 0 only; the input embedding is
+    broadcast to peer tracks via the start-of-forward sync (zero-padded
+    all-reduce), and lm_head is applied locally on track 0 to the synced
+    post-final-norm hidden state. `norm.weight` stays replicated because every
+    track applies the final RMSNorm to its (synced) hidden state.
+    """
     return {
-        "embed_tokens.weight": Replicated(),
-        "norm.weight": Replicated(),  # final pre-lmhead norm
-        "lm_head.weight": Replicated(),  # we keep lm_head replicated for first iteration; gather-free
+        "embed_tokens.weight": OwnerOnly(owner_track=0),
+        "norm.weight": Replicated(),
+        "lm_head.weight": OwnerOnly(owner_track=0),
     }

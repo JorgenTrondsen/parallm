@@ -109,7 +109,7 @@ class Replicated:
     """Replicated parameter: every track holds the same full tensor.
 
     Used for norms whose statistic is per-head-dim (RMSNorm on head_dim) and
-    for embeddings / final norms outside the sync regime.
+    for final norms that operate on the synced hidden state.
     """
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
@@ -117,6 +117,37 @@ class Replicated:
 
     def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
         return slices[0].detach().clone()
+
+    def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
+        return tuple(full_shape)
+
+
+@dataclass(frozen=True)
+class OwnerOnly:
+    """Parameter that lives on exactly one track. Other tracks omit it entirely.
+
+    Used for `embed_tokens.weight` and `lm_head.weight`: the owner track does
+    the embedding lookup and the final logits projection; the embedding output
+    is broadcast to peer tracks via the existing all-reduce sync primitive
+    (zero-padded delta), and the synced post-final-norm hidden state is local
+    to every track so the owner can apply lm_head without further communication.
+
+    `slice` returns `None` on non-owner tracks; the slicer engine interprets
+    that as "skip this key" so the per-track state_dict simply omits it.
+    """
+
+    owner_track: int = 0
+
+    def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor | None:
+        if track_idx != self.owner_track:
+            return None
+        return weight.detach().clone()
+
+    def reassemble(self, slices: list[torch.Tensor | None]) -> torch.Tensor:
+        for s in slices:
+            if s is not None:
+                return s.detach().clone()
+        raise ValueError("OwnerOnly.reassemble got no non-None slices")
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         return tuple(full_shape)

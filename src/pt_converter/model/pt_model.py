@@ -35,6 +35,8 @@ class PTTrackTextModelConfig:
 
 
 class PTWrappedModel(nn.Module):
+    LM_HEAD_OWNER_TRACK = 0
+
     def __init__(
         self,
         text_config,
@@ -69,10 +71,14 @@ class PTWrappedModel(nn.Module):
             ),
             sync_module=sync_module,
         )
-        # LM head kept replicated across tracks for the first iteration.
-        # Output of the final norm is summed-and-broadcast (post final sync), so
-        # logits are computed identically on every rank.
-        self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        # lm_head lives on the owner track only. The final SyncBoundary
+        # broadcasts the post-block hidden state to all tracks, so the owner
+        # already has the correct synced state to project to logits. Peer
+        # tracks return logits=None from forward.
+        if track_id == self.LM_HEAD_OWNER_TRACK:
+            self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        else:
+            self.lm_head = None
 
     def forward(
         self,
@@ -87,7 +93,7 @@ class PTWrappedModel(nn.Module):
             position_ids=position_ids,
             return_sync_hiddens=return_sync_hiddens,
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states) if self.lm_head is not None else None
         return logits, sync_hiddens
 
     def load_track_state_dict(self, track_state: dict[str, torch.Tensor], strict: bool = True):
@@ -101,6 +107,11 @@ class PTWrappedModel(nn.Module):
         We rewrite them to this module's namespace:
             text_model.embed_tokens.weight, text_model.norm.weight, lm_head.weight,
             text_model.layers.{i}.<...>
+
+        `embed_tokens.weight` and `lm_head.weight` are present only on the owner
+        track's slicer output and only constructed on the owner track here, so
+        on peer tracks both sides simply omit them — `load_state_dict` sees them
+        neither in the input nor in `self.state_dict()` and raises nothing.
         """
         remapped: dict[str, torch.Tensor] = {}
         # Top-level keys are model-agnostic.
