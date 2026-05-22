@@ -29,7 +29,7 @@ def _tiny_config():
         intermediate_size=128,
         num_hidden_layers=8,
         num_attention_heads=4,
-        num_key_value_heads=2,
+        num_key_value_heads=1,
         head_dim=16,
         linear_num_key_heads=4,
         linear_num_value_heads=4,

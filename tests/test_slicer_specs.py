@@ -1,12 +1,14 @@
 """Unit-test each SlicerSpec on synthetic tensors."""
 from __future__ import annotations
 
+import pytest
 import torch
 
 from pt_converter.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,
+    KVReplicatedColwise,
     PerHead,
     Replicated,
     Rowwise,
@@ -73,6 +75,39 @@ def test_gated_q_colwise_round_trip():
     assert torch.equal(slices[0], full[:8])
     assert torch.equal(slices[1], full[8:])
     assert torch.equal(spec.reassemble(slices), full)
+
+
+def test_kv_replicated_groups_match_within_group():
+    """Tracks in the same kv-group must see identical slices; different groups differ."""
+    # 4 kv-heads, head_dim=8 → out_features=32. N=8 → tracks_per_kv_group=2.
+    spec = KVReplicatedColwise(num_kv_heads=4)
+    full = torch.arange(32 * 5, dtype=torch.float32).reshape(32, 5)
+    n_tracks = 8
+    slices = [spec.slice(full, t, n_tracks) for t in range(n_tracks)]
+    # tracks 0,1 → kv-group 0; tracks 2,3 → group 1; etc.
+    for g in range(4):
+        a, b = slices[g * 2], slices[g * 2 + 1]
+        assert torch.equal(a, b), f"kv-group {g} replicas differ"
+    # Different groups must hold different rows.
+    assert not torch.equal(slices[0], slices[2])
+    # reassemble with one slice per kv-group (the unique slices) reproduces the dense.
+    uniques = [slices[g * 2] for g in range(4)]
+    assert torch.equal(spec.reassemble(uniques), full)
+
+
+def test_kv_replicated_rejects_n_not_multiple_of_kv():
+    spec = KVReplicatedColwise(num_kv_heads=4)
+    full = torch.zeros(32, 5)
+    with pytest.raises(ValueError):
+        spec.slice(full, 0, n_tracks=6)
+
+
+def test_kv_replicated_per_track_shape():
+    spec = KVReplicatedColwise(num_kv_heads=4)
+    # full_shape (32, 5) -> per-track (8, 5) regardless of n_tracks.
+    assert spec.per_track_shape((32, 5), n_tracks=4) == (8, 5)
+    assert spec.per_track_shape((32, 5), n_tracks=8) == (8, 5)
+    assert spec.per_track_shape((32, 5), n_tracks=16) == (8, 5)
 
 
 def test_colwise_rejects_indivisible_dim():

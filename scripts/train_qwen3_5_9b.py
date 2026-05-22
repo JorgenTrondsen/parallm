@@ -1,8 +1,8 @@
 """torchrun entrypoint for PT distillation fine-tuning on Qwen3.5-9B.
 
-Launch (8 ranks, n_tracks=4):
+Launch (16 ranks, n_tracks=16, 2 ranks per GPU on an 8xA100 node):
 
-    torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
+    torchrun --standalone --nproc-per-node=16 scripts/train_qwen3_5_9b.py \
         --hf-model /path/to/qwen3_5_9b \
         --tracks-dir /path/to/pt_tracks \
         --max-steps 1000 \
@@ -10,9 +10,14 @@ Launch (8 ranks, n_tracks=4):
         --batch-size 1 \
         --lr 3e-5
 
+We deliberately oversubscribe GPUs (LOCAL_RANK 0..15, set_device(local_rank %
+gpu_count)) because the per-track student is small (~562M params at N=16) and
+the cross-track all-reduce is a single global op. NCCL handles two-procs-per-
+GPU on modern PyTorch.
+
 This script is intentionally minimal: distributed init, build groups, load
-sliced student + dense teacher, wrap with FSDP2, run distillation steps,
-save periodically.
+sliced student + dense teacher, wrap teacher with FSDP2, run distillation
+steps, save periodically.
 """
 from __future__ import annotations
 
@@ -60,7 +65,9 @@ def main() -> int:
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    torch.cuda.set_device(local_rank)
+    # Oversubscribe GPUs: when nproc-per-node > visible GPUs, share devices.
+    gpu_count = torch.cuda.device_count()
+    torch.cuda.set_device(local_rank % gpu_count)
     rank = dist.get_rank()
 
     # ----- Load manifest and groups -----

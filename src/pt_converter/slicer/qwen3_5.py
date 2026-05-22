@@ -19,6 +19,7 @@ from pt_converter.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,
+    KVReplicatedColwise,
     LayerSpec,
     PerHead,
     Replicated,
@@ -33,8 +34,9 @@ def full_attention_specs(text_cfg: Any) -> LayerSpec:
     return {
         # q_proj carries [q | gate] doubled along out_features per head.
         "q_proj.weight": GatedQColwise(num_heads=num_heads, head_dim=head_dim),
-        "k_proj.weight": Colwise(),  # rows = num_kv_heads * head_dim
-        "v_proj.weight": Colwise(),
+        # k/v_proj rows are per-kv-head; replicated within a kv-group across tracks.
+        "k_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv),
+        "v_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv),
         "o_proj.weight": Rowwise(),  # cols = num_heads * head_dim
         "q_norm.weight": Replicated(),  # RMSNorm on head_dim (replicated)
         "k_norm.weight": Replicated(),

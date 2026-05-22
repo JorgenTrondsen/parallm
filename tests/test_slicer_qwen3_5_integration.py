@@ -20,6 +20,7 @@ from pt_converter.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,
+    KVReplicatedColwise,
     PerHead,
     Replicated,
     Rowwise,
@@ -34,7 +35,7 @@ def _tiny_config():
         intermediate_size=128,
         num_hidden_layers=8,
         num_attention_heads=4,
-        num_key_value_heads=2,
+        num_key_value_heads=1,
         head_dim=16,
         linear_num_key_heads=4,
         linear_num_value_heads=4,
@@ -85,27 +86,44 @@ def test_n1_slice_preserves_every_value_bit_equal(tiny_model):
 
 
 def test_n2_round_trip_via_per_spec_reassemble(tiny_model):
-    """For N=2, reassembling per-spec slices must reproduce the dense weights."""
+    """For N=2 on the num_kv=1 tiny model, reassembling per-spec slices must reproduce
+    the dense weights. KV-replicated specs take one slice per kv-group (here, 1).
+    """
+    n_tracks = 2
     tracks, manifest = slice_model_to_tracks(
-        tiny_model, n_tracks=2, sync_block_depth=4, text_config_attr="config"
+        tiny_model, n_tracks=n_tracks, sync_block_depth=4, text_config_attr="config"
     )
-    assert len(tracks) == 2
+    assert len(tracks) == n_tracks
     state = dict(tiny_model.state_dict())
 
     text_cfg = tiny_model.config
     for layer_idx, layer_type in enumerate(text_cfg.layer_types):
         specs = decoder_layer_specs(text_cfg, layer_type)
         for sub_key, spec in specs.items():
-            slices = [t[f"layers.{layer_idx}.{sub_key}"] for t in tracks]
             full_key = f"layers.{layer_idx}.{sub_key}"
             original = state[full_key]
+            track_slices = [t[f"layers.{layer_idx}.{sub_key}"] for t in tracks]
             if isinstance(spec, Replicated):
-                # Each track's slice must equal the original.
-                for s in slices:
+                for s in track_slices:
                     assert torch.equal(s, original), f"replicated mismatch at {full_key}"
+            elif isinstance(spec, KVReplicatedColwise):
+                # Pick one representative per kv-group, then reassemble.
+                tracks_per_group = n_tracks // spec.num_kv_heads
+                uniques = [track_slices[g * tracks_per_group] for g in range(spec.num_kv_heads)]
+                # Sanity: replicas within a group are bit-equal.
+                for g in range(spec.num_kv_heads):
+                    base = uniques[g]
+                    for k in range(tracks_per_group):
+                        assert torch.equal(track_slices[g * tracks_per_group + k], base), (
+                            f"kv-replication mismatch at {full_key} group {g}"
+                        )
+                assert torch.equal(spec.reassemble(uniques), original), (
+                    f"KV round-trip mismatch at {full_key}"
+                )
             else:
-                reassembled = spec.reassemble(slices)
-                assert torch.equal(reassembled, original), f"round-trip mismatch at {full_key}"
+                assert torch.equal(spec.reassemble(track_slices), original), (
+                    f"round-trip mismatch at {full_key}"
+                )
 
 
 def test_sync_layer_indices_d4_on_8_layers(tiny_model):

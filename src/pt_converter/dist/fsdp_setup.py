@@ -1,13 +1,12 @@
-"""Apply FSDP2 to a per-track student. Teacher is sharded across the global group.
+"""FSDP wrapping helpers.
 
-We use the new fully_shard API from torch.distributed.fsdp (FSDP2). Each
-`Qwen3_5DecoderLayer` is wrapped individually so activation memory is
-bounded.
+Under the KV-replicated rule (world_size == n_tracks), the per-track student
+is small (~562M params for Qwen3.5-9B at N=16) and we skip intra-track FSDP
+entirely. `wrap_student_with_fsdp` is therefore a no-op that just moves the
+student to the current CUDA device.
 
-Teacher sharding strategy: a single FSDP2 wrap over the whole teacher on the
-*global* process group, frozen (`requires_grad=False`), put in eval mode.
-This minimizes per-rank teacher VRAM (~2.25GB per rank for a 9B teacher
-in bf16 sharded across 8 ranks) without any custom plumbing.
+The teacher is still FSDP-sharded across the global group so each rank only
+materializes a fraction of the 9B teacher in memory.
 """
 from __future__ import annotations
 
@@ -33,13 +32,19 @@ def wrap_student_with_fsdp(
     param_dtype: torch.dtype = torch.bfloat16,
     reduce_dtype: torch.dtype = torch.float32,
 ) -> PTWrappedModel:
-    """FSDP2-wrap each decoder layer of `student` on its intra_track_group."""
-    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-    mesh = layout.intra_track_group  # FSDP2 accepts a ProcessGroup directly via mesh-like arg
-    for layer in student.text_model.layers:
-        fully_shard(layer, mesh=mesh, mp_policy=mp_policy)
-    # Wrap the outer model so embed/norm/lm_head are also sharded.
-    fully_shard(student, mesh=mesh, mp_policy=mp_policy)
+    """No-op under the KV-replicated layout (intra_track_group is None).
+
+    Kept as a function so the training script's surface stays the same — when
+    a future model is large enough to require intra-track sharding we wire
+    that in here without touching the caller.
+    """
+    _ = (param_dtype, reduce_dtype)  # silence unused-arg lints; kept for API compatibility
+    if layout.intra_track_group is not None:
+        # Reserved path for future large-model layouts. Not used today.
+        mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+        for layer in student.text_model.layers:
+            fully_shard(layer, mesh=layout.intra_track_group, mp_policy=mp_policy)
+        fully_shard(student, mesh=layout.intra_track_group, mp_policy=mp_policy)
     return student
 
 
@@ -48,11 +53,8 @@ def wrap_teacher_with_fsdp(
     *,
     param_dtype: torch.dtype = torch.bfloat16,
 ) -> nn.Module:
-    """Frozen-teacher FSDP wrap across the default (global) group.
-
-    Caller should already have set requires_grad=False on every teacher param
-    and put it in eval mode. We do not reduce grads on the teacher.
-    """
+    """Shard the frozen teacher across the global group. Caller has already set
+    `requires_grad=False` and `eval()`."""
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=param_dtype)
     fully_shard(teacher, mp_policy=mp_policy)
     return teacher

@@ -182,6 +182,67 @@ class FusedSegmentColwise:
 
 
 @dataclass(frozen=True)
+class KVReplicatedColwise:
+    """Slice an out-dim that is per-kv-head, with replication across tracks in a kv-group.
+
+    Used for `k_proj.weight` and `v_proj.weight` in GQA full-attention when we
+    push N above num_kv_heads. Track `t` belongs to kv-group
+    `g = t // (n_tracks // num_kv_heads)`; it stores rows
+    `[g*chunk : (g+1)*chunk]` where `chunk = weight.shape[dim] // num_kv_heads`.
+    Every track in the same kv-group therefore holds an *identical* slice.
+
+    Constraints:
+      - n_tracks must be a multiple of num_kv_heads (so the kv-group factor
+        `tracks_per_kv_group = n_tracks // num_kv_heads` is integer).
+      - weight.shape[dim] must be divisible by num_kv_heads.
+
+    `reassemble` returns the concatenation of the *unique* per-group slices
+    (one per kv-group), reconstructing the dense tensor. Caller is expected
+    to either (a) drop duplicate tracks within each group before calling, or
+    (b) pass exactly one slice per kv-group.
+    """
+
+    num_kv_heads: int
+    dim: int = 0
+
+    def _chunk(self, weight_shape: tuple[int, ...]) -> int:
+        size = weight_shape[self.dim]
+        if size % self.num_kv_heads != 0:
+            raise ValueError(
+                f"KVReplicatedColwise: dim {self.dim} size {size} not divisible by "
+                f"num_kv_heads {self.num_kv_heads}"
+            )
+        return size // self.num_kv_heads
+
+    def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
+        if n_tracks % self.num_kv_heads != 0:
+            raise ValueError(
+                f"KVReplicatedColwise: n_tracks {n_tracks} must be a multiple of "
+                f"num_kv_heads {self.num_kv_heads}"
+            )
+        chunk = self._chunk(tuple(weight.shape))
+        tracks_per_group = n_tracks // self.num_kv_heads
+        g = track_idx // tracks_per_group
+        return weight.narrow(self.dim, g * chunk, chunk).contiguous()
+
+    def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
+        # `slices` is one unique slice per kv-group (length == num_kv_heads).
+        if len(slices) != self.num_kv_heads:
+            raise ValueError(
+                f"KVReplicatedColwise.reassemble expects exactly {self.num_kv_heads} "
+                f"unique slices (one per kv-group), got {len(slices)}"
+            )
+        return torch.cat(slices, dim=self.dim).contiguous()
+
+    def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
+        # Every track in the same kv-group sees the same shape; n_tracks is
+        # accepted for interface uniformity but not used.
+        out = list(full_shape)
+        out[self.dim] = full_shape[self.dim] // self.num_kv_heads
+        return tuple(out)
+
+
+@dataclass(frozen=True)
 class GatedQColwise:
     """Slice Qwen3.5's doubled `q_proj` whose output carries [q_h0, gate_h0, q_h1, gate_h1, ...]
     interleaved per head (size: num_heads * 2 * head_dim along dim 0).

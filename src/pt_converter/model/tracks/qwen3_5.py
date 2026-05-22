@@ -32,12 +32,23 @@ from pt_converter.model.sync import SyncBoundary
 
 
 def build_per_track_text_config(text_config, n_tracks: int):
-    """Deep-copy `text_config` and divide every sliceable dim by `n_tracks`."""
+    """Deep-copy `text_config` and apply the KV-replicated per-track sizing.
+
+    Under the KV-replicated rule:
+      - num_attention_heads //= n_tracks (each track holds 1 or more q-heads)
+      - num_key_value_heads = 1 (each track holds exactly one replicated kv-head
+        from its kv-group; the dense num_kv must satisfy `n_tracks % num_kv == 0`)
+      - linear_num_*_heads //= n_tracks (no replication needed; SSM heads divide)
+      - intermediate_size //= n_tracks
+    """
     cfg = copy.deepcopy(text_config)
     if cfg.num_attention_heads % n_tracks != 0:
         raise ValueError(f"num_attention_heads {cfg.num_attention_heads} not divisible by {n_tracks}")
-    if cfg.num_key_value_heads % n_tracks != 0:
-        raise ValueError(f"num_key_value_heads {cfg.num_key_value_heads} not divisible by {n_tracks}")
+    if n_tracks % cfg.num_key_value_heads != 0:
+        raise ValueError(
+            f"n_tracks {n_tracks} must be a multiple of num_key_value_heads {cfg.num_key_value_heads} "
+            f"(KV-replicated rule)"
+        )
     if cfg.linear_num_key_heads % n_tracks != 0:
         raise ValueError(f"linear_num_key_heads {cfg.linear_num_key_heads} not divisible by {n_tracks}")
     if cfg.linear_num_value_heads % n_tracks != 0:
@@ -45,7 +56,7 @@ def build_per_track_text_config(text_config, n_tracks: int):
     if cfg.intermediate_size % n_tracks != 0:
         raise ValueError(f"intermediate_size {cfg.intermediate_size} not divisible by {n_tracks}")
     cfg.num_attention_heads //= n_tracks
-    cfg.num_key_value_heads //= n_tracks
+    cfg.num_key_value_heads = 1  # one replicated kv-head per track
     cfg.linear_num_key_heads //= n_tracks
     cfg.linear_num_value_heads //= n_tracks
     cfg.intermediate_size //= n_tracks
