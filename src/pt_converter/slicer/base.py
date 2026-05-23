@@ -17,7 +17,14 @@ import torch
 
 
 class SlicerSpec(Protocol):
-    """Protocol for a slicing rule. Each spec knows how to slice and reassemble."""
+    """Protocol for a slicing rule. Each spec knows how to slice and reassemble.
+
+    Specs may optionally implement ``replication_groups(n_tracks)`` to declare
+    that some tracks hold *identical* slices and therefore must share a gradient
+    during training. Specs that don't implement it are treated as fully unique
+    per track (one singleton group per track). See
+    ``pt_converter.train.sync_grads.get_replication_groups`` for the dispatch.
+    """
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor: ...
 
@@ -121,6 +128,10 @@ class Replicated:
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         return tuple(full_shape)
 
+    def replication_groups(self, n_tracks: int) -> list[list[int]]:
+        # Every track holds the same tensor; one group spanning all tracks.
+        return [list(range(n_tracks))]
+
 
 @dataclass(frozen=True)
 class OwnerOnly:
@@ -151,6 +162,10 @@ class OwnerOnly:
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         return tuple(full_shape)
+
+    def replication_groups(self, n_tracks: int) -> list[list[int]]:
+        # The param lives on exactly one track. No gradient sync needed.
+        return [[self.owner_track]]
 
 
 @dataclass(frozen=True)
@@ -271,6 +286,15 @@ class KVReplicatedColwise:
         out = list(full_shape)
         out[self.dim] = full_shape[self.dim] // self.num_kv_heads
         return tuple(out)
+
+    def replication_groups(self, n_tracks: int) -> list[list[int]]:
+        if n_tracks % self.num_kv_heads != 0:
+            raise ValueError(
+                f"KVReplicatedColwise.replication_groups: n_tracks {n_tracks} "
+                f"must be a multiple of num_kv_heads {self.num_kv_heads}"
+            )
+        tpg = n_tracks // self.num_kv_heads
+        return [[g * tpg + i for i in range(tpg)] for g in range(self.num_kv_heads)]
 
 
 @dataclass(frozen=True)

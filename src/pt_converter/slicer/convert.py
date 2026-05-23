@@ -35,6 +35,29 @@ class PTManifest:
     top_level_owners: dict[str, int] = field(default_factory=dict)
 
 
+def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
+    """Map canonical per-track parameter names → SlicerSpec for the whole model.
+
+    Canonical names match the keys the slicer engine emits into per-track
+    state_dicts and records in ``PTManifest.per_track_param_shapes``:
+
+      - top-level: ``embed_tokens.weight``, ``norm.weight``, ``lm_head.weight``
+      - per-layer: ``layers.{i}.<sub_key>``
+
+    This function is the model-agnostic spec resolver used by ``slice_model_to_tracks``
+    and by the training-time replication-group planner in
+    ``pt_converter.train.sync_grads``. It does NOT load or slice any weights.
+    """
+    out: dict[str, SlicerSpec] = {}
+    for canonical, spec in adapter.top_level_specs(text_cfg).items():
+        out[canonical] = spec
+    layer_types: list[str] = adapter.get_layer_types(text_cfg)
+    for layer_idx, layer_type in enumerate(layer_types):
+        for sub_key, spec in adapter.layer_specs(text_cfg, layer_type).items():
+            out[f"layers.{layer_idx}.{sub_key}"] = spec
+    return out
+
+
 def _resolve_sync_schedule(num_layers: int, block_depth: int) -> list[int]:
     """Return layer indices after which a sync boundary fires.
 

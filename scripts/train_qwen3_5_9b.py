@@ -40,11 +40,17 @@ from safetensors.torch import save_file as save_safetensors
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from pt_converter.adapters import get_adapter_for_config
 from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
 from pt_converter.dist.groups import build_groups
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.train.data import CalibrationDataConfig, PackedTokenStream
 from pt_converter.train.distill import DistillConfig, distill_step, validate_step
+from pt_converter.train.sync_grads import (
+    assert_replicated_consistent,
+    build_replication_plan,
+    sync_replicated_grads,
+)
 from pt_converter.train.teacher import HookedTeacher
 from pt_converter.utils.checkpoint import load_manifest, load_track
 
@@ -145,6 +151,19 @@ def main() -> int:
     student.load_track_state_dicts(track_states, strict=True)
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
     wrap_student_with_fsdp(student, layout)
+
+    # ----- Replicated-parameter gradient sync -----
+    # Norms (Replicated) and KV projections (KVReplicatedColwise when
+    # n_tracks > num_kv_heads) hold bit-identical copies across multiple
+    # tracks. Without intervention each copy drifts under its own gradient.
+    # We average gradients within each replication group every step so the
+    # copies remain identical forever.
+    adapter = get_adapter_for_config(cfg.text_config)
+    replication_plan = build_replication_plan(
+        student, adapter=adapter, text_cfg=cfg.text_config, layout=layout
+    )
+    assert_replicated_consistent(replication_plan)
+    _log(rank, f"[init] replication plan: {len(replication_plan)} groups synced per step")
 
     # ----- Data -----
     tok = AutoTokenizer.from_pretrained(args.hf_model)
@@ -259,6 +278,7 @@ def main() -> int:
         optim.zero_grad(set_to_none=True)
         losses = distill_step(student, teacher, batch, distill_cfg)
         losses["total"].backward()
+        sync_replicated_grads(replication_plan)
         optim.step()
         if scheduler is not None:
             scheduler.step()
