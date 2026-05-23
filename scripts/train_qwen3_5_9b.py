@@ -1,19 +1,25 @@
 """torchrun entrypoint for PT distillation fine-tuning on Qwen3.5-9B.
 
-Launch (16 ranks, n_tracks=16, 2 ranks per GPU on an 8xA100 node):
+Launch: one rank per visible GPU. The K = n_tracks / world_size tracks each
+rank owns are hosted inside a single PTWrappedModel; cross-track sync is a
+(local-sum across K) + (NCCL all-reduce across ranks) — no oversubscribed
+NCCL communicators (NCCL ≥ 2.19 rejects those).
 
-    torchrun --standalone --nproc-per-node=16 scripts/train_qwen3_5_9b.py \
-        --hf-model /path/to/qwen3_5_9b \
+Single node, 8 GPUs, n_tracks=16  →  K=2 per rank:
+
+    torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
+        --hf-model /home2/jtr020/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
         --tracks-dir /path/to/pt_tracks \
         --max-steps 1000 \
         --seq-len 4096 \
         --batch-size 1 \
         --lr 3e-5
 
-We deliberately oversubscribe GPUs (LOCAL_RANK 0..15, set_device(local_rank %
-gpu_count)) because the per-track student is small (~562M params at N=16) and
-the cross-track all-reduce is a single global op. NCCL handles two-procs-per-
-GPU on modern PyTorch.
+Two nodes × 8 GPUs, n_tracks=16  →  K=1 per rank:
+
+    torchrun --nnodes=2 --node-rank=$NODE_RANK --master-addr=$MASTER_ADDR \
+        --master-port=$MASTER_PORT --nproc-per-node=8 \
+        scripts/train_qwen3_5_9b.py ...
 
 This script is intentionally minimal: distributed init, build groups, load
 sliced student + dense teacher, wrap teacher with FSDP2, run distillation
@@ -84,16 +90,25 @@ def main() -> int:
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    # Oversubscribe GPUs: when nproc-per-node > visible GPUs, share devices.
     gpu_count = torch.cuda.device_count()
-    torch.cuda.set_device(local_rank % gpu_count)
+    if local_rank >= gpu_count:
+        raise RuntimeError(
+            f"LOCAL_RANK {local_rank} >= visible GPU count {gpu_count}. "
+            f"Launch with --nproc-per-node <= #GPUs (one rank per GPU); "
+            f"K = n_tracks / world_size tracks are hosted per rank."
+        )
+    torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
 
     # ----- Load manifest and groups -----
     manifest = load_manifest(args.tracks_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
-    _log(rank, f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} D={manifest.sync_block_depth}")
-    _log(rank, f"[init] rank={rank} track_id={layout.track_id} intra_track_rank={layout.intra_track_rank}")
+    _log(
+        rank,
+        f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
+        f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
+    )
+    _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
 
     # ----- Load teacher (dense) -----
     cfg = AutoConfig.from_pretrained(args.hf_model)
@@ -114,20 +129,20 @@ def main() -> int:
     teacher_model = teacher_model.to(torch.cuda.current_device())
     wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
 
-    # ----- Build per-rank student and load its track shard -----
-    _log(rank, f"[init] building PT student for track {layout.track_id}…")
+    # ----- Build per-rank student and load its K track shards -----
+    _log(rank, f"[init] building PT student for tracks {layout.local_track_ids}…")
     student = PTWrappedModel(
         text_config=cfg.text_config,
         n_tracks=manifest.n_tracks,
-        track_id=layout.track_id,
+        local_track_ids=layout.local_track_ids,
         sync_after_layers=manifest.sync_layer_indices,
         track_group=layout.track_group,
     )
     state_src = args.resume_from if args.resume_from else args.tracks_dir
     if args.resume_from:
         _log(rank, f"[init] resuming track state from {args.resume_from}")
-    track_state = load_track(state_src, layout.track_id)
-    student.load_track_state_dict(track_state, strict=True)
+    track_states = {tid: load_track(state_src, tid) for tid in layout.local_track_ids}
+    student.load_track_state_dicts(track_states, strict=True)
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
     wrap_student_with_fsdp(student, layout)
 
@@ -176,7 +191,13 @@ def main() -> int:
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
     def save_checkpoint(name: str):
-        """Per-rank track save into <out-dir>/<name>/."""
+        """Per-rank K-track save into <out-dir>/<name>/.
+
+        Each rank writes one ``track_{tid}.safetensors`` per local track in
+        the slicer's on-disk key format (``embed_tokens.weight``,
+        ``norm.weight``, ``layers.{i}.*``, plus ``lm_head.weight`` on the
+        owner). Together the world covers all n_tracks shards.
+        """
         ck_dir = Path(args.out_dir) / name
         if rank == 0:
             ck_dir.mkdir(parents=True, exist_ok=True)
@@ -185,14 +206,19 @@ def main() -> int:
                 ck_dir / "manifest.json",
             )
         dist.barrier()
-        track_state = {
-            k: v.detach().contiguous().clone().cpu()
-            for k, v in student.state_dict().items()
-        }
-        save_safetensors(
-            track_state,
-            str(ck_dir / f"track_{layout.track_id}.safetensors"),
-        )
+        full_sd = student.state_dict()
+        for k, tid in enumerate(layout.local_track_ids):
+            prefix = f"text_models.{k}."
+            track_state: dict[str, torch.Tensor] = {}
+            for key, val in full_sd.items():
+                if key.startswith(prefix):
+                    sub = key[len(prefix):]
+                    track_state[sub] = val.detach().contiguous().clone().cpu()
+            if tid == PTWrappedModel.LM_HEAD_OWNER_TRACK and "lm_head.weight" in full_sd:
+                track_state["lm_head.weight"] = (
+                    full_sd["lm_head.weight"].detach().contiguous().clone().cpu()
+                )
+            save_safetensors(track_state, str(ck_dir / f"track_{tid}.safetensors"))
         dist.barrier()
 
     def run_eval() -> float:

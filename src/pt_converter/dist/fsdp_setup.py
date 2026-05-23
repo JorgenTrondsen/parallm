@@ -1,12 +1,13 @@
 """FSDP wrapping helpers.
 
-Under the KV-replicated rule (world_size == n_tracks), the per-track student
-is small (~562M params for Qwen3.5-9B at N=16) and we skip intra-track FSDP
-entirely. `wrap_student_with_fsdp` is therefore a no-op that just moves the
-student to the current CUDA device.
+With one rank per GPU and K = n_tracks / world_size tracks hosted per rank,
+the per-rank student is still small (≈ K × 562M params for Qwen3.5-9B at
+N=16) and we skip intra-track FSDP entirely. `wrap_student_with_fsdp` is
+therefore a no-op that just leaves the student on the current CUDA device.
 
-The teacher is still FSDP-sharded across the global group so each rank only
-materializes a fraction of the 9B teacher in memory.
+The teacher is FSDP-sharded across the world group (one rank per GPU, so
+the communicator is duplicate-free and NCCL-clean), and each rank only
+materializes a 1/world_size fraction of the dense teacher.
 """
 from __future__ import annotations
 
@@ -32,18 +33,18 @@ def wrap_student_with_fsdp(
     param_dtype: torch.dtype = torch.bfloat16,
     reduce_dtype: torch.dtype = torch.float32,
 ) -> PTWrappedModel:
-    """No-op under the KV-replicated layout (intra_track_group is None).
+    """No-op today (intra_track_group is None).
 
-    Kept as a function so the training script's surface stays the same — when
-    a future model is large enough to require intra-track sharding we wire
-    that in here without touching the caller.
+    Kept as a function so the training script's surface stays the same. The
+    reserved branch below shards each local track's layers across an
+    intra-track group if a future layout introduces one.
     """
     _ = (param_dtype, reduce_dtype)  # silence unused-arg lints; kept for API compatibility
     if layout.intra_track_group is not None:
-        # Reserved path for future large-model layouts. Not used today.
         mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
-        for layer in student.text_model.layers:
-            fully_shard(layer, mesh=layout.intra_track_group, mp_policy=mp_policy)
+        for tm in student.text_models:
+            for layer in tm.layers:
+                fully_shard(layer, mesh=layout.intra_track_group, mp_policy=mp_policy)
         fully_shard(student, mesh=layout.intra_track_group, mp_policy=mp_policy)
     return student
 
@@ -54,7 +55,7 @@ def wrap_teacher_with_fsdp(
     *,
     param_dtype: torch.dtype = torch.bfloat16,
 ) -> None:
-    """Shard the frozen teacher across the global group.
+    """Shard the frozen teacher across the world group (one rank per GPU).
 
     HookedTeacher invokes `text_model(...)` and `lm_head(...)` directly, so the
     FSDP boundaries (which install the DTensor input-conversion hooks) must be

@@ -40,7 +40,7 @@ class ModelAdapter:
     build_per_track_text_config: Callable[[Any, int], Any]
     # ----- State-dict remap -----
     # Sub-module prefixes (under `layers.{i}.*`) that the slicer emits and
-    # that need to be re-routed under `text_model.layers.{i}.*` at load time.
+    # that need to be re-routed under `text_models.{k}.layers.{i}.*` at load time.
     state_dict_layer_prefixes: tuple[str, ...]
 
 

@@ -1,15 +1,17 @@
-"""Process-group layout for PT training (KV-replicated, N=num_attention_heads).
+"""Process-group layout for PT training.
 
-Layout under the new rule:
-  - world_size = n_tracks (e.g., 16 for Qwen3.5-9B)
-  - track_id = rank (one rank per track)
-  - track_group = dist.group.WORLD (every cross-track sync is a global all-reduce)
+Layout:
+  - one rank per visible GPU (no oversubscription — NCCL 2.19+ rejects
+    communicators that contain two ranks pinned to the same physical device)
+  - each rank hosts ``tracks_per_rank = n_tracks // world_size`` tracks
+  - rank ``r`` owns the contiguous block ``[r*K, r*K+1, ..., r*K+K-1]``
+    (keeps track 0 — the embed/lm_head owner — on rank 0)
+  - track_group = dist.group.WORLD; the cross-rank all-reduce in SyncBoundary
+    spans world_size ranks, after a local sum across the K local tracks
   - intra_track_group = None (per-track student is small enough to skip FSDP)
 
-For 8-GPU nodes running 16 ranks, 2 ranks share a GPU via
-`torch.cuda.set_device(local_rank % torch.cuda.device_count())`. NCCL handles
-this fine on modern PyTorch; the launcher script is responsible for the
-device-set call.
+Multi-node: ``world_size = nnodes * nproc_per_node`` = total GPUs across the
+job. Standard torchrun, nothing custom.
 """
 from __future__ import annotations
 
@@ -23,39 +25,40 @@ class ProcessGroupLayout:
     world_size: int
     rank: int
     n_tracks: int
-    intra_track_size: int  # always 1 under the new layout
-    track_id: int
-    intra_track_rank: int  # always 0 under the new layout
-    intra_track_group: "dist.ProcessGroup | None"  # always None under the new layout
-    track_group: "dist.ProcessGroup | None"  # = WORLD under the new layout
+    tracks_per_rank: int
+    local_track_ids: tuple[int, ...]
+    track_group: "dist.ProcessGroup | None"  # = WORLD
+    intra_track_size: int  # always 1 today
+    intra_track_rank: int  # always 0 today
+    intra_track_group: "dist.ProcessGroup | None"  # always None today
 
 
 def build_groups(n_tracks: int) -> ProcessGroupLayout:
-    """Construct the (degenerate) intra/track group layout for this process.
+    """Construct the per-rank track layout.
 
-    Under the KV-replicated rule, world_size == n_tracks, intra_track_size == 1,
-    and the track_group is the world group. We keep the function signature for
-    forward compatibility with future layouts that may re-introduce intra-track
-    sharding for very large models.
+    Requires ``n_tracks % world_size == 0``. Each rank owns a contiguous block
+    of ``K = n_tracks // world_size`` track ids; rank 0 always owns track 0.
     """
     if not dist.is_initialized():
         raise RuntimeError("dist.init_process_group must be called before build_groups()")
     world_size = dist.get_world_size()
     rank = dist.get_rank()
-    if world_size != n_tracks:
+    if n_tracks % world_size != 0:
         raise ValueError(
-            f"world_size {world_size} != n_tracks {n_tracks}. Under the KV-replicated rule "
-            f"every rank is one track; launch with --nproc-per-node={n_tracks} "
-            f"(potentially > GPU count; ranks share GPUs via set_device(local_rank % gpus))."
+            f"n_tracks {n_tracks} not divisible by world_size {world_size}. "
+            f"Launch with --nproc-per-node*--nnodes evenly dividing {n_tracks}."
         )
+    tracks_per_rank = n_tracks // world_size
+    local_track_ids = tuple(range(rank * tracks_per_rank, (rank + 1) * tracks_per_rank))
 
     return ProcessGroupLayout(
         world_size=world_size,
         rank=rank,
         n_tracks=n_tracks,
+        tracks_per_rank=tracks_per_rank,
+        local_track_ids=local_track_ids,
+        track_group=dist.group.WORLD,
         intra_track_size=1,
-        track_id=rank,
         intra_track_rank=0,
         intra_track_group=None,
-        track_group=dist.group.WORLD,
     )

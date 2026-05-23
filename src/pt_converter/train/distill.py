@@ -6,7 +6,9 @@ Implements the loop described in the plan:
    sync boundaries plus final logits.
 2. For each PT block (group of D student layers between syncs):
    - Feed the *teacher's* pre-block hidden state into the student's block.
-   - Student runs D layers locally and the SyncBoundary all-reduces deltas.
+   - Each of the rank's K local tracks runs D layers locally; one
+     SyncBoundary call combines (local-sum across K) + (NCCL all-reduce
+     across the world) to produce the synced post-block hidden.
    - block_MSE(student_post_block, teacher_post_block).
    Backprop each block independently (memory-bounded, mirrors SPD's
    block-to-block formulation).
@@ -44,8 +46,6 @@ def _block_ranges(num_layers: int, sync_indices: tuple[int, ...]) -> list[tuple[
     for idx in sync_indices:
         ranges.append((prev_end + 1, idx))
         prev_end = idx
-    # If the last sync isn't at num_layers-1, we'd have a trailing block — for
-    # our D=4/32-layer case the last sync IS at layer 31, so this is a no-op.
     if prev_end != num_layers - 1:
         ranges.append((prev_end + 1, num_layers - 1))
     return ranges
@@ -60,29 +60,36 @@ def _run_student_block(
     text_position_ids,
     causal_mask,
     linear_attn_mask,
-):
-    """Run student layers [start..end_inclusive] *without* the sync at the end.
+) -> list[torch.Tensor]:
+    """Run student layers [start..end_inclusive] on each of the K local tracks.
 
-    Returns (h_out_pre_sync, h_in) so the caller can call sync_module(h_out, h_in).
+    Every track starts from the same `h_in` (the synced pre-block hidden).
+    Returns the K post-block tensors (one per local track), without sync.
+    The caller calls `student.sync_module(h_post_list, h_in)` once to produce
+    the single synced post-block tensor.
     """
-    tm = student.text_model
-    hidden_states = h_in
+    per_track_h = [h_in for _ in student.text_models]
     for layer_idx in range(start, end_inclusive + 1):
-        layer = tm.layers[layer_idx]
-        layer_mask = (
-            linear_attn_mask
-            if tm.config.layer_types[layer_idx] == "linear_attention"
-            else causal_mask
-        )
-        hidden_states = layer(
-            hidden_states,
-            position_embeddings=position_embeddings,
-            attention_mask=layer_mask,
-            position_ids=text_position_ids,
-            past_key_values=None,
-            use_cache=False,
-        )
-    return hidden_states
+        new_h: list[torch.Tensor] = []
+        for k, tm in enumerate(student.text_models):
+            layer = tm.layers[layer_idx]
+            layer_mask = (
+                linear_attn_mask
+                if tm.config.layer_types[layer_idx] == "linear_attention"
+                else causal_mask
+            )
+            new_h.append(
+                layer(
+                    per_track_h[k],
+                    position_embeddings=position_embeddings,
+                    attention_mask=layer_mask,
+                    position_ids=text_position_ids,
+                    past_key_values=None,
+                    use_cache=False,
+                )
+            )
+        per_track_h = new_h
+    return per_track_h
 
 
 def distill_step(
@@ -104,28 +111,32 @@ def distill_step(
     teacher_logits, teacher_hiddens = teacher.forward(input_ids, attention_mask=attention_mask)
 
     # ----- Block-wise teacher-forced MSE -----
-    tm = student.text_model
-    # We need to recompute student-side scaffolding (rotary, masks) once.
-    # `embed_tokens` lives only on the owner track; peers allocate a zero
-    # placeholder and the SyncBoundary all-reduce broadcasts the owner's
-    # embedding to every track (mirrors PTTrackTextModel.forward).
-    if tm.embed_tokens is not None:
-        inputs_embeds = tm.embed_tokens(input_ids)
-    else:
-        B, S = input_ids.shape
-        inputs_embeds = torch.zeros(
-            B,
-            S,
-            tm.config.hidden_size,
-            device=input_ids.device,
-            dtype=tm.norm.weight.dtype,
-        )
-    inputs_embeds = tm.sync_module(inputs_embeds, torch.zeros_like(inputs_embeds))
-    position_ids, text_position_ids = tm._resolve_position_ids(inputs_embeds, None)
+    # Embedding broadcast: owner runs embed_tokens; peers contribute zeros.
+    # The sync_module local-sum-then-all-reduce delivers the owner's embedding
+    # to every track.
+    embeds_per_track: list[torch.Tensor] = []
+    for tm in student.text_models:
+        if tm.embed_tokens is not None:
+            embeds_per_track.append(tm.embed_tokens(input_ids))
+        else:
+            B, S = input_ids.shape
+            embeds_per_track.append(
+                torch.zeros(
+                    B,
+                    S,
+                    tm.config.hidden_size,
+                    device=input_ids.device,
+                    dtype=tm.norm.weight.dtype,
+                )
+            )
+    inputs_embeds = student.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+
+    tm0 = student.text_models[0]
+    position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
     from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask  # local import
 
     causal_mask = create_causal_mask(
-        config=tm.config,
+        config=tm0.config,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,
         past_key_values=None,
@@ -134,18 +145,18 @@ def distill_step(
     linear_attn_mask = (
         None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
     )
-    position_embeddings = tm.rotary_emb(inputs_embeds, position_ids)
+    position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
 
     block_loss = torch.zeros((), device=input_ids.device)
-    ranges = _block_ranges(len(tm.layers), cfg.sync_layer_indices)
-    # The first block reads `inputs_embeds` (the embedding output, same on every
-    # rank because embed_tokens is replicated). Subsequent blocks read the
+    ranges = _block_ranges(len(tm0.layers), cfg.sync_layer_indices)
+    # The first block reads `inputs_embeds` (the embedding output, identical
+    # on every rank after the broadcast). Subsequent blocks read the
     # *teacher's* post-block hidden state at the previous sync index.
     prev_teacher_h = inputs_embeds
     for start, end in ranges:
-        h_post = _run_student_block(
+        h_post_list = _run_student_block(
             student,
-            prev_teacher_h.detach(),  # teacher forcing: feed teacher's pre-block hidden
+            prev_teacher_h.detach(),  # teacher forcing
             start,
             end,
             position_embeddings,
@@ -153,7 +164,7 @@ def distill_step(
             causal_mask,
             linear_attn_mask,
         )
-        h_synced = tm.sync_module(h_post, prev_teacher_h.detach())
+        h_synced = student.sync_module(h_post_list, prev_teacher_h.detach())
         block_loss = block_loss + block_mse(
             h_synced, teacher_hiddens[end].detach(), attention_mask=attention_mask
         )
@@ -161,8 +172,8 @@ def distill_step(
 
     # ----- Final-logit KL + LM CE (full student forward, no teacher forcing) -----
     # All ranks call the full forward so the cross-track SyncBoundary
-    # all-reduces line up. Only the lm_head owner has logits to score; peer
-    # tracks contribute zero KL/CE for this step.
+    # all-reduces line up. Only the rank that owns track 0 has lm_head; peer
+    # ranks contribute zero KL/CE for this step.
     student_logits, _ = student(
         input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=False
     )
@@ -192,9 +203,10 @@ def validate_step(
     """Forward-only LM CE on a held-out batch.
 
     All ranks call the full student forward so the cross-track SyncBoundary
-    all-reduces match; only the lm_head owner has logits and computes CE,
-    peer tracks return a zero placeholder. The caller is responsible for
-    aggregating across ranks (typically all_reduce SUM, since peers are 0).
+    all-reduces match; only the rank that owns track 0 has lm_head and
+    computes CE — peer ranks return a zero placeholder. The caller is
+    responsible for aggregating across ranks (typically all_reduce SUM,
+    since peers are 0).
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")

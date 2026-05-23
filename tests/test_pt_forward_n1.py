@@ -3,7 +3,7 @@
 When n_tracks=1, the SyncBoundary becomes a no-op, so the PT model is
 mathematically identical to the dense model with the same weights. Any drift
 indicates a bug in:
-- slicer reassembly (key remapping in load_track_state_dict),
+- slicer reassembly (key remapping in load_track_state_dicts),
 - per-track decoder-layer construction (build_per_track_text_config),
 - the order in which we apply ops in PTTrackTextModel.forward.
 
@@ -63,12 +63,12 @@ def test_n1_matches_dense_forward():
     pt = PTWrappedModel(
         text_config=cfg,
         n_tracks=1,
-        track_id=0,
+        local_track_ids=(0,),
         sync_after_layers=manifest.sync_layer_indices,
         track_group=None,
     )
     pt.eval()
-    pt.load_track_state_dict(tracks[0], strict=False)
+    pt.load_track_state_dicts({0: tracks[0]}, strict=False)
 
     # Same input.
     torch.manual_seed(123)
@@ -95,19 +95,19 @@ def test_n1_returns_sync_hiddens_at_correct_depths():
     pt = PTWrappedModel(
         text_config=cfg,
         n_tracks=1,
-        track_id=0,
+        local_track_ids=(0,),
         sync_after_layers=manifest.sync_layer_indices,
         track_group=None,
     )
     pt.eval()
-    pt.load_track_state_dict(tracks[0], strict=False)
+    pt.load_track_state_dicts({0: tracks[0]}, strict=False)
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 16))
     attention_mask = torch.ones((1, 16), dtype=torch.long)
     with torch.no_grad():
         _, sync_hiddens = pt(input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=True)
 
-    # Two sync points (after layer 3 and layer 7) -> two captures.
-    assert len(sync_hiddens) == 2
-    for h in sync_hiddens:
+    # Two sync points (after layer 3 and layer 7) -> two captures, keyed by layer_idx.
+    assert set(sync_hiddens.keys()) == {3, 7}
+    for h in sync_hiddens.values():
         assert h.shape == (1, 16, cfg.hidden_size)

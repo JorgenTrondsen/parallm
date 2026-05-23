@@ -1,8 +1,11 @@
 """PTWrappedModel: the user-facing per-rank model.
 
-One PTWrappedModel instance per *rank*. Holds the rank's track of the text
-decoder plus a (replicated) `lm_head`. Exposes a forward that returns
-`(logits, sync_hiddens)` for use by the distillation loop.
+One PTWrappedModel instance per *rank*. Holds the K = tracks_per_rank tracks
+this rank owns (as `nn.ModuleList` of per-track text models) plus (on the
+rank that owns track 0) the shared `lm_head`. Exposes a forward that runs
+all K tracks lockstep through the layers, driving cross-track sync at the
+configured sync points, and returns `(logits, sync_hiddens)` for the
+distillation loop.
 
 The model-specific decoder layer assembly is provided by a `ModelAdapter`
 (see `pt_converter.adapters`). PTWrappedModel itself holds no model-family
@@ -12,6 +15,7 @@ per-track config builder, and instantiates its `track_text_model_cls`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 from torch import nn
@@ -42,7 +46,7 @@ class PTWrappedModel(nn.Module):
         text_config,
         *,
         n_tracks: int,
-        track_id: int,
+        local_track_ids: Sequence[int],
         sync_after_layers: list[int],
         track_group: "torch.distributed.ProcessGroup | None" = None,
     ):
@@ -58,24 +62,30 @@ class PTWrappedModel(nn.Module):
         self.text_config = text_config
         self.per_track_text_config = per_track_cfg
         self.n_tracks = n_tracks
-        self.track_id = track_id
-        self._adapter = adapter  # held for `load_track_state_dict` remap
+        self.local_track_ids = tuple(local_track_ids)
+        self.sync_after_layers = tuple(sync_after_layers)
+        self._adapter = adapter  # held for `load_track_state_dicts` remap
 
-        sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
-        self.text_model = adapter.track_text_model_cls(
-            per_track_cfg,
-            PTTrackTextModelConfig(
-                n_tracks=n_tracks,
-                sync_after_layers=tuple(sync_after_layers),
-                track_id=track_id,
-            ),
-            sync_module=sync_module,
+        self.sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
+        self.text_models = nn.ModuleList(
+            [
+                adapter.track_text_model_cls(
+                    per_track_cfg,
+                    PTTrackTextModelConfig(
+                        n_tracks=n_tracks,
+                        sync_after_layers=tuple(sync_after_layers),
+                        track_id=tid,
+                    ),
+                    sync_module=self.sync_module,
+                )
+                for tid in self.local_track_ids
+            ]
         )
         # lm_head lives on the owner track only. The final SyncBoundary
-        # broadcasts the post-block hidden state to all tracks, so the owner
-        # already has the correct synced state to project to logits. Peer
-        # tracks return logits=None from forward.
-        if track_id == self.LM_HEAD_OWNER_TRACK:
+        # broadcasts the post-block hidden state to all tracks, so whichever
+        # rank hosts the owner already has the correct synced state to
+        # project to logits. Peer ranks return logits=None from forward.
+        if self.LM_HEAD_OWNER_TRACK in self.local_track_ids:
             self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
         else:
             self.lm_head = None
@@ -87,59 +97,127 @@ class PTWrappedModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         return_sync_hiddens: bool = False,
     ):
-        hidden_states, sync_hiddens = self.text_model(
-            input_ids=input_ids,
+        # Local import: keeps the engine model-family-agnostic at import time.
+        from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
+        # 1. Embed (owner only) + cross-track broadcast via the zero-padded sync.
+        embeds_per_track: list[torch.Tensor] = []
+        for tm in self.text_models:
+            if tm.embed_tokens is not None:
+                embeds_per_track.append(tm.embed_tokens(input_ids))
+            else:
+                B, S = input_ids.shape
+                embeds_per_track.append(
+                    torch.zeros(
+                        B,
+                        S,
+                        tm.config.hidden_size,
+                        device=input_ids.device,
+                        dtype=tm.norm.weight.dtype,
+                    )
+                )
+        h = self.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+
+        # 2. Scaffolding (rotary, masks) computed once — every track's per-track
+        # config is identical, so reuse the first track's modules.
+        tm0 = self.text_models[0]
+        position_ids_resolved, text_position_ids = tm0._resolve_position_ids(h, position_ids)
+        causal_mask = create_causal_mask(
+            config=tm0.config,
+            inputs_embeds=h,
             attention_mask=attention_mask,
-            position_ids=position_ids,
-            return_sync_hiddens=return_sync_hiddens,
+            past_key_values=None,
+            position_ids=text_position_ids,
         )
-        logits = self.lm_head(hidden_states) if self.lm_head is not None else None
+        linear_attn_mask = (
+            None
+            if (attention_mask is not None and torch.all(attention_mask == 1))
+            else attention_mask
+        )
+        position_embeddings = tm0.rotary_emb(h, position_ids_resolved)
+
+        # 3. Lockstep layer iteration with per-block syncs.
+        block_start = h
+        sync_set = set(self.sync_after_layers)
+        sync_hiddens: dict[int, torch.Tensor] = {} if return_sync_hiddens else None
+        per_track_h = [block_start for _ in self.text_models]
+        for layer_idx in range(len(tm0.layers)):
+            new_h: list[torch.Tensor] = []
+            for k, tm in enumerate(self.text_models):
+                layer = tm.layers[layer_idx]
+                mask = (
+                    linear_attn_mask
+                    if tm.config.layer_types[layer_idx] == "linear_attention"
+                    else causal_mask
+                )
+                new_h.append(
+                    layer(
+                        per_track_h[k],
+                        position_embeddings=position_embeddings,
+                        attention_mask=mask,
+                        position_ids=text_position_ids,
+                        past_key_values=None,
+                        use_cache=False,
+                    )
+                )
+            per_track_h = new_h
+            if layer_idx in sync_set:
+                h = self.sync_module(per_track_h, block_start)
+                block_start = h
+                per_track_h = [h for _ in self.text_models]
+                if sync_hiddens is not None:
+                    sync_hiddens[layer_idx] = h
+
+        h = tm0.norm(h)
+        logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, sync_hiddens
 
-    def load_track_state_dict(self, track_state: dict[str, torch.Tensor], strict: bool = True):
-        """Load a per-track state_dict produced by `slicer.convert.slice_model_to_tracks`.
+    def load_track_state_dicts(
+        self,
+        track_states: dict[int, dict[str, torch.Tensor]],
+        strict: bool = True,
+    ) -> None:
+        """Load per-track shards into the K local text_models (and lm_head if owned).
 
-        Slicer keys look like (model-agnostic top level + model-specific layer
-        sub-prefixes declared by the adapter):
-            embed_tokens.weight, norm.weight, lm_head.weight,
-            layers.{i}.<adapter.state_dict_layer_prefixes[k]>.*
-
-        We rewrite them to this module's namespace:
-            text_model.embed_tokens.weight, text_model.norm.weight, lm_head.weight,
-            text_model.layers.{i}.<...>
-
-        `embed_tokens.weight` and `lm_head.weight` are present only on the owner
-        track's slicer output and only constructed on the owner track here, so
-        on peer tracks both sides simply omit them — `load_state_dict` sees them
-        neither in the input nor in `self.state_dict()` and raises nothing.
+        ``track_states`` keys must be exactly ``self.local_track_ids``. Each
+        value is the per-track state_dict emitted by
+        ``slicer.convert.slice_model_to_tracks`` (top-level keys like
+        ``embed_tokens.weight``, ``norm.weight``, ``lm_head.weight``, and
+        ``layers.{i}.<adapter-prefix>.*``). We rewrite into the namespaces
+        ``text_models.{k}.embed_tokens.weight`` / ``.norm.weight`` /
+        ``.layers.{i}.*`` and the rank-shared ``lm_head.weight``.
         """
+        provided = set(track_states.keys())
+        expected = set(self.local_track_ids)
+        if provided != expected:
+            raise ValueError(
+                f"load_track_state_dicts expected track ids {sorted(expected)}, "
+                f"got {sorted(provided)}"
+            )
+
         remapped: dict[str, torch.Tensor] = {}
-        # Top-level keys are model-agnostic.
-        top_level_remap = {
-            "embed_tokens.weight": "text_model.embed_tokens.weight",
-            "norm.weight": "text_model.norm.weight",
-            "lm_head.weight": "lm_head.weight",
-        }
-        for key, val in track_state.items():
-            if key in top_level_remap:
-                remapped[top_level_remap[key]] = val
-            elif key.startswith("layers."):
-                # Every `layers.{i}.*` key is hosted under `text_model.layers.{i}.*`.
-                # The adapter's `state_dict_layer_prefixes` is informational here —
-                # the slicer only emits keys under those known prefixes anyway —
-                # but we keep the contract explicit so future custom remaps can
-                # live in one place.
-                remapped[f"text_model.{key}"] = val
-            else:
-                remapped[key] = val
+        for k, tid in enumerate(self.local_track_ids):
+            track_state = track_states[tid]
+            prefix = f"text_models.{k}."
+            for key, val in track_state.items():
+                if key == "embed_tokens.weight":
+                    remapped[prefix + "embed_tokens.weight"] = val
+                elif key == "norm.weight":
+                    remapped[prefix + "norm.weight"] = val
+                elif key == "lm_head.weight":
+                    # Owner only; routed to the rank-shared head.
+                    remapped["lm_head.weight"] = val
+                elif key.startswith("layers."):
+                    remapped[prefix + key] = val
+                else:
+                    remapped[prefix + key] = val
 
         missing, unexpected = self.load_state_dict(remapped, strict=False)
         if strict:
-            # rotary buffer keys (e.g. text_model.rotary_emb.inv_freq) may legitimately
-            # be missing — they're computed at init. Filter those out before erroring.
+            # rotary buffer keys (e.g. text_models.{k}.rotary_emb.inv_freq) may
+            # legitimately be missing — they're computed at init.
             missing_critical = [k for k in missing if "rotary_emb" not in k]
             if missing_critical or unexpected:
                 raise RuntimeError(
-                    f"load_track_state_dict mismatch:\n  missing={missing_critical}\n  unexpected={unexpected}"
+                    f"load_track_state_dicts mismatch:\n  missing={missing_critical}\n  unexpected={unexpected}"
                 )
-        return missing, unexpected

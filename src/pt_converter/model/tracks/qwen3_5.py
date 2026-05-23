@@ -10,8 +10,11 @@ its `Qwen3_5GatedDeltaNet` with proportionally fewer linear k/v heads, and its
 The hidden_size, vocab_size, head_dim, and norms remain full size — the
 residual stream is full hidden_size on every track.
 
-The forward mirrors `Qwen3_5TextModel.forward` and inserts a SyncBoundary
-after each layer index in `sync_after_layers`.
+Cross-track sync is driven from `PTWrappedModel.forward`, which runs all K
+local tracks lockstep and calls `SyncBoundary` once per sync point. This
+module's own `forward` is a plain layer-stack forward (no sync), kept only
+for direct introspection / debugging of a single track's layer stack — the
+training loop does not invoke it.
 """
 from __future__ import annotations
 
@@ -67,14 +70,12 @@ class PTTrackTextModel(nn.Module):
     """One track's text decoder. Holds layers, norm, rotary, and (on the owner
     track only) `embed_tokens`.
 
-    `embed_tokens` lives on track 0 only. At forward time the owner runs the
-    embedding lookup; peer tracks allocate a zero placeholder and the existing
-    SyncBoundary broadcasts the owner's embedding to all tracks via a single
-    zero-padded all-reduce. After that point every track holds the same
-    `inputs_embeds`, and the rest of the forward proceeds as before.
+    `embed_tokens` lives on track 0 only. The cross-track broadcast of the
+    embedding and the per-block syncs are driven externally by
+    `PTWrappedModel.forward`, not from this module's `forward`.
 
-    The final RMSNorm (`norm`) stays replicated because every track applies it
-    to the (synced) hidden state.
+    The final RMSNorm (`norm`) is held by every track but only ever applied
+    to the synced hidden state (via `PTWrappedModel.forward`).
     """
 
     EMBED_OWNER_TRACK = 0
@@ -88,7 +89,6 @@ class PTTrackTextModel(nn.Module):
         super().__init__()
         self.config = per_track_text_config
         self.pt_cfg = pt_cfg
-        self.sync_after = set(pt_cfg.sync_after_layers)
 
         if pt_cfg.track_id == self.EMBED_OWNER_TRACK:
             self.embed_tokens = nn.Embedding(
@@ -108,6 +108,8 @@ class PTTrackTextModel(nn.Module):
             per_track_text_config.hidden_size, eps=per_track_text_config.rms_norm_eps
         )
         self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=per_track_text_config)
+        # Held only so adapter-contract consumers can inspect it; this module
+        # does not invoke sync_module from its own forward.
         self.sync_module = sync_module
 
     def _resolve_position_ids(self, inputs_embeds, position_ids):
@@ -132,28 +134,21 @@ class PTTrackTextModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        return_sync_hiddens: bool = False,
     ):
+        """Plain per-track layer-stack forward, no cross-track sync.
+
+        Not used by `PTWrappedModel.forward` (the training path) — kept for
+        direct inspection of a single track's stack. Owner-only embed lookup;
+        callers handling peer tracks must pass `inputs_embeds` directly.
+        """
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
-            if self.embed_tokens is not None:
-                inputs_embeds = self.embed_tokens(input_ids)
-            else:
-                # Non-owner track: allocate a zero placeholder; the sync below
-                # fills it with the owner's embedding via the zero-padded
-                # all-reduce trick (h_pre_block=0, only owner has nonzero h_t).
-                B, S = input_ids.shape
-                inputs_embeds = torch.zeros(
-                    B,
-                    S,
-                    self.config.hidden_size,
-                    device=input_ids.device,
-                    dtype=self.norm.weight.dtype,
+            if self.embed_tokens is None:
+                raise ValueError(
+                    "This track has no embed_tokens (non-owner); pass inputs_embeds explicitly."
                 )
-            # Broadcast owner's embedding to all tracks. Degenerates to a no-op
-            # when N=1 or no track_group is configured (SyncBoundary short-circuits).
-            inputs_embeds = self.sync_module(inputs_embeds, torch.zeros_like(inputs_embeds))
+            inputs_embeds = self.embed_tokens(input_ids)
 
         position_ids, text_position_ids = self._resolve_position_ids(inputs_embeds, position_ids)
 
@@ -164,8 +159,6 @@ class PTTrackTextModel(nn.Module):
             past_key_values=None,
             position_ids=text_position_ids,
         )
-        # For training (no cache, full attention_mask), the linear-attn mask path
-        # collapses to None when attention_mask is all-ones. Mirror that here.
         if attention_mask is not None and torch.all(attention_mask == 1):
             linear_attn_mask = None
         else:
@@ -174,8 +167,6 @@ class PTTrackTextModel(nn.Module):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        sync_hiddens: list[torch.Tensor] = []
-        h_pre_block = hidden_states  # snapshot for delta-sync
         for layer_idx, decoder_layer in enumerate(self.layers):
             layer_mask = (
                 linear_attn_mask
@@ -190,11 +181,5 @@ class PTTrackTextModel(nn.Module):
                 past_key_values=None,
                 use_cache=False,
             )
-            if layer_idx in self.sync_after:
-                hidden_states = self.sync_module(hidden_states, h_pre_block)
-                if return_sync_hiddens:
-                    sync_hiddens.append(hidden_states)
-                h_pre_block = hidden_states
 
-        hidden_states = self.norm(hidden_states)
-        return hidden_states, sync_hiddens
+        return self.norm(hidden_states)

@@ -57,8 +57,8 @@ def _smoke_config():
 
 
 def _run_block(student, h_in, start, end_inclusive, position_embeddings, text_position_ids, causal_mask, linear_attn_mask):
-    """Run student.text_model.layers[start..end_inclusive] starting from h_in."""
-    tm = student.text_model
+    """Run student.text_models[0].layers[start..end_inclusive] starting from h_in."""
+    tm = student.text_models[0]
     h = h_in
     for layer_idx in range(start, end_inclusive + 1):
         layer = tm.layers[layer_idx]
@@ -99,11 +99,11 @@ def test_n8_manual_sync_forward_produces_finite_bounded_output():
         st = PTWrappedModel(
             text_config=cfg,
             n_tracks=n_tracks,
-            track_id=t,
+            local_track_ids=(t,),
             sync_after_layers=manifest.sync_layer_indices,
             track_group=None,
         ).eval()
-        st.load_track_state_dict(tracks[t], strict=False)
+        st.load_track_state_dicts({t: tracks[t]}, strict=False)
         students.append(st)
 
     # Shared input.
@@ -112,7 +112,7 @@ def test_n8_manual_sync_forward_produces_finite_bounded_output():
 
     # Pre-compute the rotary/mask scaffolding *once* on student[0] (it's the
     # same for every track because they all share the per-track text config).
-    tm0 = students[0].text_model
+    tm0 = students[0].text_models[0]
     inputs_embeds = tm0.embed_tokens(input_ids)
     position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
     from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask  # local import
@@ -152,7 +152,7 @@ def test_n8_manual_sync_forward_produces_finite_bounded_output():
             h_pre = h_pre + delta_sum
 
         # Final norm + lm_head (replicated across tracks; use student[0]).
-        h_final = students[0].text_model.norm(h_pre)
+        h_final = students[0].text_models[0].norm(h_pre)
         pt_logits = students[0].lm_head(h_final)
 
         # Dense reference.
