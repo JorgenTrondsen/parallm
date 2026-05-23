@@ -182,3 +182,28 @@ def distill_step(
         "kl": kl_loss.detach(),
         "ce": ce_loss.detach(),
     }
+
+
+@torch.no_grad()
+def validate_step(
+    student: PTWrappedModel,
+    batch: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Forward-only LM CE on a held-out batch.
+
+    All ranks call the full student forward so the cross-track SyncBoundary
+    all-reduces match; only the lm_head owner has logits and computes CE,
+    peer tracks return a zero placeholder. The caller is responsible for
+    aggregating across ranks (typically all_reduce SUM, since peers are 0).
+    """
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+    labels = batch["labels"]
+    student_logits, _ = student(
+        input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=False
+    )
+    if student_logits is not None:
+        ce = lm_cross_entropy(student_logits, labels)
+    else:
+        ce = torch.zeros((), device=input_ids.device)
+    return {"ce": ce}
