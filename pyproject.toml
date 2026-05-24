@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+eval = ["lm-eval>=0.4,<0.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
