@@ -117,6 +117,38 @@ def test_assert_replicated_consistent_detects_drift():
         assert_replicated_consistent([cg])
 
 
+def test_bucketed_sync_matches_unbucketed():
+    """Two replication groups with different group_sizes must end up with
+    the same per-group averaged gradient regardless of whether the sync
+    flows through one collective per group or one bucketed concat. Tests
+    the post-bucket per-slice divide path."""
+    # Group A: 2 members, group_size=2 (fully local).
+    a0, a1 = _make_params(2, seed=11)
+    a0.grad = torch.full((4, 4), 6.0)
+    a1.grad = torch.full((4, 4), 2.0)
+    # Group B: 4 members, group_size=4 (fully local).
+    b0, b1, b2, b3 = _make_params(4, seed=12)
+    b0.grad = torch.full((4, 4), 1.0)
+    b1.grad = torch.full((4, 4), 2.0)
+    b2.grad = torch.full((4, 4), 3.0)
+    b3.grad = torch.full((4, 4), 6.0)
+
+    plan = [
+        ReplicationCoordGroup(local_params=[a0, a1], process_group=None, group_size=2),
+        ReplicationCoordGroup(local_params=[b0, b1, b2, b3], process_group=None, group_size=4),
+    ]
+    sync_replicated_grads(plan)
+
+    # A: (6+2)/2 = 4.0 across both members.
+    assert torch.equal(a0.grad, torch.full((4, 4), 4.0))
+    assert torch.equal(a1.grad, torch.full((4, 4), 4.0))
+    # B: (1+2+3+6)/4 = 3.0 across all four members.
+    assert torch.equal(b0.grad, torch.full((4, 4), 3.0))
+    assert torch.equal(b1.grad, torch.full((4, 4), 3.0))
+    assert torch.equal(b2.grad, torch.full((4, 4), 3.0))
+    assert torch.equal(b3.grad, torch.full((4, 4), 3.0))
+
+
 def test_sync_handles_multiple_groups_independently():
     # Two separate replication groups should be averaged independently.
     a0, a1 = _make_params(2, seed=1)
@@ -171,6 +203,7 @@ def _make_single_rank_layout(n_tracks: int):
         n_tracks=n_tracks,
         tracks_per_rank=n_tracks,
         local_track_ids=tuple(range(n_tracks)),
+        track_to_rank=(0,) * n_tracks,
         track_group=None,
         intra_track_size=1,
         intra_track_rank=0,
@@ -227,6 +260,63 @@ def test_build_replication_plan_on_tiny_qwen3_5_n4():
     # 1 full-attention layer × (q_norm + k_norm + k_proj + v_proj) = 4
     # Total = 16
     assert len(plan) == 16
+
+
+def test_asymmetric_layout_track_to_rank_lookup():
+    """Non-uniform K layout (rank 0 hosts fewer tracks because it also owns
+    embed/lm_head). Verify the pure assignment helper produces the expected
+    track_to_rank and local_track_ids, and that a replication group spanning
+    multiple ranks resolves to the right rank-set via the new lookup —
+    matching what sync_grads.build_replication_plan does at line 143."""
+    from pt_converter.dist.groups import compute_contiguous_assignment
+
+    n_tracks = 16
+    world_size = 8
+    k_list = [1, 3, 2, 2, 2, 2, 2, 2]  # rank 0 sheds tracks 1 onto rank 1
+    assert sum(k_list) == n_tracks
+    assert len(k_list) == world_size
+
+    # Expected ownership (contiguous): rank 0 → {0}, rank 1 → {1,2,3},
+    # rank 2 → {4,5}, …, rank 7 → {14,15}.
+    expected_track_to_rank = (
+        0,                           # track 0
+        1, 1, 1,                     # tracks 1-3
+        2, 2, 3, 3, 4, 4, 5, 5,      # tracks 4-11
+        6, 6, 7, 7,                  # tracks 12-15
+    )
+    expected_local = {
+        0: (0,),
+        1: (1, 2, 3),
+        2: (4, 5),
+        3: (6, 7),
+        4: (8, 9),
+        5: (10, 11),
+        6: (12, 13),
+        7: (14, 15),
+    }
+    for r in range(world_size):
+        local_ids, track_to_rank = compute_contiguous_assignment(k_list, r)
+        assert track_to_rank == expected_track_to_rank, f"rank {r} track_to_rank mismatch"
+        assert local_ids == expected_local[r], f"rank {r} local_track_ids mismatch"
+
+    # Simulate the rank-set computation that sync_grads.build_replication_plan
+    # performs for each replication group. The old formula `t // K` (assuming
+    # uniform K=2) would break under this k_list — verify the new lookup
+    # gives the right set on a group that actually diverges.
+    track_to_rank = expected_track_to_rank
+    # KV-replicated group with n_kv_heads=8: pairs of contiguous tracks. The
+    # pair {0,1} straddles rank 0 (track 0) and rank 1 (track 1) under k_list,
+    # but `t // 2` would put both on rank 0.
+    pair = [0, 1]
+    ranks_in_g = tuple(sorted({track_to_rank[t] for t in pair}))
+    naive = tuple(sorted({t // 2 for t in pair}))
+    assert ranks_in_g == (0, 1)
+    assert naive == (0,)  # the formula sync_grads used to use — wrong here
+    assert ranks_in_g != naive, "regression check: formulas must actually diverge"
+
+    # A Replicated group spans all 16 tracks → must include every rank.
+    full_group = list(range(n_tracks))
+    assert tuple(sorted({track_to_rank[t] for t in full_group})) == tuple(range(world_size))
 
 
 def test_build_then_sync_then_step_keeps_replicas_identical():

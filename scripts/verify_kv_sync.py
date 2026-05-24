@@ -40,6 +40,7 @@ from pt_converter.train.distill import DistillConfig, distill_step
 from pt_converter.train.sync_grads import (
     assert_replicated_consistent,
     build_replication_plan,
+    compute_global_grad_norm,
     sync_replicated_grads,
 )
 from pt_converter.train.teacher import HookedTeacher
@@ -164,6 +165,7 @@ def main() -> int:
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=0.0,
+        foreach=False,
     )
     distill_cfg = DistillConfig(
         sync_layer_indices=tuple(manifest.sync_layer_indices),
@@ -183,9 +185,18 @@ def main() -> int:
             batch = {k: v.unsqueeze(0) for k, v in batch.items()}
 
         optim.zero_grad(set_to_none=True)
+        # distill_step backwards each block internally; gradients accumulate.
         losses = distill_step(student, teacher, batch, distill_cfg)
-        losses["total"].backward()
         sync_replicated_grads(plan)
+        # Mirror the trainer: replication-aware global grad norm + clip. The
+        # all-reduced norm gives the same clip coefficient on every rank, so
+        # replicated copies stay bit-identical through the scaling.
+        total_norm = compute_global_grad_norm(student, plan)
+        if torch.isfinite(total_norm):
+            clip_coef = (1.0 / (total_norm + 1e-6)).clamp(max=1.0)
+            for pp in student.parameters():
+                if pp.grad is not None:
+                    pp.grad.mul_(clip_coef)
         optim.step()
 
         _log(

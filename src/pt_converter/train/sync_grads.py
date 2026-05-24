@@ -124,9 +124,9 @@ def build_replication_plan(
          instances and the appropriate process group.
     """
     n_tracks = layout.n_tracks
-    K = layout.tracks_per_rank
     world_size = layout.world_size
     rank = layout.rank
+    track_to_rank = layout.track_to_rank
 
     spec_map = resolve_param_specs(adapter, text_cfg)
 
@@ -140,7 +140,7 @@ def build_replication_plan(
         for g in groups:
             if len(g) <= 1:
                 continue
-            ranks_in_g = tuple(sorted({t // K for t in g}))
+            ranks_in_g = tuple(sorted({track_to_rank[t] for t in g}))
             plan_specs.append((canonical_name, list(g), ranks_in_g))
             if ranks_in_g not in seen:
                 seen.add(ranks_in_g)
@@ -195,6 +195,76 @@ def build_replication_plan(
     return plan
 
 
+def compute_global_grad_norm(
+    student: nn.Module,
+    plan: list[ReplicationCoordGroup],
+) -> torch.Tensor:
+    """Global L2 gradient norm over the logical model, deduplicated and world-reduced.
+
+    Each replication group contributes its synced ``|g|²`` exactly once: every
+    local copy in a group contributes ``|g|² / group_size`` to the local sum,
+    so the world all-reduce yields ``group_size × (|g|²/group_size) = |g|²``
+    per group. Unique sliced parameters contribute their local ``|g|²`` with
+    weight 1. The returned scalar is identical on every rank, so a clip
+    coefficient derived from it scales every replicated copy by the same
+    factor — the bit-equality invariant survives the clip.
+
+    Must be called *after* ``sync_replicated_grads`` so every member of a
+    replication group already holds the same synced gradient. Returns a 0-d
+    fp32 tensor on this rank's device.
+    """
+    replicated_denom: dict[int, float] = {}
+    for cg in plan:
+        for p in cg.local_params:
+            replicated_denom[id(p)] = float(cg.group_size)
+
+    sum_sq: "torch.Tensor | None" = None
+    for p in student.parameters():
+        if p.grad is None:
+            continue
+        sq = p.grad.detach().float().pow(2).sum()
+        denom = replicated_denom.get(id(p), 1.0)
+        if denom != 1.0:
+            sq = sq / denom
+        sum_sq = sq if sum_sq is None else sum_sq + sq
+
+    if sum_sq is None:
+        # No grads on this rank — still participate in the collective so peers don't hang.
+        device = next(student.parameters()).device
+        sum_sq = torch.zeros((), device=device, dtype=torch.float32)
+
+    if dist.is_initialized():
+        dist.all_reduce(sum_sq, op=dist.ReduceOp.SUM)
+
+    return sum_sq.sqrt()
+
+
+def _bucket_groups_by_pg_dtype(
+    plan: list[ReplicationCoordGroup],
+) -> list[tuple["dist.ProcessGroup | None", torch.dtype, list[ReplicationCoordGroup]]]:
+    """Group plan entries that can share a single all_reduce.
+
+    Two groups can be coalesced when they target the same process group and
+    their gradient dtypes match. Order within a bucket is preserved (matters
+    for the flat-concat split on the receiving side: every rank must lay out
+    the bucket in the same order, which is guaranteed because the plan is
+    constructed deterministically across ranks).
+    """
+    buckets: dict[
+        tuple[int, torch.dtype],
+        tuple["dist.ProcessGroup | None", torch.dtype, list[ReplicationCoordGroup]],
+    ] = {}
+    for cg in plan:
+        if not cg.local_params:
+            continue
+        dtype = cg.local_params[0].dtype
+        key = (id(cg.process_group), dtype)
+        if key not in buckets:
+            buckets[key] = (cg.process_group, dtype, [])
+        buckets[key][2].append(cg)
+    return list(buckets.values())
+
+
 def sync_replicated_grads(plan: list[ReplicationCoordGroup]) -> None:
     """Average gradients across replication groups in-place.
 
@@ -207,6 +277,11 @@ def sync_replicated_grads(plan: list[ReplicationCoordGroup]) -> None:
       4. Copy the averaged gradient back to every local member's ``.grad`` so
          each member receives an identical optimizer update.
 
+    Groups that share a process group and dtype are coalesced into a single
+    bucket and reduced with one ``all_reduce`` — cutting the per-step
+    collective count from O(num replicated params) to O(num distinct
+    (pg, dtype) pairs). Per-group divisors still apply post-reduce.
+
     Some replicated parameters may receive no gradient on some ranks (for
     example the final ``norm.weight``: only the rank that owns track 0
     backprops the LM loss through it). To keep the collective ordering
@@ -214,30 +289,36 @@ def sync_replicated_grads(plan: list[ReplicationCoordGroup]) -> None:
     allocated before the all-reduce — every member participates in every
     collective on every step.
     """
-    for cg in plan:
-        if not cg.local_params:
-            continue
-        # Ensure every local member has a .grad tensor; missing gradients are
-        # filled with zero so that this rank's contribution to the collective
-        # is a well-defined value rather than a skipped call. Without this,
-        # a rank where head.grad is None would skip the all_reduce while peer
-        # ranks issue it — that desynchronises the collective queue and
-        # eventually hangs NCCL.
-        for p in cg.local_params:
-            if p.grad is None:
-                p.grad = torch.zeros_like(p.data)
-        head = cg.local_params[0]
-        if len(cg.local_params) == 1:
-            buf = head.grad
-        else:
-            buf = head.grad.detach().clone()
+    for pg, _dtype, groups in _bucket_groups_by_pg_dtype(plan):
+        # Local sum per group, into one buffer each.
+        bufs: list[torch.Tensor] = []
+        for cg in groups:
+            for p in cg.local_params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p.data)
+            buf = cg.local_params[0].grad.detach().clone()
             for p in cg.local_params[1:]:
                 buf.add_(p.grad)
-        if cg.process_group is not None:
-            dist.all_reduce(buf, op=dist.ReduceOp.SUM, group=cg.process_group)
-        buf.div_(cg.group_size)
-        for p in cg.local_params:
-            p.grad.copy_(buf)
+            bufs.append(buf)
+
+        if pg is None:
+            # Fully-local bucket — no collective; divide and write back.
+            for cg, buf in zip(groups, bufs):
+                buf.div_(cg.group_size)
+                for p in cg.local_params:
+                    p.grad.copy_(buf)
+            continue
+
+        # Cross-rank bucket: flat-concat, one all_reduce, split, divide, write back.
+        flat = torch.cat([b.flatten() for b in bufs])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=pg)
+        offset = 0
+        for cg, buf in zip(groups, bufs):
+            n = buf.numel()
+            avg = flat[offset:offset + n].view_as(buf).div_(cg.group_size)
+            for p in cg.local_params:
+                p.grad.copy_(avg)
+            offset += n
 
 
 def assert_replicated_consistent(plan: list[ReplicationCoordGroup]) -> None:

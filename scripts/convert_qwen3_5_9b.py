@@ -2,7 +2,7 @@
 
 Usage:
     python scripts/convert_qwen3_5_9b.py \
-        --hf-model /home2/jtr020/hf_cache/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+        --hf-model /home2/jtr020/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
         --out-dir /path/to/pt_tracks \
         --n-tracks 4 \
         --sync-block-depth 4
