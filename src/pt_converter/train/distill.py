@@ -32,7 +32,8 @@ from pt_converter.train.teacher import HookedTeacher
 
 
 def _kl_ce_chunked(
-    student_logits: torch.Tensor,        # (B, T, V) bf16, has grad to params
+    hidden: torch.Tensor,                # (B, T, D) bf16, grad-connected to student params
+    lm_head: nn.Module,                  # student's lm_head (owner rank only)
     teacher_logits: torch.Tensor,        # (B, T, V) detached
     labels: torch.Tensor,                # (B, T)
     attention_mask: torch.Tensor | None, # (B, T) or None
@@ -42,30 +43,40 @@ def _kl_ce_chunked(
     kl_temperature: float,
     chunk_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute lambda_kl * KL + lambda_ce * CE in chunks along the seq dim,
-    backwarding each chunk before the next is built.
+    """Compute lambda_kl * KL + lambda_ce * CE in seq-chunks; one backward
+    into the student forward graph at the end.
 
-    The original `logit_kl` and `lm_cross_entropy` each materialize fp32
-    (B, T, V) tensors (log_softmax, softmax, cross-entropy intermediates). At
-    Qwen3.5 vocab=151936, T=1024 those are ~622 MB each — three of them
-    alive simultaneously OOMs the rank that also hosts embed_tokens, lm_head,
-    K student tracks, optimizer state, and a teacher FSDP shard.
+    Two memory pressures motivate this design:
 
-    Chunking along T plus per-chunk backward means each chunk's vocab-wide
-    fp32 saved tensors (log_softmax outputs, softmax materialized by CE
-    backward) are released as soon as that chunk's backward returns. Without
-    the in-loop backward, summing every chunk into one `weighted` scalar and
-    running a single .backward() at the end keeps every chunk's saved fp32
-    tensors alive at once — defeating the chunking for backward peak.
+    1. The per-chunk fp32 saved tensors (log_softmax, softmax materialized by
+       CE backward) are vocab-wide — at V=248320, chunk=128 each is ~127 MB.
+       We get rid of them by computing each chunk's gradient *into the hidden
+       state* (autograd.grad against ``h_anchor``) and discarding the chunk's
+       forward graph immediately — no ``retain_graph`` across chunks.
 
-    ``retain_graph=True`` on all but the last chunk keeps the upstream
-    student forward graph (bf16, per-position) alive so later chunks can
-    backward through the same student_logits; the last chunk frees it.
+    2. Materialising (B, T, V) bf16 logits in one shot (~2 GB at seq=4096)
+       to hand to the caller is itself the dominant non-activation tensor on
+       the lm_head-owning rank. We chunk the lm_head application here, so the
+       caller never sees a full-T logits tensor.
+
+    Flow:
+      - Detach ``hidden`` into ``h_anchor`` (requires_grad=True): a leaf-like
+        grad target whose grads we accumulate into ``grad_h_accum``
+        (B, T, D) bf16 — orders of magnitude smaller than (B, T, V).
+      - Per chunk: ``logits = lm_head(h_anchor[:, t0:t1, :])`` → KL + CE →
+        ``autograd.grad(loss, h_anchor)`` returns a (B, T, D) tensor that is
+        non-zero only on [t0:t1]. Add into the accumulator; the chunk's fp32
+        tensors and lm_head's per-chunk graph are freed at function return.
+      - Once all chunks are done, ``hidden.backward(grad_h_accum)`` drives
+        a single backward through the (bf16) student forward graph. No
+        ``retain_graph`` is needed anywhere, and no full-T logits tensor is
+        ever materialized.
 
     Returns ``(kl_detached, ce_detached)``. Backward is already done.
     """
-    B, T, V = student_logits.shape
-    device = student_logits.device
+    B, T, D = hidden.shape
+    V = teacher_logits.shape[-1]
+    device = hidden.device
     temp_sq = kl_temperature * kl_temperature
 
     if attention_mask is not None:
@@ -77,15 +88,24 @@ def _kl_ce_chunked(
     shift_labels = labels[:, 1:]
     ce_denom = (shift_labels != -100).sum().clamp(min=1).float()
 
-    kl_acc = student_logits.new_zeros((), dtype=torch.float32)
-    ce_acc = student_logits.new_zeros((), dtype=torch.float32)
+    h_anchor = hidden.detach().requires_grad_(True)
+    grad_h_accum = torch.zeros_like(h_anchor)
+    # lm_head's own parameter gradients must be accumulated alongside
+    # grad_h_accum — autograd.grad with only h_anchor in `inputs` would
+    # silently drop them. Initialize `.grad` so we can add into it in place.
+    lm_head_params = [p for p in lm_head.parameters() if p.requires_grad]
+    for p in lm_head_params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
 
-    chunk_starts = list(range(0, T, chunk_size))
-    last_idx = len(chunk_starts) - 1
-    for i, t0 in enumerate(chunk_starts):
+    kl_acc = hidden.new_zeros((), dtype=torch.float32)
+    ce_acc = hidden.new_zeros((), dtype=torch.float32)
+
+    for t0 in range(0, T, chunk_size):
         t1 = min(t0 + chunk_size, T)
-        s_chunk = student_logits[:, t0:t1, :]            # view, has grad
-        t_chunk = teacher_logits[:, t0:t1, :]            # detached
+        h_chunk = h_anchor[:, t0:t1, :]                 # view, has grad to h_anchor
+        s_chunk = lm_head(h_chunk)                      # (B, chunk, V) bf16
+        t_chunk = teacher_logits[:, t0:t1, :]           # detached
 
         # KL contribution for this chunk. Reuses t_logp.exp() in place of a
         # second log_softmax — saves one fp32 vocab-wide intermediate.
@@ -108,14 +128,23 @@ def _kl_ce_chunked(
                 ce_logits, ce_lbl, ignore_index=-100, reduction="sum"
             )
         else:
-            ce_sum = student_logits.new_zeros((), dtype=torch.float32)
+            ce_sum = hidden.new_zeros((), dtype=torch.float32)
         ce_chunk = ce_sum / ce_denom
 
         chunk_loss = lambda_kl * kl_chunk + lambda_ce * ce_chunk
-        chunk_loss.backward(retain_graph=(i != last_idx))
+        grads = torch.autograd.grad(
+            chunk_loss, [h_anchor, *lm_head_params], retain_graph=False
+        )
+        grad_h_accum.add_(grads[0])
+        for p, g in zip(lm_head_params, grads[1:]):
+            p.grad.add_(g)
         kl_acc = kl_acc + kl_chunk.detach()
         ce_acc = ce_acc + ce_chunk.detach()
 
+    # Single backward into the (bf16) student forward graph. lm_head's grads
+    # are already populated above and are NOT touched here (hidden's graph
+    # ends at the post-norm hidden state, before lm_head).
+    hidden.backward(grad_h_accum)
     return kl_acc, ce_acc
 
 
@@ -278,17 +307,22 @@ def distill_step(
         block_loss_val = block_loss_val + block_loss_b.detach()
         prev_h = teacher_hiddens[end].detach()
 
-    # ----- Final-logit KL + LM CE (full student forward, chunked backward) -----
+    # ----- Final-logit KL + LM CE (full student forward, chunked lm_head) -----
     # All ranks call the full forward so cross-track SyncBoundary all-reduces
-    # line up. Only the rank that owns track 0 has lm_head; peers contribute
-    # zero KL/CE this step (still a real backward to keep the collective
-    # ordering symmetric).
-    student_logits, _ = student(
-        input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=False
+    # line up. We request the pre-lm_head hidden state so `_kl_ce_chunked`
+    # can chunk the lm_head application itself — avoids materializing a
+    # (B, T, V) bf16 logits tensor on the owner rank. Only the rank that
+    # owns track 0 has lm_head; peers run the forward only for collective
+    # ordering, contribute zero KL/CE, and never backward through it.
+    hidden, _ = student(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        return_sync_hiddens=False,
+        return_hidden_pre_lm_head=True,
     )
-    if student_logits is not None:
+    if student.lm_head is not None:
         kl_val, ce_val = _kl_ce_chunked(
-            student_logits, teacher_logits.detach(), labels, attention_mask,
+            hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
             lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
             kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
         )

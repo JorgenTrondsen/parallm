@@ -20,6 +20,8 @@ from typing import Sequence
 import torch
 from torch import nn
 
+from torch.utils.checkpoint import checkpoint
+
 from pt_converter.model.sync import SyncBoundary
 
 
@@ -49,6 +51,7 @@ class PTWrappedModel(nn.Module):
         local_track_ids: Sequence[int],
         sync_after_layers: list[int],
         track_group: "torch.distributed.ProcessGroup | None" = None,
+        activation_checkpoint: bool = False,
     ):
         super().__init__()
         # Late import: pt_converter.adapters imports its registered adapters,
@@ -65,6 +68,13 @@ class PTWrappedModel(nn.Module):
         self.local_track_ids = tuple(local_track_ids)
         self.sync_after_layers = tuple(sync_after_layers)
         self._adapter = adapter  # held for `load_track_state_dicts` remap
+        # Per-layer activation checkpointing. Effective on every rank when the
+        # flag is set: peer ranks (K>1) never backward through the full forward
+        # (no recompute cost at all), and the lm_head rank's KL+CE backward is
+        # now a single `hidden.backward(grad_h_accum)` call (one recompute pass
+        # through the layers, not N_chunks). Needed to fit n_tracks=16 at
+        # seq_len=4096 on 40 GB GPUs.
+        self._use_checkpoint = activation_checkpoint
 
         self.sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
         self.text_models = nn.ModuleList(
@@ -96,6 +106,7 @@ class PTWrappedModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
         return_sync_hiddens: bool = False,
+        return_hidden_pre_lm_head: bool = False,
     ):
         # Local import: keeps the engine model-family-agnostic at import time.
         from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
@@ -141,6 +152,7 @@ class PTWrappedModel(nn.Module):
         sync_set = set(self.sync_after_layers)
         sync_hiddens: dict[int, torch.Tensor] = {} if return_sync_hiddens else None
         per_track_h = [block_start for _ in self.text_models]
+        use_ckpt = self._use_checkpoint and torch.is_grad_enabled()
         for layer_idx in range(len(tm0.layers)):
             new_h: list[torch.Tensor] = []
             for k, tm in enumerate(self.text_models):
@@ -150,8 +162,19 @@ class PTWrappedModel(nn.Module):
                     if tm.config.layer_types[layer_idx] == "linear_attention"
                     else causal_mask
                 )
-                new_h.append(
-                    layer(
+                if use_ckpt:
+                    out = checkpoint(
+                        layer,
+                        per_track_h[k],
+                        position_embeddings=position_embeddings,
+                        attention_mask=mask,
+                        position_ids=text_position_ids,
+                        past_key_values=None,
+                        use_cache=False,
+                        use_reentrant=False,
+                    )
+                else:
+                    out = layer(
                         per_track_h[k],
                         position_embeddings=position_embeddings,
                         attention_mask=mask,
@@ -159,7 +182,7 @@ class PTWrappedModel(nn.Module):
                         past_key_values=None,
                         use_cache=False,
                     )
-                )
+                new_h.append(out)
             per_track_h = new_h
             if layer_idx in sync_set:
                 h = self.sync_module(per_track_h, block_start)
@@ -169,6 +192,13 @@ class PTWrappedModel(nn.Module):
                     sync_hiddens[layer_idx] = h
 
         h = tm0.norm(h)
+        # The caller may want the post-norm hidden state instead of logits so
+        # they can chunk the lm_head application themselves (eliminates the
+        # held (B, T, V) bf16 logits tensor — ~2 GB at seq=4096). All ranks
+        # return `h` regardless of lm_head ownership; this keeps SyncBoundary
+        # collective ordering matched (peers must still run the full forward).
+        if return_hidden_pre_lm_head:
+            return h, sync_hiddens
         logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, sync_hiddens
 

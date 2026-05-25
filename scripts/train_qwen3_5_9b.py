@@ -7,9 +7,11 @@ NCCL communicators (NCCL ≥ 2.19 rejects those).
 
 Single node, 8 GPUs, n_tracks=16  →  K=2 per rank:
 
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
         --hf-model /home2/jtr020/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
         --tracks-dir /path/to/pt_tracks \
+        --rank0-tracks 1 --activation-checkpoint \
         --max-steps 1000 \
         --seq-len 4096 \
         --batch-size 1 \
@@ -74,6 +76,13 @@ def main() -> int:
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--activation-checkpoint", action="store_true",
+                   help="Per-layer activation checkpointing in PTWrappedModel.forward. "
+                        "Only takes effect on K>1 (peer) ranks — those never backward "
+                        "through the full forward (their student_logits is None), so "
+                        "recompute never runs and the saved-input-only forward is pure "
+                        "memory savings. Needed to fit n_tracks=16 / K>=3 / seq=4096 "
+                        "on 40 GB GPUs.")
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global, replication-deduplicated grad-norm clip. <=0 disables clipping.")
     p.add_argument("--save-every", type=int, default=0,
@@ -201,6 +210,7 @@ def main() -> int:
         local_track_ids=layout.local_track_ids,
         sync_after_layers=manifest.sync_layer_indices,
         track_group=layout.track_group,
+        activation_checkpoint=args.activation_checkpoint,
     )
     state_src = args.resume_from if args.resume_from else args.tracks_dir
     if args.resume_from:
