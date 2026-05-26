@@ -1,40 +1,64 @@
 # pt_converter
 
-`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks", each of which runs as a smaller decoder on its own rank/GPU. At configurable sync boundaries (every `D` layers) the tracks all-reduce their partial residual updates so the combined forward stays mathematically equivalent to the original dense model. New model families are added by registering a `ModelAdapter` — the slicer engine, sync logic, and training loop themselves stay model-agnostic. A short distillation stage (frozen dense teacher → sliced student) is included to recover any perplexity lost during the static weight conversion.
+`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks". The world layout is one rank per visible GPU, with each rank hosting `K = N / world_size` tracks locally (with `--rank0-tracks` for non-uniform layouts where rank 0 also owns `embed_tokens` and `lm_head`). At configurable sync boundaries (every `D` layers), every rank locally sums its `K` partial residual deltas, then a single NCCL all-reduce across the world combines the per-rank sums — the combined forward stays mathematically equivalent to the original dense model. `N=1` short-circuits to a no-op, giving a bit-equal dense-parity gate.
+
+Parameters that the slicer flagged as identical across multiple tracks (RMSNorm scales, and K/V projection rows when `n_tracks > num_kv_heads`) are kept bit-identical under training: `sync_replicated_grads` averages each group's gradients between `loss.backward()` and `optimizer.step()`, so a deterministic optimizer step keeps the copies bit-equal forever. New model families are added by registering a `ModelAdapter` — the slicer engine, sync logic, and training loop themselves stay model-agnostic. A short distillation stage (frozen dense teacher → sliced student) using block-wise teacher-forced MSE + end-to-end logit-KL + LM CE recovers any perplexity lost during the static weight conversion.
 
 The first supported family is **Qwen3.5** (mixed full-attention / linear-attention decoder), wired up via the `qwen3_5_text` adapter.
+
+## Install
+
+Requires Python ≥ 3.10, `torch >= 2.4`, `transformers >= 4.57.0.dev0`.
+
+```bash
+pip install -e .                # core
+pip install -e ".[test]"        # + pytest
+pip install -e ".[eval]"        # + lm-eval (for scripts/eval_lm_harness.py)
+```
 
 ## Directory structure
 
 ```
 pt_converter/
-├── pyproject.toml                          # Build metadata and dependency pins.
+├── pyproject.toml                          # Build metadata, deps; [eval] extra pulls lm-eval.
 ├── scripts/
-│   ├── convert_qwen3_5_9b.py               # CLI: slice a pretrained Qwen3.5-9B into N per-track checkpoints.
-│   └── train_qwen3_5_9b.py                 # torchrun entrypoint for distributed distillation training.
+│   ├── convert_qwen3_5_9b.py               # CLI: slice a pretrained Qwen3.5-9B into N per-track checkpoints + manifest.
+│   ├── train_qwen3_5_9b.py                 # torchrun entry point: distributed distillation.
+│   ├── eval_fidelity.py                    # torchrun entry point: KL / top-k / hidden-MSE / ppl-gap, student vs teacher.
+│   ├── eval_lm_harness.py                  # torchrun entry point: lm-evaluation-harness over student and/or teacher.
+│   └── verify_kv_sync.py                   # torchrun entry point: end-to-end check that replicated params stay bit-identical.
 ├── src/pt_converter/
 │   ├── __init__.py                         # Public API: max_tracks_for_config, slice_model_to_tracks, PTManifest.
 │   ├── adapters/
 │   │   ├── __init__.py                     # ModelAdapter dataclass + register_model_adapter / get_model_adapter registry.
 │   │   └── qwen3_5.py                      # Registers the "qwen3_5_text" adapter (slicer specs + per-track model class).
+│   ├── dist/
+│   │   ├── __init__.py                     # Package marker.
+│   │   ├── groups.py                       # ProcessGroupLayout + build_groups (supports rank0_tracks / tracks_per_rank_list).
+│   │   └── fsdp_setup.py                   # Reserved no-op intra-track FSDP wrapping; ready for future layouts.
 │   ├── model/
 │   │   ├── __init__.py                     # Package marker.
-│   │   ├── pt_model.py                     # PTWrappedModel: per-rank wrapper exposing (logits, sync_hiddens) forward.
-│   │   ├── sync.py                         # SyncBoundary: cross-track all-reduce of (h_t - h_pre_block) deltas.
+│   │   ├── pt_model.py                     # PTWrappedModel: per-rank wrapper hosting K local tracks, returns (logits, sync_hiddens).
+│   │   ├── sync.py                         # SyncBoundary: local Σ across K tracks, then NCCL all-reduce across ranks.
 │   │   └── tracks/
 │   │       ├── __init__.py                 # Package marker.
 │   │       └── qwen3_5.py                  # Per-track Qwen3.5 decoder with SyncBoundary calls at sync layers.
 │   ├── slicer/
 │   │   ├── __init__.py                     # Package marker.
-│   │   ├── base.py                         # SlicerSpec protocol + Colwise/Rowwise/PerHead/Replicated/Fused/KV/GatedQ impls.
+│   │   ├── base.py                         # SlicerSpec protocol + Colwise / Rowwise / PerHead / Replicated / Fused / KV / GatedQ / OwnerOnly.
 │   │   ├── convert.py                      # slice_model_to_tracks engine: applies adapter specs → N state dicts + PTManifest.
-│   │   └── qwen3_5.py                      # Qwen3.5-specific SlicerSpec instances for attention / linear-attention / MLP.
+│   │   └── qwen3_5.py                      # Qwen3.5-specific SlicerSpec instances (attention / linear-attention / MLP).
 │   ├── train/
 │   │   ├── __init__.py                     # Package marker.
-│   │   ├── data.py                         # PackedTokenStream IterableDataset (WikiText-103 / custom, on-the-fly tokenize + pack).
-│   │   ├── distill.py                      # SPD-style step: block-wise teacher-forced MSE + end-to-end logit-KL + LM CE.
+│   │   ├── data.py                         # PackedTokenStream IterableDataset (on-the-fly tokenize + pack; WikiText-103 / custom).
+│   │   ├── distill.py                      # SPD step: block-wise teacher-forced MSE (backward-per-block) + memory-chunked KL+CE backward.
 │   │   ├── losses.py                       # block_mse, logit_kl, lm_cross_entropy — all with attention-mask support.
-│   │   └── teacher.py                      # HookedTeacher: frozen dense model with hooks capturing hiddens at sync indices.
+│   │   ├── teacher.py                      # HookedTeacher: frozen dense model with hooks capturing hiddens at sync indices.
+│   │   └── sync_grads.py                   # Replication plan + sync_replicated_grads (averages grads inside each replication group).
+│   ├── eval/
+│   │   ├── __init__.py                     # Package marker.
+│   │   ├── fidelity.py                     # fidelity_step: KL (fwd+rev), top-k agreement, per-sync hidden MSE, ppl gap.
+│   │   └── lm_eval_adapter.py              # lm-evaluation-harness adapter for PTWrappedModel and the FSDP-wrapped teacher.
 │   └── utils/
 │       ├── __init__.py                     # Package marker.
 │       ├── checkpoint.py                   # Save/load per-track safetensors + manifest.json.
@@ -43,110 +67,94 @@ pt_converter/
     ├── __init__.py                         # Package marker.
     ├── test_pt_forward_n1.py               # N=1 PT forward must match dense bit-equal; sync_hiddens captured at right depths.
     ├── test_pt_n8_forward_smoke.py         # N=8 simulated distributed forward on CPU; finite outputs, bounded drift.
+    ├── test_pt_k2_local_sync.py            # K=2 single-process: exercises the local-sum SyncBoundary path without NCCL.
     ├── test_kv_replication.py              # KV-replicated slices identical within kv-group, unique across groups, reassemble bit-equal.
+    ├── test_replication_groups.py          # SlicerSpec.replication_groups partitions tracks correctly per spec type.
+    ├── test_sync_grads.py                  # sync_replicated_grads averages in-place; assert_replicated_consistent catches drift.
     ├── test_slicer_specs.py                # Per-SlicerSpec slice/reassemble round-trip and shape unit tests.
     ├── test_sync_schedule.py               # sync_block_depth + num_layers → correct per-track sync layer indices.
-    ├── test_model_adapter.py               # Adapter registry: register/lookup/idempotent re-register; slicer routing via adapter.
+    ├── test_model_adapter.py               # Adapter registry: register / lookup / idempotent re-register; slicer routing via adapter.
     ├── test_slicer_qwen3_5_integration.py  # Tiny Qwen3.5: N=1 bit-equal, N=2 round-trip, per-track shapes match config.
     └── test_max_tracks.py                  # max_tracks_for_config against synthetic configs under the four-rule constraint set.
 ```
 
-## File reference
+## Convert
 
-### Top level
+`scripts/convert_qwen3_5_9b.py` slices a dense Qwen3.5 checkpoint into N per-track safetensors plus a `manifest.json`.
 
-#### [pyproject.toml](pyproject.toml)
-Standard PEP 621 manifest. Declares the `pt-converter` package, requires Python 3.10+, and pins runtime dependencies `torch>=2.4`, `transformers>=4.57.0.dev0`, `datasets`, `safetensors`, and `accelerate`. Adds `pytest` as the only optional/test dependency and points setuptools at the `src/` layout.
+| Flag | Default | Purpose |
+|---|---|---|
+| `--hf-model` | required | Path or HF id of the dense source model. |
+| `--out-dir` | required | Output dir for per-track safetensors + manifest. |
+| `--n-tracks` | `max_tracks_for_config(...)` | Number of tracks (defaults to the max valid N for the model). |
+| `--sync-block-depth` | `4` | Sync every D layers. |
+| `--device` | `cpu` | Device for slicing. |
+| `--dtype` | `bfloat16` | One of `bfloat16` / `float16` / `float32`. |
 
-### scripts/
+```bash
+python scripts/convert_qwen3_5_9b.py \
+    --hf-model Qwen/Qwen3.5-9B \
+    --out-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
+    --n-tracks 16 --sync-block-depth 4
+```
 
-#### [scripts/convert_qwen3_5_9b.py](scripts/convert_qwen3_5_9b.py)
-One-shot single-process conversion script. Loads a pretrained Qwen3.5-9B dense model from the HuggingFace hub or a local path, dispatches into the model-agnostic `slice_model_to_tracks` engine, and writes one safetensors file per track alongside a `manifest.json` describing the sync schedule and per-layer metadata.
+## Train
 
-#### [scripts/train_qwen3_5_9b.py](scripts/train_qwen3_5_9b.py)
-`torchrun`-launched entrypoint for distributed distillation. Each rank loads its own sliced student track plus the frozen dense teacher, constructs a process group, and runs the SPD-style step in [src/pt_converter/train/distill.py](src/pt_converter/train/distill.py): block-wise teacher-forced MSE at every sync boundary plus end-to-end logit KL and language-modeling cross-entropy. Optionally saves resumable per-track checkpoints.
+`scripts/train_qwen3_5_9b.py` runs the distillation under `torchrun`. One rank per GPU; each rank hosts `K = n_tracks / world_size` tracks (or fewer on rank 0 if `--rank0-tracks` is set, since rank 0 also owns `embed_tokens` and `lm_head`).
 
-### src/pt_converter/
+| Flag | Default | Purpose |
+|---|---|---|
+| `--hf-model` | required | Dense teacher path. |
+| `--tracks-dir` | required | Output of the convert script. |
+| `--out-dir` | `./pt_train_out` | Checkpoint dir (also writes `best/` when eval improves). |
+| `--resume-from` | `None` | Resume model + optimizer state from a prior checkpoint dir. |
+| `--rank0-tracks` | `None` | Override K on rank 0 to free memory for embed / lm_head. |
+| `--max-steps` | `1000` | Training steps. |
+| `--seq-len` / `--batch-size` | `4096` / `1` | Sequence length and per-rank batch. |
+| `--lr` / `--warmup-steps` / `--lr-min-ratio` | `3e-5` / `0` / `0.1` | AdamW LR + cosine decay floor. |
+| `--max-grad-norm` | `1.0` | Clip gradients before optimizer step. |
+| `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). |
+| `--kl-ce-chunk-size` | `128` | Vocab chunking inside `_kl_ce_chunked` to bound peak KL + CE memory. |
+| `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
+| `--kl-temperature` | `1.0` | KL temperature. |
+| `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
+| `--eval-every` / `--val-batches` | `0` / `20` | Held-out CE eval cadence and size. |
+| `--early-stop-patience` / `--min-improvement` | `0` / `0.01` | Optional early stopping. |
+| `--seed` | `42` | Seeds torch / cuda / python / numpy. |
+| `--log-every` | `10` | Log cadence. |
 
-#### [src/pt_converter/__init__.py](src/pt_converter/__init__.py)
-The package's public API. Re-exports `max_tracks_for_config`, `slice_model_to_tracks`, and `PTManifest`, and imports the `adapters` subpackage at top level so built-in adapter registrations (`qwen3_5_text`, etc.) run as a side-effect of `import pt_converter`.
+```bash
+torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
+    --hf-model Qwen/Qwen3.5-9B \
+    --tracks-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
+    --out-dir ./pt_train_out \
+    --max-steps 4000 --seq-len 4096 --batch-size 1 \
+    --activation-checkpoint --rank0-tracks 1 \
+    --eval-every 200 --save-every 500
+```
 
-### src/pt_converter/adapters/
+## Evaluate
 
-#### [src/pt_converter/adapters/__init__.py](src/pt_converter/adapters/__init__.py)
-Defines the `ModelAdapter` dataclass — the per-family contract that bundles together (a) the slicer-spec factory for each layer kind, (b) the per-track model class, and (c) any state-dict prefix remapping. Exposes `register_model_adapter(model_type, adapter)` and `get_model_adapter(model_type)`; the slicer and runtime route everything through this registry so the engine stays model-agnostic.
+Three torchrun entry points. All reuse the same per-rank track layout as training, so `--rank0-tracks` must match the value used at training time.
 
-#### [src/pt_converter/adapters/qwen3_5.py](src/pt_converter/adapters/qwen3_5.py)
-Concrete adapter that wires up Qwen3.5 text models. Imports the per-track decoder from [src/pt_converter/model/tracks/qwen3_5.py](src/pt_converter/model/tracks/qwen3_5.py) and the slicer-spec factory from [src/pt_converter/slicer/qwen3_5.py](src/pt_converter/slicer/qwen3_5.py), assembles them into a `ModelAdapter`, and registers it under `model_type = "qwen3_5_text"` at import time.
-
-### src/pt_converter/model/
-
-#### [src/pt_converter/model/pt_model.py](src/pt_converter/model/pt_model.py)
-`PTWrappedModel` is the per-rank user-facing module. It owns this rank's track decoder and — on track 0 only — the `lm_head`. The forward returns `(logits, sync_hiddens)` where `logits` is `None` on peer tracks; the owner applies `lm_head` to the synced post-final-norm hidden state and is the sole source of logits. `load_track_state_dict` remaps slicer keys onto the per-track module; on peer tracks both the slicer output and the wrapped module simply omit `embed_tokens.weight` and `lm_head.weight`. The companion `PTTrackTextModelConfig` is the small engine ↔ adapter contract that the slicer uses to spin up a per-track instance with the right head counts, intermediate dim, and embedding shape.
-
-#### [src/pt_converter/model/sync.py](src/pt_converter/model/sync.py)
-Implements the only cross-track collective in the PT forward. At a sync point each track has produced a partial post-block hidden `h_t`, and `SyncBoundary` recombines them via `h_synced = h_pre_block + sum_t (h_t - h_pre_block)` — a single `all_reduce(SUM)` on the delta followed by an add. When `n_tracks <= 1` or no process group is supplied, it degenerates to a pure no-op, which is what makes the `N=1` correctness gate work.
-
-### src/pt_converter/model/tracks/
-
-#### [src/pt_converter/model/tracks/qwen3_5.py](src/pt_converter/model/tracks/qwen3_5.py)
-Per-track Qwen3.5 text decoder. Builds standard Qwen3.5 decoder layers (mix of full-attention and linear-attention) but with reduced head counts / intermediate sizes that match the slicer's per-track shapes, and inserts a `SyncBoundary` call after every layer index listed in the sync schedule. Constructs `embed_tokens` only on track 0; at forward time the owner runs the embedding lookup, peers allocate a zero placeholder, and a start-of-forward `SyncBoundary` call broadcasts the owner's embedding to every track via the zero-padded all-reduce trick (`h_pre_block=0`, only owner has nonzero `h_t`, so all-reduce sum ≡ broadcast). Behavior at `N=1` (where SyncBoundary no-ops and the owner is the only track) stays bit-equal to dense.
-
-### src/pt_converter/slicer/
-
-#### [src/pt_converter/slicer/base.py](src/pt_converter/slicer/base.py)
-Declarative slicing primitives. Defines the `SlicerSpec` protocol (`slice`, `reassemble`, `per_track_shape`) and eight concrete implementations: `Colwise` and `Rowwise` (standard tensor-parallel splits), `PerHead` (1-D per-head params like `A_log` / `dt_bias`), `Replicated` (norms), `OwnerOnly` (param lives on a single track — used for `embed_tokens` / `lm_head`; non-owner tracks omit the key), `FusedSegmentColwise` (e.g. fused `[Q | K | V]` in-proj), `KVReplicatedColwise` (lets `N` exceed `num_kv_heads` by replicating k/v slices within each kv-group), and `GatedQColwise` (Qwen's doubled-`q_proj` with interleaved gate columns). All specs are side-effect free and unit-tested in isolation.
-
-#### [src/pt_converter/slicer/convert.py](src/pt_converter/slicer/convert.py)
-The model-agnostic conversion engine. `slice_model_to_tracks(model, n_tracks)` looks up the right `ModelAdapter` from the model's `config.model_type`, walks every parameter, applies the adapter-provided `SlicerSpec` to produce `N` per-track tensors, and returns both the list of per-track state dicts and a `PTManifest` describing model metadata (sync layer indices, layer types, per-track shapes, and `top_level_owners` for params that live on a single track such as `embed_tokens` / `lm_head`). For an `OwnerOnly` spec, only the owner track's state dict receives the key; peer tracks omit it entirely, saving disk and per-rank memory.
-
-#### [src/pt_converter/slicer/qwen3_5.py](src/pt_converter/slicer/qwen3_5.py)
-The Qwen3.5-specific `SlicerSpec` catalogue. Provides the spec dict for each layer kind: full-attention (`q_proj` / `k_proj` / `v_proj` / `o_proj` plus q/k RMSNorms), linear-attention (fused `in_proj_qkv`, `conv1d`, `A_log`, `dt_bias`, etc.), and the gated MLP. Encodes Qwen-specific quirks like the gated-q output doubling, KV replication within groups, and the fused-segment in-proj layout.
-
-### src/pt_converter/train/
-
-#### [src/pt_converter/train/data.py](src/pt_converter/train/data.py)
-`PackedTokenStream`, an `IterableDataset` that streams a text corpus (WikiText-103 by default), tokenizes on the fly with the supplied HF tokenizer, and packs the token stream into fixed-length sequences suitable for calibration or fine-tuning. Avoids materializing the full dataset and works cleanly with multi-worker DataLoader.
-
-#### [src/pt_converter/train/distill.py](src/pt_converter/train/distill.py)
-One distillation step in SPD style. Runs the frozen teacher under `no_grad`, recording the pre- and post-block hidden states at each sync boundary. For every block the student is run *teacher-forced* — starting from the teacher's pre-block hidden — then synced, and a per-token block-MSE is taken against the teacher's post-block hidden. A final full student forward produces logits for logit-KL and LM cross-entropy against the labels.
-
-#### [src/pt_converter/train/losses.py](src/pt_converter/train/losses.py)
-The three losses used by `distill.py`: `block_mse` (per-token MSE between synced student and teacher hiddens at each sync point), `logit_kl` (temperature-softmaxed forward KL on the final logits), and `lm_cross_entropy` (standard next-token CE on the labels). All three accept an attention mask so padded sequence positions don't pollute the loss.
-
-#### [src/pt_converter/train/teacher.py](src/pt_converter/train/teacher.py)
-`HookedTeacher` wraps a frozen dense decoder + `lm_head` and registers forward hooks on the layers immediately preceding each sync boundary. Its `no_grad` forward returns the final logits plus a dict of captured hidden states keyed by sync index, which `distill.py` consumes for block-wise teacher forcing.
-
-### src/pt_converter/utils/
-
-#### [src/pt_converter/utils/checkpoint.py](src/pt_converter/utils/checkpoint.py)
-Per-track checkpoint I/O. Saves a list of per-track state dicts as one safetensors file each plus a `manifest.json` (the `PTManifest` content), and loads them back with shape recovery so the trainer can resume from any track count without re-slicing the dense weights.
-
-#### [src/pt_converter/utils/max_tracks.py](src/pt_converter/utils/max_tracks.py)
-`max_tracks_for_config` enumerates the divisibility constraints implied by the model config (attention heads, kv heads, MLP intermediate size, linear-attention dims) and reports the largest `N` that satisfies all of them simultaneously. Crucially enforces the KV-replication rule: `N` must be a multiple of `num_key_value_heads` whenever we push past it.
-
-### tests/
-
-#### [tests/test_pt_forward_n1.py](tests/test_pt_forward_n1.py)
-The headline correctness gate: with `N=1`, `SyncBoundary` is a no-op, so the wrapped PT model must produce bit-equal logits to the original dense Qwen3.5 model on the same input. Also checks that the `sync_hiddens` dict surfaces the right number of captures at the expected layer depths.
-
-#### [tests/test_pt_n8_forward_smoke.py](tests/test_pt_n8_forward_smoke.py)
-Simulates an `N=8` distributed forward on a single CPU process by running each track's forward in turn and stand-in for the all-reduce with an explicit delta-sum / broadcast. Asserts outputs are finite and that the drift from the dense model is bounded (an `O(1)` gap is expected pre-distillation).
-
-#### [tests/test_kv_replication.py](tests/test_kv_replication.py)
-End-to-end validation of `KVReplicatedColwise` for `k_proj` and `v_proj` under GQA: slices belonging to the same kv-group must be bit-identical, slices across kv-groups must differ, and the unique per-group slices concatenated must reconstruct the dense tensor exactly.
-
-#### [tests/test_slicer_specs.py](tests/test_slicer_specs.py)
-Unit-level round-trip tests for every `SlicerSpec` in [src/pt_converter/slicer/base.py](src/pt_converter/slicer/base.py): for synthetic tensors, `reassemble(slice(...))` recovers the original, `per_track_shape` matches the actual slice shape, and divisibility errors are raised when expected.
-
-#### [tests/test_sync_schedule.py](tests/test_sync_schedule.py)
-Validates the small helper that turns `(sync_block_depth=D, num_layers=L)` into the list of layer indices where a `SyncBoundary` is inserted (e.g. `D=4, L=32 → [3, 7, 11, ..., 31]`), including edge cases when `L` is not a clean multiple of `D`.
-
-#### [tests/test_model_adapter.py](tests/test_model_adapter.py)
-Exercises the adapter registry: importing the package registers built-in adapters, `get_model_adapter` looks them up by `model_type`, re-registering the same `model_type` is idempotent, and the slicer engine correctly routes a synthetic registered adapter through `slice_model_to_tracks`.
-
-#### [tests/test_slicer_qwen3_5_integration.py](tests/test_slicer_qwen3_5_integration.py)
-Integration tests that build a tiny Qwen3.5 config end-to-end. Slice at `N=1` and check bit-equal against dense; slice at `N=2` and verify the per-spec `reassemble` rules recover every parameter; and check that each per-track tensor matches the shape predicted by `PTTrackTextModelConfig`.
-
-#### [tests/test_max_tracks.py](tests/test_max_tracks.py)
-Drives `max_tracks_for_config` over a battery of synthetic Qwen-like configs to confirm correct enumeration of valid `N` values under the four divisibility rules (attention heads, kv heads, MLP intermediate, linear-attention dims) and rejection of configs where no satisfying `N > 1` exists.
+- **Logit fidelity vs teacher** — `scripts/eval_fidelity.py`. KL (forward + reverse), top-1 / top-5 agreement and top-5 IoU, per-sync-boundary hidden MSE, student / teacher perplexity and gap.
+  ```bash
+  torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
+      --hf-model Qwen/Qwen3.5-9B \
+      --checkpoint-dir ./pt_train_out/best \
+      --num-batches 200
+  ```
+- **lm-evaluation-harness** — `scripts/eval_lm_harness.py`. Runs the harness on the student and/or teacher (`--target {student,teacher,both}`) with the same seeds, so request streams align across ranks. Default tasks: `hellaswag,arc_easy,arc_challenge,winogrande,piqa`; pass `--include-mmlu` to add MMLU.
+  ```bash
+  torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
+      --hf-model Qwen/Qwen3.5-9B \
+      --checkpoint-dir ./pt_train_out/best \
+      --output-json ./pt_train_out/lm_eval.json
+  ```
+- **Replicated-param sync sanity check** — `scripts/verify_kv_sync.py`. Runs N distillation steps and asserts that `q_proj` (unique per track) changes, while `k_proj` and `input_layernorm` change *and* remain bit-identical across their replication groups.
+  ```bash
+  torchrun --standalone --nproc-per-node=8 scripts/verify_kv_sync.py \
+      --hf-model Qwen/Qwen3.5-9B \
+      --tracks-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
+      --steps 2
+  ```
