@@ -20,6 +20,8 @@ same minibatch; gradients accumulate before `optimizer.step()`.
 """
 from __future__ import annotations
 
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -29,6 +31,29 @@ from torch import nn
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.train.losses import block_mse, logit_kl, lm_cross_entropy
 from pt_converter.train.teacher import HookedTeacher
+
+
+@contextmanager
+def _phase(name: str, timings: dict[str, float] | None):
+    """Time a distill_step phase into ``timings[name]`` (seconds), CUDA-synced.
+
+    When ``timings is None`` (the default, non-profiling path) this is a pure
+    ``yield`` — no ``cuda.synchronize()``, no ``record_function``, zero overhead.
+    When profiling, the body is wrapped in a ``torch.profiler.record_function``
+    range (so phase names appear in the trace) and bracketed by device syncs so
+    the recorded wall time reflects GPU completion, not just kernel launch.
+    """
+    if timings is None:
+        yield
+        return
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.profiler.record_function(name):
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize()
+            timings[name] = timings.get(name, 0.0) + (time.perf_counter() - t0)
 
 
 def _kl_ce_chunked(
@@ -223,6 +248,7 @@ def distill_step(
     teacher: HookedTeacher,
     batch: dict[str, torch.Tensor],
     cfg: DistillConfig,
+    timings: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Run one distillation step. Backward is done internally, per block.
 
@@ -240,43 +266,45 @@ def distill_step(
     labels = batch["labels"]
 
     # ----- Teacher forward (frozen) -----
-    teacher_logits, teacher_hiddens = teacher.forward(input_ids, attention_mask=attention_mask)
+    with _phase("teacher_fwd", timings):
+        teacher_logits, teacher_hiddens = teacher.forward(input_ids, attention_mask=attention_mask)
 
     # ----- Embedding broadcast -----
     # Owner runs embed_tokens; peers contribute zeros. sync_module's local sum
     # + all-reduce delivers the owner's embedding to every track.
-    embeds_per_track: list[torch.Tensor] = []
-    for tm in student.text_models:
-        if tm.embed_tokens is not None:
-            embeds_per_track.append(tm.embed_tokens(input_ids))
-        else:
-            B, S = input_ids.shape
-            embeds_per_track.append(
-                torch.zeros(
-                    B,
-                    S,
-                    tm.config.hidden_size,
-                    device=input_ids.device,
-                    dtype=tm.norm.weight.dtype,
+    with _phase("setup", timings):
+        embeds_per_track: list[torch.Tensor] = []
+        for tm in student.text_models:
+            if tm.embed_tokens is not None:
+                embeds_per_track.append(tm.embed_tokens(input_ids))
+            else:
+                B, S = input_ids.shape
+                embeds_per_track.append(
+                    torch.zeros(
+                        B,
+                        S,
+                        tm.config.hidden_size,
+                        device=input_ids.device,
+                        dtype=tm.norm.weight.dtype,
+                    )
                 )
-            )
-    inputs_embeds = student.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+        inputs_embeds = student.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
 
-    tm0 = student.text_models[0]
-    position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
-    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask  # local import
+        tm0 = student.text_models[0]
+        position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
+        from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask  # local import
 
-    causal_mask = create_causal_mask(
-        config=tm0.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = (
-        None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
-    )
-    position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
+        causal_mask = create_causal_mask(
+            config=tm0.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=text_position_ids,
+        )
+        linear_attn_mask = (
+            None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
+        )
+        position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
 
     # ----- Per-block teacher-forced backward -----
     # Each iteration: run the student block, sync, compute block_mse, backward
@@ -288,24 +316,25 @@ def distill_step(
     # Block 0 reads the synced student embedding (detached); subsequent blocks
     # read the teacher's post-block hidden state at the previous sync index.
     prev_h = inputs_embeds.detach()
-    for start, end in ranges:
-        h_post_list = _run_student_block(
-            student,
-            prev_h,
-            start,
-            end,
-            position_embeddings,
-            text_position_ids,
-            causal_mask,
-            linear_attn_mask,
-        )
-        h_synced = student.sync_module(h_post_list, prev_h)
-        block_loss_b = block_mse(
-            h_synced, teacher_hiddens[end].detach(), attention_mask=attention_mask
-        )
-        (cfg.lambda_block * block_loss_b).backward()
-        block_loss_val = block_loss_val + block_loss_b.detach()
-        prev_h = teacher_hiddens[end].detach()
+    with _phase("block_loop", timings):
+        for start, end in ranges:
+            h_post_list = _run_student_block(
+                student,
+                prev_h,
+                start,
+                end,
+                position_embeddings,
+                text_position_ids,
+                causal_mask,
+                linear_attn_mask,
+            )
+            h_synced = student.sync_module(h_post_list, prev_h)
+            block_loss_b = block_mse(
+                h_synced, teacher_hiddens[end].detach(), attention_mask=attention_mask
+            )
+            (cfg.lambda_block * block_loss_b).backward()
+            block_loss_val = block_loss_val + block_loss_b.detach()
+            prev_h = teacher_hiddens[end].detach()
 
     # ----- Final-logit KL + LM CE (full student forward, chunked lm_head) -----
     # All ranks call the full forward so cross-track SyncBoundary all-reduces
@@ -314,18 +343,20 @@ def distill_step(
     # (B, T, V) bf16 logits tensor on the owner rank. Only the rank that
     # owns track 0 has lm_head; peers run the forward only for collective
     # ordering, contribute zero KL/CE, and never backward through it.
-    hidden, _ = student(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_sync_hiddens=False,
-        return_hidden_pre_lm_head=True,
-    )
-    if student.lm_head is not None:
-        kl_val, ce_val = _kl_ce_chunked(
-            hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
-            lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
-            kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
+    with _phase("student_fwd", timings):
+        hidden, _ = student(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_sync_hiddens=False,
+            return_hidden_pre_lm_head=True,
         )
+    if student.lm_head is not None:
+        with _phase("klce", timings):
+            kl_val, ce_val = _kl_ce_chunked(
+                hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
+                lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
+                kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
+            )
     else:
         kl_val = torch.zeros((), device=input_ids.device)
         ce_val = torch.zeros((), device=input_ids.device)

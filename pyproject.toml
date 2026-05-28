@@ -18,6 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 eval = ["lm-eval>=0.4,<0.5"]
+# Fused Triton kernels for the gated-delta linear-attention layers (GPU only).
+# Without these, the 24 linear-attention layers fall back to a slow pure-torch
+# chunked recurrence; installing them is a ~3-4x training step speedup at
+# n_tracks=16. Needs a CUDA GPU + triton.
+fast = ["flash-linear-attention>=0.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

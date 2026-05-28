@@ -83,6 +83,17 @@ def main() -> int:
                         "recompute never runs and the saved-input-only forward is pure "
                         "memory savings. Needed to fit n_tracks=16 / K>=3 / seq=4096 "
                         "on 40 GB GPUs.")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile each per-track decoder layer in place "
+                        "(default: on; use --no-compile to disable). Inductor fusion of "
+                        "the tiny per-track kernels; cuts launch overhead, biggest win on "
+                        "the high-K straggler rank. Math unchanged; first steps pay a "
+                        "one-time compile warmup.")
+    p.add_argument("--compile-mode", default="default",
+                   help="torch.compile mode. 'default' = inductor fusion only "
+                        "(recommended). 'reduce-overhead' (CUDA graphs) is "
+                        "experimental here — can conflict with activation-checkpoint "
+                        "recompute and needs static memory.")
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global, replication-deduplicated grad-norm clip. <=0 disables clipping.")
     p.add_argument("--save-every", type=int, default=0,
@@ -90,6 +101,19 @@ def main() -> int:
     p.add_argument("--save-final", action="store_true",
                    help="Write final/ when training exits (loop done or early-stopped).")
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--profile", action="store_true",
+                   help="Per-phase CUDA-synced wall-clock breakdown of each distill "
+                        "step (teacher_fwd / setup / block_loop / student_fwd / klce / "
+                        "data_wait / other), logged per step and as a mean. Cheap "
+                        "(just cuda.synchronize + perf_counter); absolute ms stay "
+                        "representative of a real run. No effect on training math; "
+                        "off = zero overhead.")
+    p.add_argument("--profile-trace", action="store_true",
+                   help="Additionally capture a torch.profiler kernel trace over a "
+                        "short window (Chrome trace + key_averages table on rank 0). "
+                        "Implies --profile. NOTE: CUDA activity tracing inflates the "
+                        "absolute per-phase ms during its active window — use it for "
+                        "kernel-level attribution, not for wall-clock budgeting.")
     p.add_argument("--lambda-block", type=float, default=1.0)
     p.add_argument("--lambda-kl", type=float, default=1.0)
     p.add_argument("--lambda-ce", type=float, default=0.5)
@@ -120,6 +144,9 @@ def main() -> int:
                         "ranks 1..world_size-1, with any remainder going to the earliest "
                         "peer ranks.")
     args = p.parse_args()
+    # --profile-trace implies the phase timers; the trace is an add-on.
+    if args.profile_trace:
+        args.profile = True
 
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
@@ -211,6 +238,8 @@ def main() -> int:
         sync_after_layers=manifest.sync_layer_indices,
         track_group=layout.track_group,
         activation_checkpoint=args.activation_checkpoint,
+        compile_layers=args.compile,
+        compile_mode=args.compile_mode,
     )
     state_src = args.resume_from if args.resume_from else args.tracks_dir
     if args.resume_from:
@@ -377,19 +406,63 @@ def main() -> int:
         windows_since_best = 0
     stop_now = False
 
+    # ----- Optional profiling -----
+    # --profile: pass a fresh `timings` dict into distill_step each step (CUDA-synced
+    # phase wall times) and log a per-step + mean breakdown. Cheap; absolute ms stay
+    # representative. --profile-trace adds a torch.profiler kernel trace over a tiny
+    # fixed window. CRITICAL: the trace is exported only AFTER the loop and after
+    # destroy_process_group(), never inside on_trace_ready mid-loop — the slow rank-0
+    # key_averages/export would otherwise leave peers blocked in the next collective
+    # until the NCCL watchdog (default 600s) aborts the whole run.
+    prof = None
+    prof_running = False
+    prof_dir = None
+    TRACE_START = 3          # steps before this run un-traced (clean warmup)
+    TRACE_ACTIVE = 2         # number of steps captured in the trace
+    phase_keys = ["teacher_fwd", "setup", "block_loop", "student_fwd", "klce", "data_wait"]
+    phase_totals: dict[str, float] = {}
+    profiled_steps = 0
+    if args.profile_trace:
+        prof_dir = Path(args.out_dir) / "profile"
+        if rank == 0:
+            prof_dir.mkdir(parents=True, exist_ok=True)
+        dist.barrier()
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=False,
+            with_stack=False,
+        )
+
     t0 = time.time()
     student.train()
-    for batch in loader:
-        if step >= args.max_steps or stop_now:
+    data_iter = iter(loader)
+    while not (step >= args.max_steps or stop_now):
+        # Open the trace window at a fixed post-warmup step (symmetric across ranks).
+        if prof is not None and not prof_running and step == TRACE_START:
+            prof.start()
+            prof_running = True
+        # Time the (num_workers=0, inline) data fetch separately from compute.
+        t_fetch = time.perf_counter()
+        try:
+            batch = next(data_iter)
+        except StopIteration:
             break
+        data_wait = time.perf_counter() - t_fetch
+
+        t_step = time.perf_counter()
         batch = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in batch.items()}
         if batch["input_ids"].ndim == 1:
             batch = {k: v.unsqueeze(0) for k, v in batch.items()}
 
+        timings: dict[str, float] | None = {} if args.profile else None
+
         optim.zero_grad(set_to_none=True)
         # distill_step now backwards each block immediately to bound peak
         # memory; gradients accumulate on student params internally.
-        losses = distill_step(student, teacher, batch, distill_cfg)
+        losses = distill_step(student, teacher, batch, distill_cfg, timings=timings)
         sync_replicated_grads(replication_plan)
 
         # Global, replication-deduplicated grad norm. Same scalar on every rank,
@@ -405,6 +478,8 @@ def main() -> int:
                 f"(loss={losses['total'].item()}, grad_norm=nan/inf)",
             )
             optim.zero_grad(set_to_none=True)
+            if prof is not None:
+                prof.step()
             step += 1
             continue
 
@@ -417,6 +492,24 @@ def main() -> int:
         optim.step()
         if scheduler is not None:
             scheduler.step()
+
+        if args.profile:
+            timings["data_wait"] = data_wait
+            torch.cuda.synchronize()
+            step_total = (time.perf_counter() - t_step) + data_wait
+            accounted = sum(timings.get(k, 0.0) for k in phase_keys)
+            other = step_total - accounted
+            # Step 0 carries one-time warmup (cuDNN autotune, lazy allocs, first
+            # dataset batch); exclude it from the mean.
+            if step > 0:
+                for k in phase_keys:
+                    phase_totals[k] = phase_totals.get(k, 0.0) + timings.get(k, 0.0)
+                phase_totals["other"] = phase_totals.get("other", 0.0) + other
+                phase_totals["_total"] = phase_totals.get("_total", 0.0) + step_total
+                profiled_steps += 1
+            breakdown = " ".join(f"{k}={timings.get(k, 0.0) * 1e3:.0f}ms" for k in phase_keys)
+            _log(rank, f"[profile step {step}] {breakdown} other={other * 1e3:.0f}ms "
+                       f"total={step_total * 1e3:.0f}ms")
 
         if step % args.log_every == 0:
             elapsed = time.time() - t0
@@ -456,7 +549,31 @@ def main() -> int:
                 _log(rank, f"[early-stop] val_kl hasn't improved in {args.early_stop_patience} windows (best={best_val_kl:.4f})")
                 stop_now = True
 
+        # Close the trace window (symmetric across ranks) once it has run its
+        # TRACE_ACTIVE steps. Remaining steps run un-traced.
+        if prof_running and step >= TRACE_START + TRACE_ACTIVE - 1:
+            torch.cuda.synchronize()
+            prof.stop()
+            prof_running = False
         step += 1
+
+    if prof_running:  # loop ended before the window closed (e.g. tiny --max-steps)
+        torch.cuda.synchronize()
+        prof.stop()
+        prof_running = False
+
+    if args.profile:
+        if profiled_steps > 0:
+            mean_total = phase_totals.get("_total", 0.0) / profiled_steps
+            _log(rank, f"[profile] === mean over {profiled_steps} steps (excl. step 0), rank 0 ===")
+            for k in phase_keys + ["other"]:
+                mean_ms = phase_totals.get(k, 0.0) / profiled_steps * 1e3
+                pct = (phase_totals.get(k, 0.0) / phase_totals["_total"] * 100) if mean_total else 0.0
+                _log(rank, f"[profile]   {k:12s} {mean_ms:9.0f} ms  ({pct:4.1f}%)")
+            _log(rank, f"[profile]   {'TOTAL':12s} {mean_total * 1e3:9.0f} ms")
+        # Peak memory is per-rank; print on every rank (peers host K>rank0 tracks).
+        peak_gb = torch.cuda.max_memory_allocated() / 1e9
+        print(f"[profile] rank {rank} peak CUDA mem allocated: {peak_gb:.2f} GB", flush=True)
 
     if args.save_final:
         _log(rank, "[save] final")
@@ -464,6 +581,16 @@ def main() -> int:
 
     teacher.remove_hooks()
     dist.destroy_process_group()
+
+    # Export the kernel trace only after the process group is gone: key_averages()
+    # and export_chrome_trace() can take minutes, and with no live PG there is no
+    # collective for them to desync and no watchdog to trip. rank 0 only.
+    if prof is not None and rank == 0:
+        trace_path = prof_dir / "trace_rank0.json"
+        prof.export_chrome_trace(str(trace_path))
+        print("[profile] === top kernels by self CUDA time ===", flush=True)
+        print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=30), flush=True)
+        print(f"[profile] chrome trace written to {trace_path}", flush=True)
     return 0
 
 

@@ -52,6 +52,8 @@ class PTWrappedModel(nn.Module):
         sync_after_layers: list[int],
         track_group: "torch.distributed.ProcessGroup | None" = None,
         activation_checkpoint: bool = False,
+        compile_layers: bool = False,
+        compile_mode: str = "default",
     ):
         super().__init__()
         # Late import: pt_converter.adapters imports its registered adapters,
@@ -91,6 +93,23 @@ class PTWrappedModel(nn.Module):
                 for tid in self.local_track_ids
             ]
         )
+        # Per-track decoder layers are tiny at high n_tracks (e.g. 1 attention head
+        # and a 768-wide MLP per track at n_tracks=16) and run in a sequential
+        # Python loop over the K local tracks, so each rank is launch-bound on many
+        # small kernels. Compile each layer's forward in place so inductor fuses the
+        # tiny kernels and cuts launch overhead. We use `layer.compile(...)` (the
+        # in-place nn.Module method) — NOT `torch.compile(layer)`, which wraps the
+        # module in an OptimizedModule and renames state_dict keys to
+        # `...layers.{i}._orig_mod.*`, breaking load_track_state_dicts/save. The
+        # in-place form leaves module identity and state_dict() untouched, so both
+        # forward call sites and all checkpoint I/O keep working. The SyncBoundary
+        # all-reduce lives in the forward loop (outside the layer), so no collective
+        # is captured into a graph. dynamic=False: shapes are static (B, T fixed).
+        if compile_layers:
+            for tm in self.text_models:
+                for layer in tm.layers:
+                    layer.compile(mode=compile_mode, dynamic=False)
+
         # lm_head lives on the owner track only. The final SyncBoundary
         # broadcasts the post-block hidden state to all tracks, so whichever
         # rank hosts the owner already has the correct synced state to

@@ -14,7 +14,14 @@ Requires Python ≥ 3.10, `torch >= 2.4`, `transformers >= 4.57.0.dev0`.
 pip install -e .                # core
 pip install -e ".[test]"        # + pytest
 pip install -e ".[eval]"        # + lm-eval (for scripts/eval_lm_harness.py)
+pip install -e ".[fast]"        # + flash-linear-attention (fused gated-delta kernels; GPU)
 ```
+
+**Strongly recommended for training:** install the `[fast]` extra
+(`flash-linear-attention`). Qwen3.5's 24 linear-attention layers otherwise fall back
+to a slow pure-torch chunked recurrence; the fused Triton kernels are a ~3-4× training
+step speedup (≈9× combined with `--compile` + SDPA). GPU + `triton` only — the test
+suite still runs on CPU via the pure-torch fallback.
 
 ## Directory structure
 
@@ -100,7 +107,7 @@ python scripts/convert_qwen3_5_9b.py \
 
 ## Train
 
-`scripts/train_qwen3_5_9b.py` runs the distillation under `torchrun`. One rank per GPU; each rank hosts `K = n_tracks / world_size` tracks (or fewer on rank 0 if `--rank0-tracks` is set, since rank 0 also owns `embed_tokens` and `lm_head`).
+`scripts/train_qwen3_5_9b.py` runs the distillation under `torchrun`. One rank per GPU; each rank hosts `K = n_tracks / world_size` tracks (or fewer on rank 0 if `--rank0-tracks` is set, since rank 0 also owns `embed_tokens` and `lm_head`). The per-track layers are tiny at high `n_tracks` (e.g. one attention head per track at `n_tracks=16`), so by default each layer is `torch.compile`d (`--compile`, ~2× faster steps) and the full-attention layers use SDPA.
 
 | Flag | Default | Purpose |
 |---|---|---|
@@ -114,6 +121,9 @@ python scripts/convert_qwen3_5_9b.py \
 | `--lr` / `--warmup-steps` / `--lr-min-ratio` | `3e-5` / `0` / `0.1` | AdamW LR + cosine decay floor. |
 | `--max-grad-norm` | `1.0` | Clip gradients before optimizer step. |
 | `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). |
+| `--compile` / `--no-compile` | on | `torch.compile` each per-track decoder layer in place (inductor fusion of the tiny per-track kernels). Default on (~2× faster steps); `--no-compile` to disable. One-time compile warmup on the first steps. |
+| `--compile-mode` | `default` | `torch.compile` mode. `default` (inductor fusion). `reduce-overhead` (CUDA graphs) is experimental here. |
+| `--profile` / `--profile-trace` | off | `--profile`: per-phase CUDA-synced wall-clock breakdown + per-rank peak mem. `--profile-trace`: adds a torch.profiler kernel trace (Chrome trace + key_averages on rank 0). |
 | `--kl-ce-chunk-size` | `128` | Vocab chunking inside `_kl_ce_chunked` to bound peak KL + CE memory. |
 | `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
 | `--kl-temperature` | `1.0` | KL temperature. |

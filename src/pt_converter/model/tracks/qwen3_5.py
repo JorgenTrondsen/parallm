@@ -63,6 +63,14 @@ def build_per_track_text_config(text_config, n_tracks: int):
     cfg.linear_num_key_heads //= n_tracks
     cfg.linear_num_value_heads //= n_tracks
     cfg.intermediate_size //= n_tracks
+    # Per-track decoder layers are built standalone (no PreTrainedModel to resolve an
+    # attention backend), so the full-attention Qwen3_5Attention would default to
+    # eager and materialize a full (T, T) score matrix per head at training seq_len.
+    # Force SDPA: fused, faster, lower-memory. Only affects full-attention layers; the
+    # gated-delta linear-attention path doesn't use the attention interface. The masks
+    # built via create_causal_mask(config=...) follow this setting, so call sites need
+    # no change.
+    cfg._attn_implementation = "sdpa"
     return cfg
 
 
