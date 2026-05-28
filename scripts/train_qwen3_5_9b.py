@@ -101,9 +101,9 @@ def main() -> int:
                    help="0 disables validation. >0 runs val_batches batches of WT-103 val every N steps.")
     p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--early-stop-patience", type=int, default=0,
-                   help="0 disables early stop. Otherwise stop after N eval windows with no val_ce improvement.")
+                   help="0 disables early stop. Otherwise stop after N eval windows with no val_kl improvement.")
     p.add_argument("--min-improvement", type=float, default=0.01,
-                   help="Min val_ce drop (nats) to count as an improvement.")
+                   help="Min val_kl drop to count as an improvement.")
     p.add_argument("--warmup-steps", type=int, default=0,
                    help="Linear warmup steps. 0 disables the LR schedule entirely.")
     p.add_argument("--lr-min-ratio", type=float, default=0.1,
@@ -326,7 +326,7 @@ def main() -> int:
         train_state = {
             "optimizer": optim.state_dict(),
             "step": step,
-            "best_val_ce": best_val_ce,
+            "best_val_kl": best_val_kl,
             "windows_since_best": windows_since_best,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state(),
@@ -336,11 +336,16 @@ def main() -> int:
         torch.save(train_state, str(ck_dir / f"train_state_rank{rank}.pt"))
         dist.barrier()
 
-    def run_eval() -> float:
-        """Run val_batches of validation; return mean val CE (same on all ranks)."""
+    def run_eval() -> tuple[float, float]:
+        """Run val_batches of validation; return (mean val_kl, mean val_ce).
+
+        val_kl drives early stop / best/; val_ce is logged for observability.
+        Both are summed across ranks (peers contribute 0) so every rank sees
+        the same scalars.
+        """
         assert val_loader is not None
         student.eval()
-        ce_sum = torch.zeros((), device=torch.cuda.current_device())
+        sums = torch.zeros(2, device=torch.cuda.current_device())  # [kl, ce]
         n = 0
         for vb in val_loader:
             if n >= args.val_batches:
@@ -348,24 +353,27 @@ def main() -> int:
             vb = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in vb.items()}
             if vb["input_ids"].ndim == 1:
                 vb = {k: v.unsqueeze(0) for k, v in vb.items()}
-            out = validate_step(student, vb)
-            ce_sum = ce_sum + out["ce"]
+            out = validate_step(student, vb, teacher, kl_temperature=args.kl_temperature)
+            sums[0] = sums[0] + out["kl"]
+            sums[1] = sums[1] + out["ce"]
             n += 1
         student.train()
-        # On peer tracks every per-batch CE was 0; owner's sum is the real
-        # total. all_reduce SUM lets all ranks see the same mean.
-        dist.all_reduce(ce_sum, op=dist.ReduceOp.SUM)
-        return (ce_sum / max(1, n)).item()
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        sums = sums / max(1, n)
+        return sums[0].item(), sums[1].item()
 
     if resume_state is not None:
         step = int(resume_state["step"])
-        best_val_ce = float(resume_state["best_val_ce"])
-        windows_since_best = int(resume_state["windows_since_best"])
-        _log(rank, f"[init] resumed at step={step} best_val_ce={best_val_ce:.4f} "
+        # .get for back-compat with pre-val_kl checkpoints: the old metric
+        # (best_val_ce) is in different units and not comparable, so we just
+        # start val_kl tracking fresh on resume from such a checkpoint.
+        best_val_kl = float(resume_state.get("best_val_kl", float("inf")))
+        windows_since_best = int(resume_state.get("windows_since_best", 0))
+        _log(rank, f"[init] resumed at step={step} best_val_kl={best_val_kl:.4f} "
                    f"windows_since_best={windows_since_best}")
     else:
         step = 0
-        best_val_ce = float("inf")
+        best_val_kl = float("inf")
         windows_since_best = 0
     stop_now = False
 
@@ -427,22 +435,25 @@ def main() -> int:
             save_checkpoint(f"step_{step}")
 
         if val_loader is not None and step > 0 and step % args.eval_every == 0:
-            val_ce = run_eval()
-            improved = val_ce < (best_val_ce - args.min_improvement)
+            val_kl, val_ce = run_eval()
+            improved = val_kl < (best_val_kl - args.min_improvement)
             if improved:
-                best_val_ce = val_ce
+                best_val_kl = val_kl
                 windows_since_best = 0
-                _log(rank, f"[eval step={step}] val_ce={val_ce:.4f} (new best)")
+                _log(
+                    rank,
+                    f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f} (new best)",
+                )
                 save_checkpoint("best")
             else:
                 windows_since_best += 1
                 _log(
                     rank,
-                    f"[eval step={step}] val_ce={val_ce:.4f} "
+                    f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f} "
                     f"(no improvement; {windows_since_best}/{args.early_stop_patience})",
                 )
             if args.early_stop_patience > 0 and windows_since_best >= args.early_stop_patience:
-                _log(rank, f"[early-stop] val_ce hasn't improved in {args.early_stop_patience} windows (best={best_val_ce:.4f})")
+                _log(rank, f"[early-stop] val_kl hasn't improved in {args.early_stop_patience} windows (best={best_val_kl:.4f})")
                 stop_now = True
 
         step += 1

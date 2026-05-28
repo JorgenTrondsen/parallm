@@ -118,7 +118,7 @@ python scripts/convert_qwen3_5_9b.py \
 | `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
 | `--kl-temperature` | `1.0` | KL temperature. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
-| `--eval-every` / `--val-batches` | `0` / `20` | Held-out CE eval cadence and size. |
+| `--eval-every` / `--val-batches` | `0` / `20` | Held-out KL(teacher ‖ student) eval cadence and size; val_ce also logged. |
 | `--early-stop-patience` / `--min-improvement` | `0` / `0.01` | Optional early stopping. |
 | `--seed` | `42` | Seeds torch / cuda / python / numpy. |
 | `--log-every` | `10` | Log cadence. |

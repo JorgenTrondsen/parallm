@@ -343,14 +343,17 @@ def distill_step(
 def validate_step(
     student: PTWrappedModel,
     batch: dict[str, torch.Tensor],
+    teacher: HookedTeacher,
+    kl_temperature: float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Forward-only LM CE on a held-out batch.
+    """Forward-only KL(teacher || student) and LM CE on a held-out batch.
 
     All ranks call the full student forward so the cross-track SyncBoundary
-    all-reduces match; only the rank that owns track 0 has lm_head and
-    computes CE — peer ranks return a zero placeholder. The caller is
-    responsible for aggregating across ranks (typically all_reduce SUM,
-    since peers are 0).
+    all-reduces match; only the rank that owns track 0 has lm_head and can
+    compute the metrics — peer ranks return zero placeholders. The teacher
+    forward also runs only on the owner rank (peers have nothing to compare
+    against). The caller is responsible for aggregating across ranks
+    (typically all_reduce SUM, since peers are 0).
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
@@ -360,6 +363,11 @@ def validate_step(
     )
     if student_logits is not None:
         ce = lm_cross_entropy(student_logits, labels)
+        teacher_logits, _ = teacher.forward(input_ids, attention_mask=attention_mask)
+        kl = logit_kl(
+            student_logits, teacher_logits, attention_mask, temperature=kl_temperature
+        )
     else:
         ce = torch.zeros((), device=input_ids.device)
-    return {"ce": ce}
+        kl = torch.zeros((), device=input_ids.device)
+    return {"ce": ce, "kl": kl}
