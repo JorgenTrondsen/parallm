@@ -47,6 +47,8 @@ checkpoints/
 outputs/
 runs/
 wandb/
+convert_out/
+train_out/
 
 # HuggingFace cache
 .cache/

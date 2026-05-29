@@ -14,6 +14,7 @@ per-track config builder, and instantiates its `track_text_model_cls`.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -38,6 +39,9 @@ class PTTrackTextModelConfig:
     n_tracks: int
     sync_after_layers: tuple[int, ...]
     track_id: int = 0
+    # When False, track 0 does NOT build its full [V,H] embed_tokens — the
+    # vocab-parallel path hosts a sharded embedding on the wrapper instead.
+    host_embed_tokens: bool = True
 
 
 class PTWrappedModel(nn.Module):
@@ -54,6 +58,9 @@ class PTWrappedModel(nn.Module):
         activation_checkpoint: bool = False,
         compile_layers: bool = False,
         compile_mode: str = "default",
+        vocab_parallel: bool = False,
+        vp_world_size: int = 1,
+        vp_rank: int = 0,
     ):
         super().__init__()
         # Late import: pt_converter.adapters imports its registered adapters,
@@ -70,13 +77,33 @@ class PTWrappedModel(nn.Module):
         self.local_track_ids = tuple(local_track_ids)
         self.sync_after_layers = tuple(sync_after_layers)
         self._adapter = adapter  # held for `load_track_state_dicts` remap
-        # Per-layer activation checkpointing. Effective on every rank when the
-        # flag is set: peer ranks (K>1) never backward through the full forward
-        # (no recompute cost at all), and the lm_head rank's KL+CE backward is
-        # now a single `hidden.backward(grad_h_accum)` call (one recompute pass
-        # through the layers, not N_chunks). Needed to fit n_tracks=16 at
-        # seq_len=4096 on 40 GB GPUs.
+        # Per-layer activation checkpointing of the full student forward. Under
+        # vocab-parallel (the default) EVERY rank backwards through that forward
+        # — `_kl_ce_vocab_parallel` ends in one `hidden.backward(grad_h_accum)`
+        # on every rank — so checkpointing trades the held forward graph (the
+        # ~25 GB `student_fwd`/`klce` peak) for one recompute pass on every rank,
+        # lowering the peak uniformly. (Legacy --no-vocab-parallel: only the
+        # lm_head-owner rank backwards; peers run the forward for collective
+        # ordering and pay no recompute.) The KL/CE backward is a single
+        # `hidden.backward` either way (not per-chunk). This is the lever for
+        # fitting larger batch sizes at seq_len=4096 on 40 GB GPUs.
         self._use_checkpoint = activation_checkpoint
+
+        # ----- Vocab-parallel (tensor-parallel over V) setup -----
+        # When enabled, embed_tokens + lm_head + the KL/CE softmax are sharded
+        # over the vocab dimension across all `vp_world_size` ranks (rank `r`
+        # owns rows [v_lo, v_hi)). This decouples those full-vocab-sized tensors
+        # from track-0 ownership, balancing memory and parallelizing the KL/CE
+        # phase. See `pt_converter.model.vocab_parallel`.
+        self.vocab_parallel = vocab_parallel
+        self.vp_world_size = vp_world_size
+        self.vp_rank = vp_rank
+        self.vp_group = track_group  # spans one rank per GPU (== WORLD here)
+        if vocab_parallel:
+            from pt_converter.model.vocab_parallel import vocab_range
+            self.v_lo, self.v_hi = vocab_range(text_config.vocab_size, vp_world_size, vp_rank)
+        else:
+            self.v_lo, self.v_hi = 0, text_config.vocab_size
 
         self.sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
         self.text_models = nn.ModuleList(
@@ -87,6 +114,7 @@ class PTWrappedModel(nn.Module):
                         n_tracks=n_tracks,
                         sync_after_layers=tuple(sync_after_layers),
                         track_id=tid,
+                        host_embed_tokens=not vocab_parallel,
                     ),
                     sync_module=self.sync_module,
                 )
@@ -110,27 +138,43 @@ class PTWrappedModel(nn.Module):
                 for layer in tm.layers:
                     layer.compile(mode=compile_mode, dynamic=False)
 
-        # lm_head lives on the owner track only. The final SyncBoundary
-        # broadcasts the post-block hidden state to all tracks, so whichever
-        # rank hosts the owner already has the correct synced state to
-        # project to logits. Peer ranks return logits=None from forward.
-        if self.LM_HEAD_OWNER_TRACK in self.local_track_ids:
-            self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+        if vocab_parallel:
+            # Vocab-parallel: every rank holds the embed + lm_head shard for its
+            # vocab range [v_lo, v_hi). The embedding is summed across ranks
+            # (one all-reduce in `embed`); lm_head produces this rank's logit
+            # slice, consumed by the vocab-parallel KL/CE in `train/distill.py`.
+            from pt_converter.model.vocab_parallel import VocabParallelEmbedding
+            self.vp_embed = VocabParallelEmbedding(
+                text_config.vocab_size,
+                text_config.hidden_size,
+                self.v_lo,
+                self.v_hi,
+                padding_idx=getattr(text_config, "pad_token_id", None),
+            )
+            self.lm_head = nn.Linear(text_config.hidden_size, self.v_hi - self.v_lo, bias=False)
         else:
-            self.lm_head = None
+            # lm_head lives on the owner track only. The final SyncBoundary
+            # broadcasts the post-block hidden state to all tracks, so whichever
+            # rank hosts the owner already has the correct synced state to
+            # project to logits. Peer ranks return logits=None from forward.
+            self.vp_embed = None
+            if self.LM_HEAD_OWNER_TRACK in self.local_track_ids:
+                self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
+            else:
+                self.lm_head = None
 
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.LongTensor | None = None,
-        return_sync_hiddens: bool = False,
-        return_hidden_pre_lm_head: bool = False,
-    ):
-        # Local import: keeps the engine model-family-agnostic at import time.
-        from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+    def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        """Full input embedding (B, S, H), grad-connected, identical on every rank.
 
-        # 1. Embed (owner only) + cross-track broadcast via the zero-padded sync.
+        Vocab-parallel: each rank looks up its vocab shard (zeros elsewhere) and
+        the partials are summed via one all-reduce. Non-VP (legacy): the owner
+        track embeds the full vocab, peers contribute zeros, and the same sum
+        broadcasts it to every track. Both go through `sync_module`, so the
+        cross-track collective ordering is identical.
+        """
+        if self.vocab_parallel:
+            partial = self.vp_embed(input_ids)
+            return self.sync_module([partial], torch.zeros_like(partial))
         embeds_per_track: list[torch.Tensor] = []
         for tm in self.text_models:
             if tm.embed_tokens is not None:
@@ -146,7 +190,22 @@ class PTWrappedModel(nn.Module):
                         dtype=tm.norm.weight.dtype,
                     )
                 )
-        h = self.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+        return self.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        return_sync_hiddens: bool = False,
+        return_hidden_pre_lm_head: bool = False,
+    ):
+        # Local import: keeps the engine model-family-agnostic at import time.
+        from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
+        # 1. Embed (vocab-parallel slice, or legacy owner-only) + cross-track
+        #    broadcast via the all-reduce in `embed`.
+        h = self.embed(input_ids)
 
         # 2. Scaffolding (rotary, masks) computed once — every track's per-track
         # config is identical, so reuse the first track's modules.
@@ -218,6 +277,11 @@ class PTWrappedModel(nn.Module):
         # collective ordering matched (peers must still run the full forward).
         if return_hidden_pre_lm_head:
             return h, sync_hiddens
+        # NOTE: in vocab-parallel mode `self.lm_head(h)` is only this rank's
+        # vocab SLICE (B, T, v_hi-v_lo), not full logits — callers needing the
+        # logit objective must request the hidden state and use the
+        # vocab-parallel KL/CE in `train/distill.py`. The legacy path returns
+        # full (B, T, V) logits on the owner and None on peers.
         logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, sync_hiddens
 
@@ -249,6 +313,12 @@ class PTWrappedModel(nn.Module):
             track_state = track_states[tid]
             prefix = f"text_models.{k}."
             for key, val in track_state.items():
+                if key in ("embed_tokens.weight", "lm_head.weight") and self.vocab_parallel:
+                    # Vocab-parallel: embed + lm_head are sharded onto the
+                    # wrapper's vp_embed / lm_head via load_vocab_parallel_weights,
+                    # not into the per-track text models. Skip the full tensors
+                    # here (they only appear in the track-0 shard).
+                    continue
                 if key == "embed_tokens.weight":
                     remapped[prefix + "embed_tokens.weight"] = val
                 elif key == "norm.weight":
@@ -266,7 +336,64 @@ class PTWrappedModel(nn.Module):
             # rotary buffer keys (e.g. text_models.{k}.rotary_emb.inv_freq) may
             # legitimately be missing — they're computed at init.
             missing_critical = [k for k in missing if "rotary_emb" not in k]
+            if self.vocab_parallel:
+                # vp_embed.weight / lm_head.weight are loaded separately via
+                # load_vocab_parallel_weights, so they're expected-missing here.
+                missing_critical = [
+                    k for k in missing_critical
+                    if not (k.startswith("vp_embed.") or k.startswith("lm_head."))
+                ]
             if missing_critical or unexpected:
                 raise RuntimeError(
                     f"load_track_state_dicts mismatch:\n  missing={missing_critical}\n  unexpected={unexpected}"
                 )
+
+    def load_vocab_parallel_weights(
+        self,
+        full_embed_weight: torch.Tensor,
+        full_lm_head_weight: torch.Tensor,
+    ) -> None:
+        """Slice the full `[V, H]` embed + lm_head into this rank's vocab shard.
+
+        Every rank calls this with the *full* tensors (read from the track-0
+        shard, where the slicer stores them as `OwnerOnly`); each keeps rows
+        `[v_lo, v_hi)`. Keeps the on-disk checkpoint format unchanged.
+        """
+        if not self.vocab_parallel:
+            raise RuntimeError("load_vocab_parallel_weights called on a non-vocab-parallel model")
+        with torch.no_grad():
+            self.vp_embed.weight.copy_(full_embed_weight[self.v_lo:self.v_hi].to(self.vp_embed.weight.dtype))
+            self.lm_head.weight.copy_(full_lm_head_weight[self.v_lo:self.v_hi].to(self.lm_head.weight.dtype))
+
+    def gather_vocab_parallel_weights(self) -> "tuple[torch.Tensor, torch.Tensor] | None":
+        """All-gather the embed + lm_head vocab shards → full `[V, H]` on rank 0.
+
+        Returns `(embed_weight, lm_head_weight)` on rank 0 (both full vocab) and
+        `None` on peers, so `save_checkpoint` can write the unchanged on-disk
+        format (full tensors in the track-0 shard). Shards are zero-padded to a
+        uniform width for the collective, then trimmed back to `V`.
+        """
+        if not self.vocab_parallel:
+            raise RuntimeError("gather_vocab_parallel_weights called on a non-vocab-parallel model")
+        import torch.distributed as dist
+        V = self.text_config.vocab_size
+        shard = math.ceil(V / self.vp_world_size)
+        H = self.text_config.hidden_size
+
+        def _gather(local: torch.Tensor) -> "torch.Tensor | None":
+            padded = local.new_zeros((shard, H))
+            padded[: local.shape[0]] = local
+            if dist.is_initialized() and self.vp_group is not None:
+                out = [torch.empty_like(padded) for _ in range(self.vp_world_size)]
+                dist.all_gather(out, padded, group=self.vp_group)
+            else:
+                out = [padded]
+            if self.vp_rank != 0:
+                return None
+            return torch.cat(out, dim=0)[:V].contiguous()
+
+        embed_full = _gather(self.vp_embed.weight.detach())
+        lm_head_full = _gather(self.lm_head.weight.detach())
+        if self.vp_rank != 0:
+            return None
+        return embed_full, lm_head_full

@@ -58,7 +58,8 @@ class HookedTeacher:
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
-        self._captures.clear()
+        # Install a fresh dict the hooks write into this forward.
+        self._captures = {}
         outputs = self.text_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -66,6 +67,10 @@ class HookedTeacher:
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        # Hand back a copy so the caller can mutate without surprising us.
-        captures = dict(self._captures)
+        # Hand the caller SOLE ownership of the captures and drop our reference,
+        # so the caller can free each hidden state (pop/del) as it is consumed
+        # — otherwise the 8 (B,T,H) bf16 tensors stay resident for the whole
+        # step (grows ×B, the headroom we want back for larger batch sizes).
+        captures = self._captures
+        self._captures = {}
         return logits, captures

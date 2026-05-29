@@ -51,9 +51,11 @@ def wrap_student_with_fsdp(
 
 def wrap_teacher_with_fsdp(
     text_model: nn.Module,
-    lm_head: nn.Module,
+    lm_head: nn.Module | None = None,
     *,
     param_dtype: torch.dtype = torch.bfloat16,
+    compile_layers: bool = False,
+    compile_mode: str = "default",
 ) -> None:
     """Shard the frozen teacher across the world group (one rank per GPU).
 
@@ -62,9 +64,18 @@ def wrap_teacher_with_fsdp(
     on those exact modules — not on a parent wrapper. We also shard each
     decoder layer individually so only one layer's parameters are
     all-gathered at a time during the forward pass.
+
+    ``lm_head=None`` skips sharding the head — used by the vocab-parallel path,
+    where the teacher's lm_head is a small per-rank vocab-row shard (already
+    ~1/world_size, no FSDP needed). ``compile_layers`` torch.compiles each
+    decoder layer in place *before* fully_shard (compile-then-shard order); the
+    teacher runs under no_grad so this is inference-only.
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=param_dtype)
     for layer in text_model.layers:
+        if compile_layers:
+            layer.compile(mode=compile_mode, dynamic=False)
         fully_shard(layer, mp_policy=mp_policy)
     fully_shard(text_model, mp_policy=mp_policy)
-    fully_shard(lm_head, mp_policy=mp_policy)
+    if lm_head is not None:
+        fully_shard(lm_head, mp_policy=mp_policy)

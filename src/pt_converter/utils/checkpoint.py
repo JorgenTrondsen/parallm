@@ -37,6 +37,27 @@ def load_track(checkpoint_dir: str | Path, track_id: int) -> dict[str, torch.Ten
     return load_safetensors(str(Path(checkpoint_dir) / f"track_{track_id}.safetensors"))
 
 
+def load_track_keys(
+    checkpoint_dir: str | Path, track_id: int, keys: list[str]
+) -> dict[str, torch.Tensor]:
+    """Load only `keys` from `track_{track_id}.safetensors` (mmap, no full read).
+
+    Used by the vocab-parallel loader so every rank can read just the full
+    embed_tokens / lm_head tensors from the track-0 shard without materializing
+    the whole shard. Missing keys are silently skipped (e.g. tied lm_head).
+    """
+    from safetensors import safe_open
+
+    path = str(Path(checkpoint_dir) / f"track_{track_id}.safetensors")
+    out: dict[str, torch.Tensor] = {}
+    with safe_open(path, framework="pt", device="cpu") as f:
+        present = set(f.keys())
+        for k in keys:
+            if k in present:
+                out[k] = f.get_tensor(k)
+    return out
+
+
 def load_manifest(checkpoint_dir: str | Path) -> PTManifest:
     data = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
     shapes = {k: tuple(v) for k, v in data.pop("per_track_param_shapes").items()}

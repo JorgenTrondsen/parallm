@@ -9,9 +9,13 @@ both on a held-out stream. Reports:
   - Per-sync-boundary hidden-state MSE
   - Student vs teacher perplexity (and gap)
 
-The launch shape mirrors ``scripts/train_qwen3_5_9b.py``. The layout flags
-(``--rank0-tracks``) must match what training used so the per-rank track
-ownership lines up with the checkpoint's per-rank ``track_*.safetensors``.
+The launch shape mirrors ``scripts/train_qwen3_5_9b.py``. The layout is uniform
+(K = n_tracks // world_size); forward output is layout-independent (the
+SyncBoundary all-reduce combines all tracks regardless of which rank hosts
+them), so it need not match training. Eval uses the legacy full-logits student
+path (full lm_head on the owner rank) — it loads a vocab-parallel-trained
+checkpoint unchanged (track_0 carries the gathered full embed/lm_head) and
+yields full-vocab logits for the fidelity metrics.
 
 Single node, 8 GPUs, n_tracks=16, best checkpoint:
 
@@ -45,24 +49,6 @@ def _log(rank: int, msg: str) -> None:
         print(msg, flush=True)
 
 
-def _compute_tracks_per_rank_list(n_tracks: int, world_size: int, rank0_tracks: int) -> list[int]:
-    """Same asymmetric-layout derivation as train_qwen3_5_9b.py.
-
-    Replicated here rather than imported because the train script is an entry
-    point, not a library module. Keep this in sync with the train script's
-    body if the layout policy changes.
-    """
-    remaining = n_tracks - rank0_tracks
-    peers = world_size - 1
-    if rank0_tracks <= 0 or peers <= 0 or remaining < peers:
-        raise ValueError(
-            f"--rank0-tracks={rank0_tracks} invalid for n_tracks={n_tracks}, "
-            f"world_size={world_size}: each peer must get at least one track."
-        )
-    base, extra = divmod(remaining, peers)
-    return [rank0_tracks] + [base + (1 if i < extra else 0) for i in range(peers)]
-
-
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--hf-model", required=True, help="Dense teacher model path (same as training)")
@@ -79,9 +65,6 @@ def main() -> int:
     p.add_argument("--chunk-size", type=int, default=128,
                    help="Seq-chunk size for the vocab-wide fp32 expansion; matches "
                         "--kl-ce-chunk-size in training.")
-    p.add_argument("--rank0-tracks", type=int, default=None,
-                   help="MUST match the layout the checkpoint was trained with. "
-                        "Default = n_tracks // world_size (uniform).")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -94,24 +77,15 @@ def main() -> int:
         )
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
 
-    # ----- Manifest + layout. Same policy as train_qwen3_5_9b.py so the
-    # per-rank track ownership matches the on-disk track_*.safetensors. -----
+    # ----- Manifest + uniform layout (forward output is layout-independent). -----
     manifest = load_manifest(args.checkpoint_dir)
-    tracks_per_rank_list = None
-    if args.rank0_tracks is not None:
-        tracks_per_rank_list = _compute_tracks_per_rank_list(
-            manifest.n_tracks, world_size, args.rank0_tracks
-        )
-    layout = build_groups(n_tracks=manifest.n_tracks, tracks_per_rank_list=tracks_per_rank_list)
+    layout = build_groups(n_tracks=manifest.n_tracks)
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
         f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
     )
-    if tracks_per_rank_list is not None:
-        _log(rank, f"[init] non-uniform layout K_per_rank={tracks_per_rank_list}")
     _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
 
     # ----- Teacher (frozen, FSDP-sharded across the world). -----

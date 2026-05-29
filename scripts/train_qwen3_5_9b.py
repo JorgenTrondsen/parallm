@@ -9,13 +9,19 @@ Single node, 8 GPUs, n_tracks=16  →  K=2 per rank:
 
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
-        --hf-model /home2/jtr020/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-        --tracks-dir /path/to/pt_tracks \
-        --rank0-tracks 1 --activation-checkpoint \
+        --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+        --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
+        --activation-checkpoint \
         --max-steps 1000 \
         --seq-len 4096 \
         --batch-size 1 \
         --lr 3e-5
+
+    Vocab-parallel (default) shards embed_tokens + lm_head + KL/CE over all
+    ranks, so the layout is uniform K = n_tracks // world_size (no straggler) and
+    no rank specially carries the embed/lm_head. --no-vocab-parallel selects the
+    legacy track-0-owner path (full embed/lm_head on rank 0; memory-heavy at
+    n_tracks=16 on 40 GB).
 
 Two nodes × 8 GPUs, n_tracks=16  →  K=1 per rank:
 
@@ -48,6 +54,7 @@ from pt_converter.adapters import get_adapter_for_config
 from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
 from pt_converter.dist.groups import build_groups
 from pt_converter.model.pt_model import PTWrappedModel
+from pt_converter.model.vocab_parallel import vocab_range
 from pt_converter.train.data import CalibrationDataConfig, PackedTokenStream
 from pt_converter.train.distill import DistillConfig, distill_step, validate_step
 from pt_converter.train.sync_grads import (
@@ -57,7 +64,14 @@ from pt_converter.train.sync_grads import (
     sync_replicated_grads,
 )
 from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_manifest, load_track
+from pt_converter.utils.checkpoint import load_manifest, load_track, load_track_keys
+from pt_converter.utils.mem_report import (
+    component_breakdown,
+    device_mem,
+    format_report,
+    log_stage,
+    print_all_ranks,
+)
 
 
 def _log(rank: int, msg: str):
@@ -77,23 +91,38 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--activation-checkpoint", action="store_true",
-                   help="Per-layer activation checkpointing in PTWrappedModel.forward. "
-                        "Only takes effect on K>1 (peer) ranks — those never backward "
-                        "through the full forward (their student_logits is None), so "
-                        "recompute never runs and the saved-input-only forward is pure "
-                        "memory savings. Needed to fit n_tracks=16 / K>=3 / seq=4096 "
-                        "on 40 GB GPUs.")
+                   help="Per-layer activation checkpointing of the full student forward. "
+                        "Under vocab-parallel (default) EVERY rank backwards through that "
+                        "forward (the KL/CE phase ends in one hidden.backward per rank), so "
+                        "this trades the held forward graph — the ~25 GB student_fwd/klce "
+                        "peak — for one recompute pass, lowering the peak on every rank. "
+                        "(Legacy --no-vocab-parallel: only the lm_head-owner rank backwards, "
+                        "so it helps that rank; peers pay no recompute.) Compute ↑, memory ↓ "
+                        "— the lever for fitting a larger --batch-size at seq=4096 on 40 GB GPUs.")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile each per-track decoder layer in place "
                         "(default: on; use --no-compile to disable). Inductor fusion of "
                         "the tiny per-track kernels; cuts launch overhead, biggest win on "
                         "the high-K straggler rank. Math unchanged; first steps pay a "
                         "one-time compile warmup.")
+    p.add_argument("--vocab-parallel", action=argparse.BooleanOptionalAction, default=True,
+                   help="Vocab/tensor-parallel embed_tokens + lm_head + KL/CE across all "
+                        "ranks (default: on; --no-vocab-parallel for the legacy track-0-owner "
+                        "path). Shards the full-vocab tensors and the KL/CE fp32 softmax over "
+                        "the world, balancing memory (rank 0 no longer carries embed+lm_head+"
+                        "klce alone) and parallelizing the previously rank-0-serial klce phase. "
+                        "On-disk checkpoint format is unchanged (gather-on-save into track 0). "
+                        "The layout is uniform K = n_tracks // world_size.")
     p.add_argument("--compile-mode", default="default",
                    help="torch.compile mode. 'default' = inductor fusion only "
                         "(recommended). 'reduce-overhead' (CUDA graphs) is "
                         "experimental here — can conflict with activation-checkpoint "
                         "recompute and needs static memory.")
+    p.add_argument("--compile-teacher", action=argparse.BooleanOptionalAction, default=True,
+                   help="torch.compile each frozen-teacher decoder layer (in-place, before "
+                        "fully_shard), inference-only. Separate from --compile so it can be "
+                        "disabled alone if it conflicts with FSDP2 or the sync-boundary "
+                        "forward hooks; --no-compile-teacher falls back to eager teacher.")
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global, replication-deduplicated grad-norm clip. <=0 disables clipping.")
     p.add_argument("--save-every", type=int, default=0,
@@ -114,13 +143,32 @@ def main() -> int:
                         "Implies --profile. NOTE: CUDA activity tracing inflates the "
                         "absolute per-phase ms during its active window — use it for "
                         "kernel-level attribution, not for wall-clock budgeting.")
+    p.add_argument("--mem-report", action="store_true",
+                   help="Per-rank breakdown of what occupies GPU memory: lifecycle "
+                        "deltas at each init stage (baseline / teacher / student / "
+                        "optimizer), a measured resident-component table (teacher shard, "
+                        "student params, grads, AdamW state — actual bytes/dtype, not "
+                        "assumed), the transient per-phase activation peak inside one "
+                        "distill step, and the allocated-vs-reserved-vs-device gap "
+                        "(CUDA ctx + NCCL). Cheap; off = zero overhead. NOTE: if combined "
+                        "with --profile, the final --profile peak reflects steps after "
+                        "the --mem-report-step capture (which resets peak stats).")
+    p.add_argument("--mem-report-step", type=int, default=3,
+                   help="Step on which --mem-report captures per-phase memory and the "
+                        "resident-component breakdown. Default 3 (post compile/cuDNN "
+                        "warmup, so peaks are steady-state); clamped to < --max-steps, "
+                        "falling back to the last step on tiny runs.")
     p.add_argument("--lambda-block", type=float, default=1.0)
     p.add_argument("--lambda-kl", type=float, default=1.0)
     p.add_argument("--lambda-ce", type=float, default=0.5)
     p.add_argument("--kl-temperature", type=float, default=1.0)
-    p.add_argument("--kl-ce-chunk-size", type=int, default=128,
+    p.add_argument("--kl-ce-chunk-size", type=int, default=512,
                    help="Seq-chunk size for the KL+CE pass; caps the per-chunk fp32 "
-                        "(B, chunk, V) expansion on the lm_head-owning rank.")
+                        "(B, chunk, V/world) expansion. Each chunk runs 3 small all-reduces "
+                        "+ one autograd.grad and the klce phase is collective/dispatch-bound, "
+                        "so larger = fewer chunks = faster (512 → 8 chunks at seq=4096 vs 32 "
+                        "at 128, ~4x fewer collectives) at negligible extra memory. The fp32 "
+                        "transient grows ×batch, so keep this moderate at large --batch-size.")
     p.add_argument("--eval-every", type=int, default=0,
                    help="0 disables validation. >0 runs val_batches batches of WT-103 val every N steps.")
     p.add_argument("--val-batches", type=int, default=20)
@@ -136,13 +184,6 @@ def main() -> int:
                    help="Seed for torch / cuda / python / numpy RNGs. Same on every rank "
                         "(no per-rank randomness in this pipeline). Restored from a "
                         "resumed train_state if present.")
-    p.add_argument("--rank0-tracks", type=int, default=None,
-                   help="Number of student tracks to host on rank 0 (which also owns "
-                        "embed_tokens + lm_head). Default = n_tracks // world_size "
-                        "(uniform). Lower values shift the imbalance off rank 0; the "
-                        "displaced tracks are distributed as evenly as possible across "
-                        "ranks 1..world_size-1, with any remainder going to the earliest "
-                        "peer ranks.")
     args = p.parse_args()
     # --profile-trace implies the phase timers; the trace is an add-on.
     if args.profile_trace:
@@ -160,6 +201,22 @@ def main() -> int:
         )
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
+    world_size = dist.get_world_size()
+
+    # ----- Memory-report lifecycle hook -----
+    # Records a device_mem() snapshot at each init stage (for the final report's
+    # lifecycle recap) and logs it per rank. No-op unless --mem-report.
+    mem_stages: dict[str, dict[str, float]] = {}
+
+    def mem_stage(label: str):
+        if not args.mem_report:
+            return
+        mem_stages[label] = device_mem()
+        log_stage(rank, world_size, label)
+
+    if args.mem_report:
+        torch.cuda.reset_peak_memory_stats()
+        mem_stage("baseline (post set_device)")
 
     # ----- RNG seed (same on every rank; no per-rank randomness in this pipeline) -----
     torch.manual_seed(args.seed)
@@ -185,29 +242,17 @@ def main() -> int:
             _log(rank, f"[init] WARNING: --resume-from set but no {train_state_path.name}; optimizer/step will start fresh")
 
     # ----- Load manifest and groups -----
+    # Uniform layout: K = n_tracks // world_size tracks per rank. (The old
+    # asymmetric --rank0-tracks layout existed only to keep embed/lm_head off the
+    # busiest rank; vocab-parallel shards those across all ranks, so uniform is
+    # now always correct.)
     manifest = load_manifest(args.tracks_dir)
-    tracks_per_rank_list = None
-    if args.rank0_tracks is not None:
-        world_size = dist.get_world_size()
-        k0 = args.rank0_tracks
-        remaining = manifest.n_tracks - k0
-        peers = world_size - 1
-        if k0 <= 0 or peers <= 0 or remaining < peers:
-            raise ValueError(
-                f"--rank0-tracks={k0} invalid for n_tracks={manifest.n_tracks}, "
-                f"world_size={world_size}: each peer must get at least one track."
-            )
-        base, extra = divmod(remaining, peers)
-        # Earliest peers absorb the remainder so the layout is deterministic.
-        tracks_per_rank_list = [k0] + [base + (1 if i < extra else 0) for i in range(peers)]
-    layout = build_groups(n_tracks=manifest.n_tracks, tracks_per_rank_list=tracks_per_rank_list)
+    layout = build_groups(n_tracks=manifest.n_tracks)
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
         f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
     )
-    if tracks_per_rank_list is not None:
-        _log(rank, f"[init] non-uniform layout K_per_rank={tracks_per_rank_list}")
     _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
 
     # ----- Load teacher (dense) -----
@@ -221,13 +266,40 @@ def main() -> int:
         param.requires_grad = False
     # Use the inner text decoder for hidden-state hooks.
     text_model = teacher_model.model.language_model if hasattr(teacher_model.model, "language_model") else teacher_model.model
+    teacher_model = teacher_model.to(torch.cuda.current_device())
+
+    # Teacher lm_head: vocab-parallel mode gives it a per-rank vocab-row shard
+    # [v_lo, v_hi) (matching the student) so each rank computes only its
+    # (B,T,Vs) teacher logit slice — 1/world_size of the matmul, and no resident
+    # full (B,T,V) logits tensor. The full head is then dropped. The text_model
+    # is FSDP-sharded either way (its forward produces the full hidden states
+    # every rank needs). Legacy: full lm_head, FSDP-sharded.
+    if args.vocab_parallel:
+        v_lo, v_hi = vocab_range(cfg.text_config.vocab_size, world_size, rank)
+        full_w = teacher_model.lm_head.weight
+        shard = torch.nn.Linear(full_w.shape[1], v_hi - v_lo, bias=False).to(
+            device=full_w.device, dtype=full_w.dtype
+        )
+        with torch.no_grad():
+            shard.weight.copy_(full_w[v_lo:v_hi])
+        shard.weight.requires_grad = False
+        teacher_model.lm_head = shard  # drop the full head (frees ~2 GB if untied)
+        teacher_lm_head = shard
+        fsdp_lm_head = None
+    else:
+        teacher_lm_head = teacher_model.lm_head
+        fsdp_lm_head = teacher_model.lm_head
+
     teacher = HookedTeacher(
         text_model=text_model,
-        lm_head=teacher_model.lm_head,
+        lm_head=teacher_lm_head,
         sync_layer_indices=manifest.sync_layer_indices,
     )
-    teacher_model = teacher_model.to(torch.cuda.current_device())
-    wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
+    wrap_teacher_with_fsdp(
+        text_model, fsdp_lm_head,
+        compile_layers=args.compile_teacher, compile_mode=args.compile_mode,
+    )
+    mem_stage("teacher loaded (FSDP-sharded)")
 
     # ----- Build per-rank student and load its K track shards -----
     _log(rank, f"[init] building PT student for tracks {layout.local_track_ids}…")
@@ -240,14 +312,29 @@ def main() -> int:
         activation_checkpoint=args.activation_checkpoint,
         compile_layers=args.compile,
         compile_mode=args.compile_mode,
+        vocab_parallel=args.vocab_parallel,
+        vp_world_size=world_size,
+        vp_rank=rank,
     )
     state_src = args.resume_from if args.resume_from else args.tracks_dir
     if args.resume_from:
         _log(rank, f"[init] resuming track state from {args.resume_from}")
     track_states = {tid: load_track(state_src, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
+    if args.vocab_parallel:
+        # Every rank reads the FULL [V,H] embed + lm_head from the track-0 shard
+        # (the slicer stores them there, OwnerOnly) and keeps its vocab slice.
+        # lm_head may be tied to embed_tokens — fall back to embed if absent.
+        ht = load_track_keys(state_src, PTWrappedModel.LM_HEAD_OWNER_TRACK,
+                             ["embed_tokens.weight", "lm_head.weight"])
+        full_embed = ht["embed_tokens.weight"]
+        full_lm_head = ht.get("lm_head.weight", full_embed)
+        student.load_vocab_parallel_weights(full_embed, full_lm_head)
+        _log(rank, f"[init] vocab-parallel: V={cfg.text_config.vocab_size} "
+                   f"shard=[{student.v_lo},{student.v_hi}) per rank")
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
     wrap_student_with_fsdp(student, layout)
+    mem_stage("student loaded (K tracks + vocab-parallel embed/lm_head)")
 
     # ----- Replicated-parameter gradient sync -----
     # Norms (Replicated) and KV projections (KVReplicatedColwise when
@@ -274,16 +361,21 @@ def main() -> int:
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=0)
 
     # ----- Optimizer + LR schedule -----
-    # foreach=False uses the single-tensor Adam path; lower peak memory than
-    # the default _multi_tensor_adam (which stacks intermediates and OOMs on
-    # the rank that hosts embed_tokens + lm_head + K student tracks).
+    # foreach=True (multi-tensor AdamW) fuses the per-param update into grouped
+    # ops — much faster than single-tensor (optim.step was ~120 ms/step, ~10% at
+    # B=1). Its transient stacks intermediates, but optim.step runs AFTER backward
+    # (activations freed, ~14.5 GB resident) so its peak stays well below the
+    # student_fwd peak under vocab-parallel — it does NOT raise the step peak. The
+    # old foreach=False was to avoid OOM on the LEGACY rank-0-heavy layout (rank 0
+    # carried embed+lm_head+K tracks at ~36 GB); vocab-parallel balanced that away.
     optim = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=0.0,
-        foreach=False,
+        foreach=True,
     )
+    mem_stage("optimizer constructed (AdamW state lazy)")
 
     scheduler = None
     if args.warmup_steps > 0:
@@ -325,7 +417,9 @@ def main() -> int:
         Each rank writes one ``track_{tid}.safetensors`` per local track in
         the slicer's on-disk key format (``embed_tokens.weight``,
         ``norm.weight``, ``layers.{i}.*``, plus ``lm_head.weight`` on the
-        owner). Together the world covers all n_tracks shards.
+        owner). Together the world covers all n_tracks shards. In vocab-parallel
+        mode the sharded embed/lm_head are all-gathered to full ``[V,H]`` and
+        written into the track-0 shard, so the on-disk format is unchanged.
         """
         ck_dir = Path(args.out_dir) / name
         if rank == 0:
@@ -335,6 +429,9 @@ def main() -> int:
                 ck_dir / "manifest.json",
             )
         dist.barrier()
+        # Collective: all-gather the vocab shards → full embed/lm_head on rank 0
+        # (None on peers). Must run on every rank before the per-track loop.
+        vp_full = student.gather_vocab_parallel_weights() if student.vocab_parallel else None
         full_sd = student.state_dict()
         for k, tid in enumerate(layout.local_track_ids):
             prefix = f"text_models.{k}."
@@ -343,10 +440,15 @@ def main() -> int:
                 if key.startswith(prefix):
                     sub = key[len(prefix):]
                     track_state[sub] = val.detach().contiguous().clone().cpu()
-            if tid == PTWrappedModel.LM_HEAD_OWNER_TRACK and "lm_head.weight" in full_sd:
-                track_state["lm_head.weight"] = (
-                    full_sd["lm_head.weight"].detach().contiguous().clone().cpu()
-                )
+            if tid == PTWrappedModel.LM_HEAD_OWNER_TRACK:
+                if vp_full is not None:  # vocab-parallel: gathered full tensors (rank 0)
+                    embed_full, lm_head_full = vp_full
+                    track_state["embed_tokens.weight"] = embed_full.detach().contiguous().cpu()
+                    track_state["lm_head.weight"] = lm_head_full.detach().contiguous().cpu()
+                elif not student.vocab_parallel and "lm_head.weight" in full_sd:
+                    track_state["lm_head.weight"] = (
+                        full_sd["lm_head.weight"].detach().contiguous().clone().cpu()
+                    )
             save_safetensors(track_state, str(ck_dir / f"track_{tid}.safetensors"))
 
         # Per-rank training state: optimizer (per-rank because each rank holds
@@ -369,8 +471,10 @@ def main() -> int:
         """Run val_batches of validation; return (mean val_kl, mean val_ce).
 
         val_kl drives early stop / best/; val_ce is logged for observability.
-        Both are summed across ranks (peers contribute 0) so every rank sees
-        the same scalars.
+        Legacy: only the owner computes non-zero metrics, so we all_reduce SUM
+        (peers contribute 0). Vocab-parallel: validate_step already returns the
+        GLOBAL metric on every rank, so summing would over-count — skip the
+        reduce (every rank runs the same val batches and gets identical scalars).
         """
         assert val_loader is not None
         student.eval()
@@ -387,7 +491,8 @@ def main() -> int:
             sums[1] = sums[1] + out["ce"]
             n += 1
         student.train()
-        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        if not student.vocab_parallel:
+            dist.all_reduce(sums, op=dist.ReduceOp.SUM)
         sums = sums / max(1, n)
         return sums[0].item(), sums[1].item()
 
@@ -405,6 +510,10 @@ def main() -> int:
         best_val_kl = float("inf")
         windows_since_best = 0
     stop_now = False
+
+    # Step on which --mem-report captures per-phase memory + the resident-component
+    # breakdown. Clamp into range so tiny --max-steps runs still capture.
+    mem_report_step = min(args.mem_report_step, args.max_steps - 1) if args.mem_report else -1
 
     # ----- Optional profiling -----
     # --profile: pass a fresh `timings` dict into distill_step each step (CUDA-synced
@@ -458,11 +567,15 @@ def main() -> int:
             batch = {k: v.unsqueeze(0) for k, v in batch.items()}
 
         timings: dict[str, float] | None = {} if args.profile else None
+        # --mem-report captures per-phase memory on a single designated step
+        # (passing `mem` resets peak stats each phase, so we never pass it every step).
+        do_mem_capture = step == mem_report_step
+        step_mem: dict[str, dict[str, float]] | None = {} if do_mem_capture else None
 
         optim.zero_grad(set_to_none=True)
         # distill_step now backwards each block immediately to bound peak
         # memory; gradients accumulate on student params internally.
-        losses = distill_step(student, teacher, batch, distill_cfg, timings=timings)
+        losses = distill_step(student, teacher, batch, distill_cfg, timings=timings, mem=step_mem)
         sync_replicated_grads(replication_plan)
 
         # Global, replication-deduplicated grad norm. Same scalar on every rank,
@@ -492,6 +605,23 @@ def main() -> int:
         optim.step()
         if scheduler is not None:
             scheduler.step()
+
+        # --mem-report: with grads still live (zero_grad runs next iter) and the
+        # AdamW state now materialized, attribute the resident footprint to its
+        # occupants and pair it with the per-phase peaks captured this step.
+        if do_mem_capture:
+            mem_stages[f"after optim.step (step {step})"] = device_mem()
+            report_lines = format_report(
+                rank,
+                label=f"MEM REPORT @ step {step}",
+                components=component_breakdown(student, teacher, optim),
+                device=device_mem(),
+                phase_mem=step_mem,
+                stages=mem_stages,
+            )
+            print_all_ranks(rank, world_size, report_lines)
+            # Rebuild a clean global peak for any later steps / the --profile peak.
+            torch.cuda.reset_peak_memory_stats()
 
         if args.profile:
             timings["data_wait"] = data_wait
@@ -571,7 +701,7 @@ def main() -> int:
                 pct = (phase_totals.get(k, 0.0) / phase_totals["_total"] * 100) if mean_total else 0.0
                 _log(rank, f"[profile]   {k:12s} {mean_ms:9.0f} ms  ({pct:4.1f}%)")
             _log(rank, f"[profile]   {'TOTAL':12s} {mean_total * 1e3:9.0f} ms")
-        # Peak memory is per-rank; print on every rank (peers host K>rank0 tracks).
+        # Peak memory is per-rank; print on every rank.
         peak_gb = torch.cuda.max_memory_allocated() / 1e9
         print(f"[profile] rank {rank} peak CUDA mem allocated: {peak_gb:.2f} GB", flush=True)
 

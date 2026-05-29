@@ -98,7 +98,7 @@ class PTTrackTextModel(nn.Module):
         self.config = per_track_text_config
         self.pt_cfg = pt_cfg
 
-        if pt_cfg.track_id == self.EMBED_OWNER_TRACK:
+        if pt_cfg.track_id == self.EMBED_OWNER_TRACK and pt_cfg.host_embed_tokens:
             self.embed_tokens = nn.Embedding(
                 per_track_text_config.vocab_size,
                 per_track_text_config.hidden_size,

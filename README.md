@@ -1,6 +1,6 @@
 # pt_converter
 
-`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks". The world layout is one rank per visible GPU, with each rank hosting `K = N / world_size` tracks locally (with `--rank0-tracks` for non-uniform layouts where rank 0 also owns `embed_tokens` and `lm_head`). At configurable sync boundaries (every `D` layers), every rank locally sums its `K` partial residual deltas, then a single NCCL all-reduce across the world combines the per-rank sums — the combined forward stays mathematically equivalent to the original dense model. `N=1` short-circuits to a no-op, giving a bit-equal dense-parity gate.
+`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks". The world layout is one rank per visible GPU, with each rank hosting `K = N / world_size` tracks locally. `embed_tokens`, `lm_head`, and the KL/CE softmax are **vocab-parallel** — sharded over the vocabulary dimension across all ranks — so no rank specially carries them and the layout is uniform. At configurable sync boundaries (every `D` layers), every rank locally sums its `K` partial residual deltas, then a single NCCL all-reduce across the world combines the per-rank sums — the combined forward stays mathematically equivalent to the original dense model. `N=1` short-circuits to a no-op, giving a bit-equal dense-parity gate.
 
 Parameters that the slicer flagged as identical across multiple tracks (RMSNorm scales, and K/V projection rows when `n_tracks > num_kv_heads`) are kept bit-identical under training: `sync_replicated_grads` averages each group's gradients between `loss.backward()` and `optimizer.step()`, so a deterministic optimizer step keeps the copies bit-equal forever. New model families are added by registering a `ModelAdapter` — the slicer engine, sync logic, and training loop themselves stay model-agnostic. A short distillation stage (frozen dense teacher → sliced student) using block-wise teacher-forced MSE + end-to-end logit-KL + LM CE recovers any perplexity lost during the static weight conversion.
 
@@ -41,8 +41,8 @@ pt_converter/
 │   │   └── qwen3_5.py                      # Registers the "qwen3_5_text" adapter (slicer specs + per-track model class).
 │   ├── dist/
 │   │   ├── __init__.py                     # Package marker.
-│   │   ├── groups.py                       # ProcessGroupLayout + build_groups (supports rank0_tracks / tracks_per_rank_list).
-│   │   └── fsdp_setup.py                   # Reserved no-op intra-track FSDP wrapping; ready for future layouts.
+│   │   ├── groups.py                       # ProcessGroupLayout + build_groups (uniform K; tracks_per_rank_list utility for non-uniform).
+│   │   └── fsdp_setup.py                   # No-op student FSDP; teacher FSDP-shard + optional per-layer compile / vocab-sharded lm_head.
 │   ├── model/
 │   │   ├── __init__.py                     # Package marker.
 │   │   ├── pt_model.py                     # PTWrappedModel: per-rank wrapper hosting K local tracks, returns (logits, sync_hiddens).
@@ -101,30 +101,32 @@ pt_converter/
 ```bash
 python scripts/convert_qwen3_5_9b.py \
     --hf-model Qwen/Qwen3.5-9B \
-    --out-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
+    --out-dir convert_out/qwen3_5_9b_n16_d4 \
     --n-tracks 16 --sync-block-depth 4
 ```
 
 ## Train
 
-`scripts/train_qwen3_5_9b.py` runs the distillation under `torchrun`. One rank per GPU; each rank hosts `K = n_tracks / world_size` tracks (or fewer on rank 0 if `--rank0-tracks` is set, since rank 0 also owns `embed_tokens` and `lm_head`). The per-track layers are tiny at high `n_tracks` (e.g. one attention head per track at `n_tracks=16`), so by default each layer is `torch.compile`d (`--compile`, ~2× faster steps) and the full-attention layers use SDPA.
+`scripts/train_qwen3_5_9b.py` runs the distillation under `torchrun`. One rank per GPU; each rank hosts `K = n_tracks / world_size` tracks (uniform). `embed_tokens`, `lm_head`, and the KL/CE softmax are vocab-parallel across all ranks (`--vocab-parallel`, default on), so memory is balanced and the previously rank-0-serial KL/CE phase runs in parallel. The per-track layers are tiny at high `n_tracks` (e.g. one attention head per track at `n_tracks=16`), so by default each layer is `torch.compile`d (`--compile`, ~2× faster steps) and the full-attention layers use SDPA; the frozen teacher's layers are likewise compiled (`--compile-teacher`).
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--hf-model` | required | Dense teacher path. |
 | `--tracks-dir` | required | Output of the convert script. |
-| `--out-dir` | `./pt_train_out` | Checkpoint dir (also writes `best/` when eval improves). |
+| `--out-dir` | `/train_out` | Checkpoint dir (also writes `best/` when eval improves). |
 | `--resume-from` | `None` | Resume model + optimizer state from a prior checkpoint dir. |
-| `--rank0-tracks` | `None` | Override K on rank 0 to free memory for embed / lm_head. |
+| `--vocab-parallel` / `--no-vocab-parallel` | on | Vocab/tensor-parallel `embed_tokens` + `lm_head` + KL/CE across all ranks (balanced memory, parallel KL/CE, uniform layout). `--no-vocab-parallel` selects the legacy track-0-owner path (memory-heavy at `n_tracks=16` on 40 GB). |
+| `--compile-teacher` / `--no-compile-teacher` | on | `torch.compile` each frozen-teacher decoder layer (inference-only); disable alone if it conflicts with FSDP2 / the sync-boundary hooks. |
 | `--max-steps` | `1000` | Training steps. |
 | `--seq-len` / `--batch-size` | `4096` / `1` | Sequence length and per-rank batch. |
 | `--lr` / `--warmup-steps` / `--lr-min-ratio` | `3e-5` / `0` / `0.1` | AdamW LR + cosine decay floor. |
 | `--max-grad-norm` | `1.0` | Clip gradients before optimizer step. |
-| `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). |
+| `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). Under vocab-parallel (default) every rank backwards through the full student forward, so this lowers the ~25 GB `student_fwd`/`klce` peak on **every** rank — the lever for fitting a larger `--batch-size` at `seq=4096` on 40 GB. |
 | `--compile` / `--no-compile` | on | `torch.compile` each per-track decoder layer in place (inductor fusion of the tiny per-track kernels). Default on (~2× faster steps); `--no-compile` to disable. One-time compile warmup on the first steps. |
 | `--compile-mode` | `default` | `torch.compile` mode. `default` (inductor fusion). `reduce-overhead` (CUDA graphs) is experimental here. |
 | `--profile` / `--profile-trace` | off | `--profile`: per-phase CUDA-synced wall-clock breakdown + per-rank peak mem. `--profile-trace`: adds a torch.profiler kernel trace (Chrome trace + key_averages on rank 0). |
-| `--kl-ce-chunk-size` | `128` | Vocab chunking inside `_kl_ce_chunked` to bound peak KL + CE memory. |
+| `--mem-report` / `--mem-report-step` | off / `3` | Per-rank breakdown of *what* occupies GPU memory: lifecycle deltas (baseline → teacher → student → optimizer), a measured resident-component table (teacher shard / student params / grads / AdamW state — real bytes + dtype), the transient per-phase activation peak captured on `--mem-report-step`, and the allocated-vs-reserved-vs-device gap (CUDA ctx + NCCL). Cheap; off = zero overhead. |
+| `--kl-ce-chunk-size` | `512` | Seq-chunk size for the KL+CE pass (caps the per-chunk fp32 `(B, chunk, V/world)` expansion). The klce phase is collective/dispatch-bound, so larger = fewer chunks = faster (512 → 8 chunks at `seq=4096` vs 32 at 128) at negligible extra memory; the transient grows ×batch, so keep moderate at large `--batch-size`. |
 | `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
 | `--kl-temperature` | `1.0` | KL temperature. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
@@ -134,37 +136,48 @@ python scripts/convert_qwen3_5_9b.py \
 | `--log-every` | `10` | Log cadence. |
 
 ```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
-    --hf-model Qwen/Qwen3.5-9B \
-    --tracks-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
-    --out-dir ./pt_train_out \
+    --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
+    --out-dir train_out/qwen3_5_9b_n16_d4 \
     --max-steps 4000 --seq-len 4096 --batch-size 1 \
-    --activation-checkpoint --rank0-tracks 1 \
+    --activation-checkpoint \
+    --eval-every 200 --save-every 500
+```
+
+**Larger batch (8× A100-40GB, n16):** `--activation-checkpoint` recomputes the full student
+forward instead of holding it (the ~25 GB `student_fwd`/`klce` peak), which is what frees the
+headroom to raise `--batch-size` at `seq=4096`. Keep `--kl-ce-chunk-size` moderate (its fp32
+transient scales ×batch). Use `--mem-report` to confirm `device_used` stays under ~39 GB before
+committing to a long run:
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
+    --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
+    --out-dir train_out/qwen3_5_9b_n16_d4 \
+    --max-steps 4000 --seq-len 4096 --batch-size 4 \
+    --activation-checkpoint --kl-ce-chunk-size 512 \
     --eval-every 200 --save-every 500
 ```
 
 ## Evaluate
 
-Three torchrun entry points. All reuse the same per-rank track layout as training, so `--rank0-tracks` must match the value used at training time.
+Three torchrun entry points. They use the uniform per-rank track layout; forward output is layout-independent (the SyncBoundary all-reduce combines all tracks regardless of which rank hosts them). Eval loads checkpoints via the legacy full-logits student path (full `lm_head` on the owner rank), which reads a vocab-parallel-trained checkpoint unchanged.
 
 - **Logit fidelity vs teacher** — `scripts/eval_fidelity.py`. KL (forward + reverse), top-1 / top-5 agreement and top-5 IoU, per-sync-boundary hidden MSE, student / teacher perplexity and gap.
   ```bash
   torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
-      --hf-model Qwen/Qwen3.5-9B \
-      --checkpoint-dir ./pt_train_out/best \
+      --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+      --checkpoint-dir train_out/qwen3_5_9b_n16_d4/best \
       --num-batches 200
   ```
 - **lm-evaluation-harness** — `scripts/eval_lm_harness.py`. Runs the harness on the student and/or teacher (`--target {student,teacher,both}`) with the same seeds, so request streams align across ranks. Default tasks: `hellaswag,arc_easy,arc_challenge,winogrande,piqa`; pass `--include-mmlu` to add MMLU.
   ```bash
   torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
-      --hf-model Qwen/Qwen3.5-9B \
-      --checkpoint-dir ./pt_train_out/best \
-      --output-json ./pt_train_out/lm_eval.json
-  ```
-- **Replicated-param sync sanity check** — `scripts/verify_kv_sync.py`. Runs N distillation steps and asserts that `q_proj` (unique per track) changes, while `k_proj` and `input_layernorm` change *and* remain bit-identical across their replication groups.
-  ```bash
-  torchrun --standalone --nproc-per-node=8 scripts/verify_kv_sync.py \
-      --hf-model Qwen/Qwen3.5-9B \
-      --tracks-dir ./pt_tracks/qwen3_5_9b_n16_d4 \
-      --steps 2
+      --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+      --checkpoint-dir train_out/qwen3_5_9b_n16_d4/best \
+      --output-json train_out/qwen3_5_9b_n16_d4/lm_eval.json
   ```

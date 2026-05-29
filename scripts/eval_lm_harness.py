@@ -56,18 +56,6 @@ def _log(rank: int, msg: str) -> None:
         print(msg, flush=True)
 
 
-def _compute_tracks_per_rank_list(n_tracks: int, world_size: int, rank0_tracks: int) -> list[int]:
-    remaining = n_tracks - rank0_tracks
-    peers = world_size - 1
-    if rank0_tracks <= 0 or peers <= 0 or remaining < peers:
-        raise ValueError(
-            f"--rank0-tracks={rank0_tracks} invalid for n_tracks={n_tracks}, "
-            f"world_size={world_size}: each peer must get at least one track."
-        )
-    base, extra = divmod(remaining, peers)
-    return [rank0_tracks] + [base + (1 if i < extra else 0) for i in range(peers)]
-
-
 def _run_one_target(
     target: str,
     forward_fn,
@@ -141,9 +129,6 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--max-length", type=int, default=4096,
                    help="Tokenizer truncation length for lm-eval contexts.")
-    p.add_argument("--rank0-tracks", type=int, default=None,
-                   help="MUST match the layout the checkpoint was trained with. "
-                        "Default = n_tracks // world_size (uniform).")
     p.add_argument("--output-json", default=None,
                    help="Optional path to dump per-target lm-eval results dict (rank 0 only). "
                         "In 'both' mode the file contains a top-level {student, teacher} dict.")
@@ -160,15 +145,9 @@ def main() -> int:
         )
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
-    world_size = dist.get_world_size()
 
     manifest = load_manifest(args.checkpoint_dir)
-    tracks_per_rank_list = None
-    if args.rank0_tracks is not None:
-        tracks_per_rank_list = _compute_tracks_per_rank_list(
-            manifest.n_tracks, world_size, args.rank0_tracks
-        )
-    layout = build_groups(n_tracks=manifest.n_tracks, tracks_per_rank_list=tracks_per_rank_list)
+    layout = build_groups(n_tracks=manifest.n_tracks)
     _log(
         rank,
         f"[init] target={args.target} world={layout.world_size} "
