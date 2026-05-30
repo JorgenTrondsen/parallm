@@ -32,15 +32,23 @@ def full_attention_specs(text_cfg: Any) -> LayerSpec:
     num_heads = int(text_cfg.num_attention_heads)
     num_kv = int(text_cfg.num_key_value_heads)
     head_dim = int(text_cfg.head_dim)
+    # Full-attention head-local params (k/v projections and their per-head
+    # RMSNorms) DIVERGE per track by default (`sync=False`): each track gets its
+    # own KV head instead of a bit-identical copy of the kv-group's, turning the
+    # full-attention layers from GQA into per-track MHA — a capacity superset
+    # distillation can exploit, free on memory (the copies already exist), and
+    # leaving each track fully self-contained for per-node inference. The trainer
+    # can restore legacy bit-identical sync with `--sync-attention-heads`
+    # (force_sync). q_proj/o_proj are already unique per track.
     return {
         # q_proj carries [q | gate] doubled along out_features per head.
         "q_proj.weight": GatedQColwise(num_heads=num_heads, head_dim=head_dim),
-        # k/v_proj rows are per-kv-head; replicated within a kv-group across tracks.
-        "k_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv),
-        "v_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv),
+        # k/v_proj rows are per-kv-head; start as a kv-group copy, then diverge.
+        "k_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv, sync=False),
+        "v_proj.weight": KVReplicatedColwise(num_kv_heads=num_kv, sync=False),
         "o_proj.weight": Rowwise(),  # cols = num_heads * head_dim
-        "q_norm.weight": Replicated(),  # RMSNorm on head_dim (replicated)
-        "k_norm.weight": Replicated(),
+        "q_norm.weight": Replicated(sync=False),  # RMSNorm on head_dim, per-track
+        "k_norm.weight": Replicated(sync=False),
     }
 
 

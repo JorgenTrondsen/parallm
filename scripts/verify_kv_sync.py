@@ -1,25 +1,31 @@
-"""End-to-end verification of replicated-parameter gradient sync.
+"""End-to-end verification of replicated-parameter gradient sync / divergence.
 
 Launches the same init as train_qwen3_5_9b.py, runs N distillation steps,
 and reports for representative parameters:
 
-  - q_proj.weight (unique per track):   should CHANGE after each step.
-  - k_proj.weight (kv-replicated):       should CHANGE AND stay bit-identical
-                                          across all tracks in its kv-group.
-  - input_layernorm.weight (Replicated): should CHANGE AND stay bit-identical
-                                          across ALL tracks.
+  - q_proj.weight (unique per track):     should CHANGE after each step.
+  - input_layernorm.weight (Replicated):  should CHANGE AND stay bit-identical
+                                           across ALL tracks (always synced).
+  - k_proj.weight (full-attention head):  behaviour depends on the mode below.
 
-The "stay identical" claim is checked globally via
-``assert_replicated_consistent(plan)`` — it MIN/MAX-all-reduces every
-replicated parameter inside its process subgroup, so any drift across any
-rank raises ``RuntimeError``.
+Default (divergence, mirrors the trainer): the full-attention head params
+(k_proj/v_proj/q_norm/k_norm) train independently per track, so k_proj should
+CHANGE and DIVERGE across the tracks of a kv-group. With --sync-attention-heads
+(legacy/force_sync) k_proj should CHANGE AND stay bit-identical within its
+kv-group, exactly as before.
+
+The residual-stream norms are checked globally via
+``assert_replicated_consistent(plan)`` — it MIN/MAX-all-reduces every parameter
+still in the plan inside its process subgroup, so any drift of a *synced* param
+across any rank raises ``RuntimeError``. (Diverged head params are absent from
+the plan, so they are not subject to this check.)
 
 Launch::
 
     torchrun --standalone --nproc-per-node=8 scripts/verify_kv_sync.py \\
         --hf-model /home2/jtr020/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \\
         --tracks-dir /home2/jtr020/pt_tracks/qwen3_5_9b_n16_d4 \\
-        --steps 2
+        --steps 2 [--sync-attention-heads]
 """
 from __future__ import annotations
 
@@ -66,6 +72,10 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=2)
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--sync-attention-heads", action="store_true",
+                   help="Legacy mode: keep full-attention head params (k/v_proj, "
+                        "q_norm, k_norm) bit-identical within each kv-group. Default "
+                        "OFF mirrors the trainer (those params diverge per track).")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -122,8 +132,12 @@ def main() -> int:
 
     # ----- Build replication plan and assert initial consistency -----
     adapter = get_adapter_for_config(cfg)
-    plan = build_replication_plan(student, adapter=adapter, text_cfg=text_cfg, layout=layout)
-    _log(rank, f"[init] replication plan: {len(plan)} groups")
+    plan = build_replication_plan(
+        student, adapter=adapter, text_cfg=text_cfg, layout=layout,
+        force_sync=args.sync_attention_heads,
+    )
+    _log(rank, f"[init] replication plan: {len(plan)} groups "
+               f"(attention-head sync: {'ON' if args.sync_attention_heads else 'OFF — diverging'})")
     assert_replicated_consistent(plan)
     _log(rank, "[init] startup consistency check PASSED")
 
@@ -231,7 +245,8 @@ def main() -> int:
     )
 
     # If this rank holds two local tracks AND they're in the same kv-group,
-    # do a local bit-equality check on k_proj.
+    # compare their k_proj copies. Synced (legacy): must be bit-identical.
+    # Diverging (default): must NOT be bit-identical after a step.
     if layout.tracks_per_rank > 1:
         k1_param = _find_param(
             student, 1, f"layers.{target_layer}.self_attn.k_proj.weight"
@@ -241,8 +256,12 @@ def main() -> int:
         same_group = (tid0 // tpg) == (tid1 // tpg)
         if same_group:
             equal = torch.equal(k_after, k1_param)
+            if args.sync_attention_heads:
+                verdict = "bit-identical (expected: True)" if equal else "DRIFTED (UNEXPECTED!)"
+            else:
+                verdict = "DIVERGED (expected)" if not equal else "still identical (UNEXPECTED!)"
             print(
-                f"[rank {rank}] local k_proj tracks {tid0} vs {tid1} bit-identical: {equal}",
+                f"[rank {rank}] local k_proj tracks {tid0} vs {tid1}: {verdict}",
                 flush=True,
             )
 
@@ -261,14 +280,17 @@ def main() -> int:
     k_changed = k_change > 0.0
     ln_changed = ln_change > 0.0
     fn_changed = fn_change > 0.0
+    mode = "SYNCED (legacy)" if args.sync_attention_heads else "DIVERGING (default)"
+    k_expect = ("synced bit-identical within kv-group"
+                if args.sync_attention_heads else "per-track (diverges within kv-group)")
     _log(
         rank,
-        f"[verdict on rank 0]\n"
+        f"[verdict on rank 0]  attention-head mode: {mode}\n"
         f"  q_proj   updated?     {q_changed}    (Δ={q_change:.3e})\n"
-        f"  k_proj   updated?     {k_changed}    (Δ={k_change:.3e})\n"
+        f"  k_proj   updated?     {k_changed}    (Δ={k_change:.3e})  [{k_expect}]\n"
         f"  input_LN updated?     {ln_changed}   (Δ={ln_change:.3e})\n"
         f"  final_norm updated?   {fn_changed}   (Δ={fn_change:.3e})\n"
-        f"  cross-rank consistent: YES\n",
+        f"  synced-norms cross-rank consistent: YES\n",
     )
 
     teacher.remove_hooks()

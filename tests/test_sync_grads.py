@@ -212,9 +212,10 @@ def _make_single_rank_layout(n_tracks: int):
 
 
 def test_build_replication_plan_on_tiny_qwen3_5_n4():
-    """K=4 tracks on one rank with num_kv_heads=1: every Replicated norm and
-    every KV-projection has its replication group fully local. The plan must
-    cover them all with process_group=None."""
+    """K=4 tracks on one rank with num_kv_heads=1. By default the full-attention
+    head params diverge per track (absent from the plan); the residual-stream
+    norms stay synced (fully local ⇒ process_group=None). force_sync re-adds the
+    head params, recovering the legacy plan."""
     import torch.nn as nn
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
@@ -252,14 +253,22 @@ def test_build_replication_plan_on_tiny_qwen3_5_n4():
         assert cg.process_group is None
         assert len(cg.local_params) == cg.group_size == n_tracks
 
-    # Sanity: at least the final norm + each layer's two norms + the full-
-    # attention layer's q_norm/k_norm/k_proj/v_proj should appear.
-    # 4 layers × (input_layernorm + post_attention_layernorm) = 8
-    # final norm = 1
-    # 3 linear-attention layers × 1 (linear_attn.norm) = 3
-    # 1 full-attention layer × (q_norm + k_norm + k_proj + v_proj) = 4
-    # Total = 16
-    assert len(plan) == 16
+    # Default (diverge): only the residual-stream norms are synced.
+    #   4 layers × (input_layernorm + post_attention_layernorm) = 8
+    #   final norm = 1
+    #   3 linear-attention layers × 1 (linear_attn.norm) = 3
+    #   1 full-attention layer × (q_norm + k_norm + k_proj + v_proj) = 0 (diverged)
+    #   Total = 12
+    assert len(plan) == 12
+
+    # force_sync re-adds the 4 diverged full-attention head params → 16.
+    plan_synced = build_replication_plan(
+        student, adapter=adapter, text_cfg=cfg, layout=layout, force_sync=True
+    )
+    assert len(plan_synced) == 16
+    for cg in plan_synced:
+        assert cg.process_group is None
+        assert len(cg.local_params) == cg.group_size == n_tracks
 
 
 def test_asymmetric_layout_track_to_rank_lookup():
@@ -319,23 +328,16 @@ def test_asymmetric_layout_track_to_rank_lookup():
     assert tuple(sorted({track_to_rank[t] for t in full_group})) == tuple(range(world_size))
 
 
-def test_build_then_sync_then_step_keeps_replicas_identical():
-    """Run one backward+sync+step on a tiny K=4 student and confirm every
-    replicated parameter still has bit-identical copies across local tracks."""
+def _build_tiny_student(seed: int):
+    """Slice a tiny Qwen3.5 dense model into a single-rank K=4 student."""
     import torch.nn as nn
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-    from pt_converter.adapters import get_adapter_for_config
     from pt_converter.model.pt_model import PTWrappedModel
     from pt_converter.slicer.convert import slice_model_to_tracks
-    from pt_converter.train.sync_grads import (
-        assert_replicated_consistent,
-        build_replication_plan,
-        sync_replicated_grads,
-    )
 
     cfg = _tiny_qwen3_5_config()
-    torch.manual_seed(11)
+    torch.manual_seed(seed)
     dense = Qwen3_5TextModel(cfg).eval()
     dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
     nn.init.normal_(dense.lm_head.weight, mean=0.0, std=0.02)
@@ -353,10 +355,35 @@ def test_build_then_sync_then_step_keeps_replicas_identical():
     )
     student.load_track_state_dicts({i: tracks[i] for i in range(n_tracks)}, strict=False)
     student.train()
+    return cfg, student, manifest, n_tracks
 
+
+def _kproj_full_attention_param(student, track_idx: int):
+    """The k_proj.weight of the first full-attention layer in a given track."""
+    tm = student.text_models[track_idx]
+    for i, lt in enumerate(tm.config.layer_types):
+        if lt == "full_attention":
+            return tm.get_submodule(f"layers.{i}.self_attn.k_proj").weight
+    raise AssertionError("no full_attention layer in tiny config")
+
+
+def test_force_sync_keeps_replicas_identical():
+    """Under force_sync (legacy), one backward+sync+step must keep every
+    replicated parameter — including the full-attention head params — bit-
+    identical across local tracks."""
+    from pt_converter.adapters import get_adapter_for_config
+    from pt_converter.train.sync_grads import (
+        assert_replicated_consistent,
+        build_replication_plan,
+        sync_replicated_grads,
+    )
+
+    cfg, student, _manifest, n_tracks = _build_tiny_student(seed=11)
     layout = _make_single_rank_layout(n_tracks)
     adapter = get_adapter_for_config(cfg)
-    plan = build_replication_plan(student, adapter=adapter, text_cfg=cfg, layout=layout)
+    plan = build_replication_plan(
+        student, adapter=adapter, text_cfg=cfg, layout=layout, force_sync=True
+    )
     assert_replicated_consistent(plan)  # bit-identical after slicing
 
     input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
@@ -374,3 +401,51 @@ def test_build_then_sync_then_step_keeps_replicas_identical():
 
     # After the step every replication group's local copies must still be identical.
     assert_replicated_consistent(plan)
+    # k_proj copies stay bit-identical across tracks (they were force-synced).
+    k0 = _kproj_full_attention_param(student, 0)
+    for t in range(1, n_tracks):
+        assert torch.equal(k0, _kproj_full_attention_param(student, t))
+
+
+def test_default_diverges_attention_heads_but_keeps_norms_synced():
+    """Default mode: one backward+sync+step must (a) keep the synced norms
+    bit-identical and (b) let the full-attention k_proj copies DIVERGE across
+    tracks (they are absent from the replication plan)."""
+    from pt_converter.adapters import get_adapter_for_config
+    from pt_converter.train.sync_grads import (
+        assert_replicated_consistent,
+        build_replication_plan,
+        sync_replicated_grads,
+    )
+
+    cfg, student, _manifest, n_tracks = _build_tiny_student(seed=11)
+    layout = _make_single_rank_layout(n_tracks)
+    adapter = get_adapter_for_config(cfg)
+    plan = build_replication_plan(student, adapter=adapter, text_cfg=cfg, layout=layout)
+    assert_replicated_consistent(plan)  # synced norms identical after slicing
+
+    # k_proj copies are identical at conversion, before any training.
+    k0_before = _kproj_full_attention_param(student, 0).detach().clone()
+    for t in range(1, n_tracks):
+        assert torch.equal(k0_before, _kproj_full_attention_param(student, t))
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    attention_mask = torch.ones((1, 8), dtype=torch.long)
+    logits, _ = student(input_ids=input_ids, attention_mask=attention_mask)
+    loss = logits.float().pow(2).mean()
+    loss.backward()
+    sync_replicated_grads(plan)
+    optim = torch.optim.SGD(
+        [p for p in student.parameters() if p.requires_grad], lr=1e-3
+    )
+    optim.step()
+
+    # Synced norms still bit-identical (they were in the plan and averaged).
+    assert_replicated_consistent(plan)
+    # k_proj copies have now diverged across tracks (no sync; distinct grads).
+    k0_after = _kproj_full_attention_param(student, 0)
+    diverged = any(
+        not torch.equal(k0_after, _kproj_full_attention_param(student, t))
+        for t in range(1, n_tracks)
+    )
+    assert diverged, "full-attention k_proj should diverge across tracks by default"

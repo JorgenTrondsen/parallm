@@ -36,17 +36,28 @@ def _singleton_groups(n_tracks: int) -> list[list[int]]:
     return [[t] for t in range(n_tracks)]
 
 
-def get_replication_groups(spec: SlicerSpec, n_tracks: int) -> list[list[int]]:
+def get_replication_groups(
+    spec: SlicerSpec, n_tracks: int, force_sync: bool = False
+) -> list[list[int]]:
     """Return the partition of tracks into replication groups for this spec.
 
     Tracks in the same group hold identical parameter slices and must share
     a gradient during training. Specs that don't implement ``replication_groups``
     default to one singleton group per track (no sync).
+
+    ``force_sync`` overrides a spec's ``sync=False`` (diverge) setting back to a
+    single shared group — used by the trainer's ``--sync-attention-heads`` A/B
+    switch to restore the legacy bit-identical behaviour. Specs whose
+    ``replication_groups`` predates the kwarg are called without it.
     """
     fn = getattr(spec, "replication_groups", None)
     if fn is None:
         return _singleton_groups(n_tracks)
-    return fn(n_tracks)
+    try:
+        return fn(n_tracks, force_sync=force_sync)
+    except TypeError:
+        # Spec implements the old (n_tracks)-only signature.
+        return fn(n_tracks)
 
 
 @dataclass
@@ -103,6 +114,7 @@ def build_replication_plan(
     adapter: ModelAdapter,
     text_cfg: Any,
     layout: ProcessGroupLayout,
+    force_sync: bool = False,
 ) -> list[ReplicationCoordGroup]:
     """Construct the gradient-sync plan for all replicated parameters.
 
@@ -111,6 +123,12 @@ def build_replication_plan(
     replication group spans only a subset of ranks) are created via
     ``dist.new_group``, which itself is collective and must be called by every
     rank in the world in identical order.
+
+    ``force_sync`` (legacy mode) overrides specs flagged to diverge (``sync=False``,
+    e.g. the full-attention k/v projections and head norms) back to a single
+    bit-identical group. Default ``False`` honours each spec's ``sync`` setting, so
+    the diverged head params are absent from the plan and train independently. It
+    must be passed identically on every rank (it changes which subgroups are built).
 
     Steps:
       1. Resolve ``canonical_name → SlicerSpec`` for every parameter (same names
@@ -136,7 +154,7 @@ def build_replication_plan(
     seen: set[tuple[int, ...]] = set()
     plan_specs: list[tuple[str, list[int], tuple[int, ...]]] = []
     for canonical_name, spec in spec_map.items():
-        groups = get_replication_groups(spec, n_tracks)
+        groups = get_replication_groups(spec, n_tracks, force_sync=force_sync)
         for g in groups:
             if len(g) <= 1:
                 continue

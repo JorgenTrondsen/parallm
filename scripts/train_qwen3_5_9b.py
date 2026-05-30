@@ -113,6 +113,16 @@ def main() -> int:
                         "klce alone) and parallelizing the previously rank-0-serial klce phase. "
                         "On-disk checkpoint format is unchanged (gather-on-save into track 0). "
                         "The layout is uniform K = n_tracks // world_size.")
+    p.add_argument("--sync-attention-heads", action=argparse.BooleanOptionalAction, default=False,
+                   help="Keep the full-attention head params (k_proj, v_proj, q_norm, "
+                        "k_norm) bit-identical across the tracks of each kv-group, the "
+                        "legacy behaviour. Default OFF: those copies DIVERGE per track "
+                        "(each track gets its own KV head — GQA → per-track MHA), a "
+                        "capacity superset that is free on memory and drops the per-step "
+                        "kv-group all-reduces. Pass --sync-attention-heads to A/B back to "
+                        "the synced/dense-GQA-equivalent path. The residual-stream norms "
+                        "(input/post layernorm, final norm, linear-attn norm) are always "
+                        "kept synced.")
     p.add_argument("--compile-mode", default="default",
                    help="torch.compile mode. 'default' = inductor fusion only "
                         "(recommended). 'reduce-overhead' (CUDA graphs) is "
@@ -337,17 +347,21 @@ def main() -> int:
     mem_stage("student loaded (K tracks + vocab-parallel embed/lm_head)")
 
     # ----- Replicated-parameter gradient sync -----
-    # Norms (Replicated) and KV projections (KVReplicatedColwise when
-    # n_tracks > num_kv_heads) hold bit-identical copies across multiple
-    # tracks. Without intervention each copy drifts under its own gradient.
-    # We average gradients within each replication group every step so the
-    # copies remain identical forever.
+    # The residual-stream norms (input/post layernorm, final norm, linear-attn
+    # norm) hold bit-identical copies across tracks and MUST stay synced — we
+    # average their gradients within each replication group every step so they
+    # remain identical forever. By default the full-attention head params
+    # (k_proj/v_proj/q_norm/k_norm) DIVERGE per track (their specs are sync=False),
+    # so they're absent from the plan and train independently; --sync-attention-heads
+    # (force_sync) restores the legacy bit-identical / dense-GQA-equivalent path.
     adapter = get_adapter_for_config(cfg.text_config)
     replication_plan = build_replication_plan(
-        student, adapter=adapter, text_cfg=cfg.text_config, layout=layout
+        student, adapter=adapter, text_cfg=cfg.text_config, layout=layout,
+        force_sync=args.sync_attention_heads,
     )
     assert_replicated_consistent(replication_plan)
-    _log(rank, f"[init] replication plan: {len(replication_plan)} groups synced per step")
+    _log(rank, f"[init] replication plan: {len(replication_plan)} groups synced per step "
+               f"(attention-head sync: {'ON' if args.sync_attention_heads else 'OFF — diverging'})")
 
     # ----- Data -----
     tok = AutoTokenizer.from_pretrained(args.hf_model)

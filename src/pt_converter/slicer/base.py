@@ -19,10 +19,13 @@ import torch
 class SlicerSpec(Protocol):
     """Protocol for a slicing rule. Each spec knows how to slice and reassemble.
 
-    Specs may optionally implement ``replication_groups(n_tracks)`` to declare
-    that some tracks hold *identical* slices and therefore must share a gradient
-    during training. Specs that don't implement it are treated as fully unique
-    per track (one singleton group per track). See
+    Specs may optionally implement ``replication_groups(n_tracks, force_sync=False)``
+    to declare that some tracks hold *identical* slices and therefore must share a
+    gradient during training. Specs that don't implement it are treated as fully
+    unique per track (one singleton group per track). Replicated-style specs carry
+    a ``sync`` flag: when ``sync`` is False they return singleton groups (the copies
+    are free to *diverge* under training), unless ``force_sync=True`` overrides it
+    back to a single shared group (the legacy bit-identical behaviour). See
     ``pt_converter.train.sync_grads.get_replication_groups`` for the dispatch.
     """
 
@@ -113,11 +116,18 @@ class PerHead:
 
 @dataclass(frozen=True)
 class Replicated:
-    """Replicated parameter: every track holds the same full tensor.
+    """Replicated parameter: every track holds the same full tensor at conversion.
 
     Used for norms whose statistic is per-head-dim (RMSNorm on head_dim) and
     for final norms that operate on the synced hidden state.
+
+    ``sync`` controls whether the copies are kept bit-identical during training.
+    When True (default) they form one replication group and their gradients are
+    averaged each step; when False each copy is its own singleton group and is
+    free to diverge (e.g. per-track attention head norms).
     """
+
+    sync: bool = True
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
         return weight.detach().clone()
@@ -128,9 +138,12 @@ class Replicated:
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         return tuple(full_shape)
 
-    def replication_groups(self, n_tracks: int) -> list[list[int]]:
-        # Every track holds the same tensor; one group spanning all tracks.
-        return [list(range(n_tracks))]
+    def replication_groups(self, n_tracks: int, force_sync: bool = False) -> list[list[int]]:
+        if self.sync or force_sync:
+            # Every track holds the same tensor; one group spanning all tracks.
+            return [list(range(n_tracks))]
+        # Diverge: each copy trains independently.
+        return [[t] for t in range(n_tracks)]
 
 
 @dataclass(frozen=True)
@@ -163,8 +176,9 @@ class OwnerOnly:
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         return tuple(full_shape)
 
-    def replication_groups(self, n_tracks: int) -> list[list[int]]:
+    def replication_groups(self, n_tracks: int, force_sync: bool = False) -> list[list[int]]:
         # The param lives on exactly one track. No gradient sync needed.
+        # `force_sync` is accepted for signature uniformity and ignored.
         return [[self.owner_track]]
 
 
@@ -246,10 +260,19 @@ class KVReplicatedColwise:
     (one per kv-group), reconstructing the dense tensor. Caller is expected
     to either (a) drop duplicate tracks within each group before calling, or
     (b) pass exactly one slice per kv-group.
+
+    ``sync`` controls whether the within-group copies are kept bit-identical
+    during training. When True (legacy) the copies form one replication group
+    per kv-group and their gradients are averaged each step, exactly reproducing
+    dense GQA. When False the copies are free to diverge — each track gets its
+    own KV head (GQA → per-track MHA), a capacity superset that distillation can
+    exploit. Slicing/reassembly are unaffected by this flag; only the
+    training-time replication grouping changes.
     """
 
     num_kv_heads: int
     dim: int = 0
+    sync: bool = True
 
     def _chunk(self, weight_shape: tuple[int, ...]) -> int:
         size = weight_shape[self.dim]
@@ -287,14 +310,18 @@ class KVReplicatedColwise:
         out[self.dim] = full_shape[self.dim] // self.num_kv_heads
         return tuple(out)
 
-    def replication_groups(self, n_tracks: int) -> list[list[int]]:
+    def replication_groups(self, n_tracks: int, force_sync: bool = False) -> list[list[int]]:
         if n_tracks % self.num_kv_heads != 0:
             raise ValueError(
                 f"KVReplicatedColwise.replication_groups: n_tracks {n_tracks} "
                 f"must be a multiple of num_kv_heads {self.num_kv_heads}"
             )
         tpg = n_tracks // self.num_kv_heads
-        return [[g * tpg + i for i in range(tpg)] for g in range(self.num_kv_heads)]
+        if self.sync or force_sync:
+            # Keep each kv-group's copies bit-identical (dense GQA).
+            return [[g * tpg + i for i in range(tpg)] for g in range(self.num_kv_heads)]
+        # Diverge: every track's KV head trains independently.
+        return [[t] for t in range(n_tracks)]
 
 
 @dataclass(frozen=True)
