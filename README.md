@@ -14,14 +14,18 @@ Requires Python ≥ 3.10, `torch >= 2.4`, `transformers >= 4.57.0.dev0`.
 pip install -e .                # core
 pip install -e ".[test]"        # + pytest
 pip install -e ".[eval]"        # + lm-eval (for scripts/eval_lm_harness.py)
-pip install -e ".[fast]"        # + flash-linear-attention (fused gated-delta kernels; GPU)
+pip install -e ".[fast]"        # + flash-linear-attention + causal-conv1d (fused gated-delta kernels; GPU)
 ```
 
 **Strongly recommended for training:** install the `[fast]` extra
-(`flash-linear-attention`). Qwen3.5's 24 linear-attention layers otherwise fall back
-to a slow pure-torch chunked recurrence; the fused Triton kernels are a ~3-4× training
-step speedup (≈9× combined with `--compile` + SDPA). GPU + `triton` only — the test
-suite still runs on CPU via the pure-torch fallback.
+(`flash-linear-attention` + `causal-conv1d`). Qwen3.5's 24 linear-attention layers
+otherwise fall back to a slow pure-torch chunked recurrence; the fused Triton kernels
+are a ~3-4× training step speedup (≈9× combined with `--compile` + SDPA), and
+`causal-conv1d` also enables the frozen teacher's linear-attn fast path. GPU + `triton`
+only — the test suite still runs on CPU via the pure-torch fallback. If `causal-conv1d`'s
+CUDA-extension build fails under pip's build isolation (a torch/nvcc CUDA-version
+mismatch), install it with `pip install --no-build-isolation causal-conv1d` (needs
+`ninja` and a matching `nvcc` on `PATH`).
 
 ## Directory structure
 
@@ -141,7 +145,7 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
     --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
     --out-dir train_out/qwen3_5_9b_n16_d4 \
-    --max-steps 4000 --seq-len 4096 --batch-size 1 \
+    --max-steps 4000 --seq-len 4096 --batch-size 5 \
     --activation-checkpoint \
     --eval-every 200 --save-every 500
 ```

@@ -18,11 +18,17 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 eval = ["lm-eval>=0.4,<0.5"]
-# Fused Triton kernels for the gated-delta linear-attention layers (GPU only).
+# Fused kernels for the gated-delta linear-attention layers (GPU only):
+# flash-linear-attention (chunked recurrence) + causal-conv1d (the short conv).
 # Without these, the 24 linear-attention layers fall back to a slow pure-torch
-# chunked recurrence; installing them is a ~3-4x training step speedup at
-# n_tracks=16. Needs a CUDA GPU + triton.
-fast = ["flash-linear-attention>=0.5"]
+# path; together they are a ~3-4x training step speedup at n_tracks=16, and
+# causal-conv1d additionally enables the frozen teacher's linear-attn fast path.
+# Needs a CUDA GPU + triton. NOTE: causal-conv1d builds a CUDA extension and can
+# fail under pip's build isolation when the isolated build pulls a torch whose
+# CUDA version mismatches your toolkit's nvcc; if so, install it with
+# `pip install --no-build-isolation causal-conv1d` (requires ninja + a matching
+# nvcc on PATH).
+fast = ["flash-linear-attention>=0.5", "causal-conv1d>=1.5"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
