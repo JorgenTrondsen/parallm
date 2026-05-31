@@ -136,7 +136,8 @@ def main() -> int:
     p.add_argument("--max-grad-norm", type=float, default=1.0,
                    help="Global, replication-deduplicated grad-norm clip. <=0 disables clipping.")
     p.add_argument("--save-every", type=int, default=0,
-                   help="0 disables step checkpoints. Use --eval-every to drive best/ saves instead.")
+                   help="Overwrite the rolling latest/ checkpoint every N steps (single dir, "
+                        "~52 GB at n=16). 0 disables it; use --eval-every to drive best/ saves instead.")
     p.add_argument("--save-final", action="store_true",
                    help="Write final/ when training exits (loop done or early-stopped).")
     p.add_argument("--log-every", type=int, default=10)
@@ -500,7 +501,11 @@ def main() -> int:
             vb = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in vb.items()}
             if vb["input_ids"].ndim == 1:
                 vb = {k: v.unsqueeze(0) for k, v in vb.items()}
-            out = validate_step(student, vb, teacher, kl_temperature=args.kl_temperature)
+            out = validate_step(
+                student, vb, teacher,
+                kl_temperature=args.kl_temperature,
+                chunk_size=args.kl_ce_chunk_size,
+            )
             sums[0] = sums[0] + out["kl"]
             sums[1] = sums[1] + out["ce"]
             n += 1
@@ -669,7 +674,14 @@ def main() -> int:
 
         if args.save_every > 0 and step > 0 and step % args.save_every == 0:
             _log(rank, f"[save] step {step}")
-            save_checkpoint(f"step_{step}")
+            # Rolling checkpoint: always overwrite the single latest/ dir in place,
+            # so only one periodic checkpoint (~52 GB at n=16) ever exists alongside
+            # best/. The saved step number lives inside train_state_rank*.pt, so
+            # resume (--resume-from .../latest) recovers it. Overwrites in place
+            # rather than writing a temp + rename (no room for a 2nd copy under a
+            # tight disk quota); a crash mid-save can corrupt latest/, but best/ is
+            # untouched and protects model quality.
+            save_checkpoint("latest")
 
         if val_loader is not None and step > 0 and step % args.eval_every == 0:
             val_kl, val_ce = run_eval()

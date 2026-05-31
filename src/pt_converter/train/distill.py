@@ -586,6 +586,7 @@ def validate_step(
     batch: dict[str, torch.Tensor],
     teacher: HookedTeacher,
     kl_temperature: float = 1.0,
+    chunk_size: int = 512,
 ) -> dict[str, torch.Tensor]:
     """Forward-only KL(teacher || student) and LM CE on a held-out batch.
 
@@ -614,7 +615,7 @@ def validate_step(
             hidden, student.lm_head, student.v_lo, student.v_hi,
             teacher_logits.detach(), labels, attention_mask,
             lambda_kl=1.0, lambda_ce=1.0, kl_temperature=kl_temperature,
-            chunk_size=hidden.shape[1], group=student.vp_group,
+            chunk_size=chunk_size, group=student.vp_group,
             world_size=student.vp_world_size, compute_grads=False,
         )
         return {"ce": ce, "kl": kl}
