@@ -126,7 +126,13 @@ def main() -> int:
                    help="Override fewshot count for all tasks. Default = each task's standard shot count.")
     p.add_argument("--limit", type=int, default=None,
                    help="Cap requests per task. Useful for smoke testing (e.g. --limit 32).")
-    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--batch-size", type=int, default=8,
+                   help="Requests scored per forward. Each forward pays a fixed set of NCCL "
+                        "all-reduces (embed + one per sync boundary) regardless of batch size, "
+                        "so batching amortizes them and fills the GPU — the biggest eval speedup. "
+                        "The owner rank holds a (B, max_len, vocab) bf16 logits tensor, so lower "
+                        "this for long-context / loglikelihood-rolling tasks (e.g. wikitext) to "
+                        "avoid OOM; the short-context multiple-choice tasks are fine at 8+.")
     p.add_argument("--max-length", type=int, default=4096,
                    help="Tokenizer truncation length for lm-eval contexts.")
     p.add_argument("--output-json", default=None,
@@ -182,7 +188,8 @@ def main() -> int:
     if want_teacher:
         _log(rank, "[init] loading frozen dense teacher…")
         teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True
+            args.hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True,
+            attn_implementation="sdpa",
         )
         teacher_model.eval()
         for param in teacher_model.parameters():
