@@ -51,6 +51,7 @@ pt_converter/
 │   │   ├── __init__.py                     # Package marker.
 │   │   ├── pt_model.py                     # PTWrappedModel: per-rank wrapper hosting K local tracks, returns (logits, sync_hiddens).
 │   │   ├── sync.py                         # SyncBoundary: local Σ across K tracks, then NCCL all-reduce across ranks.
+│   │   ├── vocab_parallel.py               # Vocab-parallel primitives: VocabParallelEmbedding + vocab_range (embed / lm_head / KL-CE sharded over the vocab dim across all ranks).
 │   │   └── tracks/
 │   │       ├── __init__.py                 # Package marker.
 │   │       └── qwen3_5.py                  # Per-track Qwen3.5 decoder with SyncBoundary calls at sync layers.
@@ -61,9 +62,9 @@ pt_converter/
 │   │   └── qwen3_5.py                      # Qwen3.5-specific SlicerSpec instances (attention / linear-attention / MLP).
 │   ├── train/
 │   │   ├── __init__.py                     # Package marker.
-│   │   ├── data.py                         # PackedTokenStream IterableDataset (on-the-fly tokenize + pack; WikiText-103 / custom).
-│   │   ├── distill.py                      # SPD step: block-wise teacher-forced MSE (backward-per-block) + memory-chunked KL+CE backward.
-│   │   ├── losses.py                       # block_mse, logit_kl, lm_cross_entropy — all with attention-mask support.
+│   │   ├── data.py                         # PackedTokenStream IterableDataset (streamed tokenize + pack; seed-interleaved mixture / presets / custom sources).
+│   │   ├── distill.py                      # SPD step: per-block MSE (teacher/student-forced, optional normalized+clamped) + memory-chunked, optionally vocab-parallel KL+CE backward.
+│   │   ├── losses.py                       # block_mse (raw or normalized/relative), logit_kl, lm_cross_entropy — all with attention-mask support.
 │   │   ├── teacher.py                      # HookedTeacher: frozen dense model with hooks capturing hiddens at sync indices.
 │   │   └── sync_grads.py                   # Replication plan + sync_replicated_grads (averages grads inside each replication group).
 │   ├── eval/
@@ -73,9 +74,11 @@ pt_converter/
 │   └── utils/
 │       ├── __init__.py                     # Package marker.
 │       ├── checkpoint.py                   # Save/load per-track safetensors + manifest.json.
-│       └── max_tracks.py                   # Compute maximum valid N under KV-replication and divisibility rules.
+│       ├── max_tracks.py                   # Compute maximum valid N under KV-replication and divisibility rules.
+│       └── mem_report.py                   # Per-rank CUDA memory attribution (teacher shard / student / grads / AdamW + per-phase activation peak); drives --mem-report.
 └── tests/
     ├── __init__.py                         # Package marker.
+    ├── conftest.py                         # Autouse fixture forcing the pure-torch gated-delta path so CPU tests skip the GPU-only FLA / Triton kernels.
     ├── test_pt_forward_n1.py               # N=1 PT forward must match dense bit-equal; sync_hiddens captured at right depths.
     ├── test_pt_n8_forward_smoke.py         # N=8 simulated distributed forward on CPU; finite outputs, bounded drift.
     ├── test_pt_k2_local_sync.py            # K=2 single-process: exercises the local-sum SyncBoundary path without NCCL.
@@ -86,7 +89,10 @@ pt_converter/
     ├── test_sync_schedule.py               # sync_block_depth + num_layers → correct per-track sync layer indices.
     ├── test_model_adapter.py               # Adapter registry: register / lookup / idempotent re-register; slicer routing via adapter.
     ├── test_slicer_qwen3_5_integration.py  # Tiny Qwen3.5: N=1 bit-equal, N=2 round-trip, per-track shapes match config.
-    └── test_max_tracks.py                  # max_tracks_for_config against synthetic configs under the four-rule constraint set.
+    ├── test_max_tracks.py                  # max_tracks_for_config against synthetic configs under the four-rule constraint set.
+    ├── test_vocab_parallel.py              # Vocab-parallel embed + KL/CE parity: single-shard == dense, masked partials sum to nn.Embedding, 2-rank gloo grads stitch back to dense.
+    ├── test_data_mixture.py                # Streamed mixture: presets, --data-source spec parsing, packing/labels, seed-interleave determinism across ranks.
+    └── test_distill_recipe.py              # Quality recipe: normalized relative block-MSE + deterministic student-forcing scheduled sampling; end-to-end K=2 distill step.
 ```
 
 ## Convert
@@ -124,6 +130,9 @@ python scripts/convert_qwen3_5_9b.py \
 | `--compile-teacher` / `--no-compile-teacher` | on | `torch.compile` each frozen-teacher decoder layer (inference-only); disable alone if it conflicts with FSDP2 / the sync-boundary hooks. |
 | `--max-steps` | `1000` | Training steps. |
 | `--seq-len` / `--batch-size` | `4096` / `1` | Sequence length and per-rank batch. |
+| `--data-preset` | `qwen-mix` | Streamed training mixture. **`qwen-mix`** = `DKYoon/SlimPajama-6B` (0.70) + `open-web-math` (0.15) + `bigcode/the-stack-dedup` (0.15, `content` key), interleaved to approximate Qwen3.5's code/math-heavy distribution. **`the-stack-dedup` is gated** — accept its terms and export `HF_TOKEN`, or use the ungated `slimpajama` / `wikitext` presets. Sources stream, so corpus size is irrelevant (only consumed tokens are fetched); point `HF_HOME` at scratch to save quota. |
+| `--data-source` | `None` | Add a custom training source, `NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]]`, repeatable. Empty `CONFIG`/`TEXT_KEY` fields keep defaults (e.g. `DKYoon/SlimPajama-6B::text:0.7`). If **any** `--data-source` is passed it **replaces** `--data-preset`. Sources are normalized to a common `text` column and seed-interleaved by weight. |
+| `--val-dataset-name` / `--val-dataset-config` / `--val-split` / `--val-text-key` | `Salesforce/wikitext` / `wikitext-103-raw-v1` / `validation` / `text` | Held-out validation source (single dataset) for the KL eval. Defaults to **WikiText-103 validation on purpose**: a *fixed* comparator keeps `val_kl`/`val_ce` comparable across runs (and to history) for early-stop / `best/` selection, independent of the training mixture. |
 | `--lr` / `--warmup-steps` / `--cosine-decay` / `--lr-min-ratio` | `3e-5` / `0` / off / `0.1` | AdamW LR, linear warmup steps, cosine decay (decoupled — warmup/decay/both/neither), and the cosine floor as a fraction of `--lr`. Recommended: a short warmup + `--cosine-decay` (the legacy constant-LR default produced grad-norm spikes / wasted clipped steps). |
 | `--max-grad-norm` | `1.0` | Clip gradients before optimizer step. |
 | `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). Under vocab-parallel (default) every rank backwards through the full student forward, so this lowers the ~25 GB `student_fwd`/`klce` peak on **every** rank — the lever for fitting a larger `--batch-size` at `seq=4096` on 40 GB. |

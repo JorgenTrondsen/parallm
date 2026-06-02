@@ -55,7 +55,14 @@ from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_wi
 from pt_converter.dist.groups import build_groups
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.model.vocab_parallel import vocab_range
-from pt_converter.train.data import CalibrationDataConfig, PackedTokenStream
+from pt_converter.train.data import (
+    DEFAULT_PRESET,
+    CalibrationDataConfig,
+    PackedTokenStream,
+    parse_source_spec,
+    preset_names,
+    preset_sources,
+)
 from pt_converter.train.distill import DistillConfig, distill_step, validate_step
 from pt_converter.train.sync_grads import (
     assert_replicated_consistent,
@@ -90,6 +97,29 @@ def main() -> int:
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--lr", type=float, default=3e-5)
+    # ----- Training data (streamed + packed; see train/data.py) -----
+    p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names(),
+                   help="Training-data mixture. 'qwen-mix' (default) approximates Qwen3.5's "
+                        "code/math-heavy distribution (DKYoon/SlimPajama-6B 0.70 + "
+                        "open-web-math 0.15 + bigcode/the-stack-dedup 0.15), so the KL/CE "
+                        "recovery matches the teacher on code/math, not just Wikipedia. NOTE: "
+                        "the-stack-dedup is GATED — accept its terms on the HF dataset page and "
+                        "export HF_TOKEN, or use the ungated 'slimpajama'/'wikitext' presets. "
+                        "All sources are parquet-native (script datasets unsupported) and stream "
+                        "— nominal dataset size is irrelevant (only consumed tokens are fetched). "
+                        "Overridden by any --data-source. Point HF_HOME at scratch to save quota.")
+    p.add_argument("--data-source", action="append", default=None, metavar="NAME[:CONFIG[:KEY[:WEIGHT]]]",
+                   help="Add a custom training source (repeatable). Empty CONFIG/KEY fields keep "
+                        "defaults, e.g. 'DKYoon/SlimPajama-6B::text:0.7'. If any --data-source "
+                        "is given it REPLACES --data-preset.")
+    p.add_argument("--val-dataset-name", default="Salesforce/wikitext",
+                   help="Held-out validation dataset (single source). Defaults to WikiText-103 "
+                        "validation: a FIXED comparator keeps val_kl/val_ce comparable across "
+                        "runs (and to history) for early-stop / best-checkpoint selection, "
+                        "independent of the training mixture.")
+    p.add_argument("--val-dataset-config", default="wikitext-103-raw-v1")
+    p.add_argument("--val-split", default="validation")
+    p.add_argument("--val-text-key", default="text")
     p.add_argument("--activation-checkpoint", action="store_true",
                    help="Per-layer activation checkpointing of the full student forward. "
                         "Under vocab-parallel (default) EVERY rank backwards through that "
@@ -401,14 +431,32 @@ def main() -> int:
                f"(attention-head sync: {'ON' if args.sync_attention_heads else 'OFF — diverging'})")
 
     # ----- Data -----
+    # Training mixture: --data-source (repeatable) overrides --data-preset. The
+    # fixed seed keeps the interleave identical across ranks (no DistributedSampler;
+    # vocab-parallel needs every rank on the same batch).
     tok = AutoTokenizer.from_pretrained(args.hf_model)
-    ds = PackedTokenStream(tok, CalibrationDataConfig(seq_len=args.seq_len))
+    if args.data_source:
+        train_sources = [parse_source_spec(s) for s in args.data_source]
+    else:
+        train_sources = preset_sources(args.data_preset)
+    train_cfg = CalibrationDataConfig(sources=train_sources, seq_len=args.seq_len, seed=args.seed)
+    _log(rank, "[data] train sources: "
+               + ", ".join(f"{s.dataset_name}(w={s.weight:g})" for s in train_sources))
+    ds = PackedTokenStream(tok, train_cfg)
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     val_loader = None
     if args.eval_every > 0:
-        val_ds = PackedTokenStream(
-            tok, CalibrationDataConfig(split="validation", seq_len=args.seq_len)
+        # Val stays a single FIXED comparator (WT-103 val by default) so val_kl is
+        # comparable across runs regardless of the training mixture.
+        val_cfg = CalibrationDataConfig.single(
+            dataset_name=args.val_dataset_name,
+            dataset_config=args.val_dataset_config,
+            split=args.val_split,
+            text_key=args.val_text_key,
+            seq_len=args.seq_len,
+            seed=args.seed,
         )
+        val_ds = PackedTokenStream(tok, val_cfg)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=0)
 
     # ----- Optimizer + LR schedule -----

@@ -171,7 +171,9 @@ def main() -> int:
 
     # ----- Data + step -----
     tok = AutoTokenizer.from_pretrained(args.hf_model)
-    ds = PackedTokenStream(tok, CalibrationDataConfig(seq_len=args.seq_len))
+    # Single lightweight source (WT-103) — this is a determinism/sync check, not a
+    # quality run, so it doesn't need the qwen-mix default.
+    ds = PackedTokenStream(tok, CalibrationDataConfig.single(seq_len=args.seq_len))
     loader = DataLoader(ds, batch_size=1, num_workers=0)
 
     optim = torch.optim.AdamW(

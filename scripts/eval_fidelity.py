@@ -131,7 +131,7 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(args.hf_model)
     ds = PackedTokenStream(
         tok,
-        CalibrationDataConfig(
+        CalibrationDataConfig.single(
             dataset_name=args.dataset_name,
             dataset_config=args.dataset_config,
             split=args.split,
