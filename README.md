@@ -124,7 +124,7 @@ python scripts/convert_qwen3_5_9b.py \
 | `--compile-teacher` / `--no-compile-teacher` | on | `torch.compile` each frozen-teacher decoder layer (inference-only); disable alone if it conflicts with FSDP2 / the sync-boundary hooks. |
 | `--max-steps` | `1000` | Training steps. |
 | `--seq-len` / `--batch-size` | `4096` / `1` | Sequence length and per-rank batch. |
-| `--lr` / `--warmup-steps` / `--lr-min-ratio` | `3e-5` / `0` / `0.1` | AdamW LR + cosine decay floor. |
+| `--lr` / `--warmup-steps` / `--cosine-decay` / `--lr-min-ratio` | `3e-5` / `0` / off / `0.1` | AdamW LR, linear warmup steps, cosine decay (decoupled — warmup/decay/both/neither), and the cosine floor as a fraction of `--lr`. Recommended: a short warmup + `--cosine-decay` (the legacy constant-LR default produced grad-norm spikes / wasted clipped steps). |
 | `--max-grad-norm` | `1.0` | Clip gradients before optimizer step. |
 | `--activation-checkpoint` | off | Activation-checkpoint the student decoder blocks (memory ↓, compute ↑). Under vocab-parallel (default) every rank backwards through the full student forward, so this lowers the ~25 GB `student_fwd`/`klce` peak on **every** rank — the lever for fitting a larger `--batch-size` at `seq=4096` on 40 GB. |
 | `--compile` / `--no-compile` | on | `torch.compile` each per-track decoder layer in place (inductor fusion of the tiny per-track kernels). Default on (~2× faster steps); `--no-compile` to disable. One-time compile warmup on the first steps. |
@@ -134,6 +134,9 @@ python scripts/convert_qwen3_5_9b.py \
 | `--kl-ce-chunk-size` | `512` | Seq-chunk size for the KL+CE pass (caps the per-chunk fp32 `(B, chunk, V/world)` expansion). The klce phase is collective/dispatch-bound, so larger = fewer chunks = faster (512 → 8 chunks at `seq=4096` vs 32 at 128) at negligible extra memory; the transient grows ×batch, so keep moderate at large `--batch-size`. |
 | `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
 | `--kl-temperature` | `1.0` | KL temperature. |
+| `--student-forcing-prob` / `--student-forcing-warmup` | `0.0` / `0` | Scheduled sampling: per block, with this probability feed the block the **student's own** synced hidden (instead of the teacher's) as input, while the MSE target stays the teacher hidden. Closes the exposure-bias gap between teacher-forced training and free-running inference (the cause of the depth-exploding block_mse / chance-level downstream). `--student-forcing-warmup` ramps the prob `0 → prob` over N steps (start teacher-forced). Recommended `0.5` / ~half of `--max-steps`. The per-block draw is deterministic across ranks (seeded by `--seed` + step), so the SyncBoundary all-reduce stays consistent. `0.0` = legacy fully-teacher-forced path. |
+| `--normalize-block-mse` | off | Relative (scale-free) block MSE `Σ(s−t)²/Σt²` per block instead of the raw masked mean. The residual-stream norm grows with depth, so the raw MSE lets deep layers dominate the gradient (and spike the grad norm); normalizing makes every depth contribute comparably. Rescales the block term, so `--lambda-block` becomes a relative weight (1.0 is a fine start). |
+| `--block-mse-clamp` | `10.0` | Cap the normalized per-block relative MSE (only active with `--normalize-block-mse`). Under student forcing a block can be fed the student's own drifted hidden, occasionally blowing the ratio up to 100+ on a single batch — a spike that inflates the gradient and trips the `--max-grad-norm` clip, throttling the whole step. Clamping saturates the gradient above the cap (outlier rejection); normal per-block ratios (~0.5–1.5) are untouched. `<=0` disables it. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
 | `--eval-every` / `--val-batches` | `0` / `20` | Held-out KL(teacher ‖ student) eval cadence and size; val_ce also logged. |
 | `--early-stop-patience` / `--min-improvement` | `0` / `0.01` | Optional early stopping. |
@@ -166,6 +169,27 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --max-steps 4000 --seq-len 4096 --batch-size 4 \
     --activation-checkpoint --kl-ce-chunk-size 512 \
     --eval-every 200 --save-every 500
+```
+
+**Quality-recovery recipe (recommended at high `n_tracks`).** Pure teacher-forced block
+distillation trains each block only on the teacher's (correct) input, so at free-running
+inference the deep blocks compound error — the symptom is a block_mse that is small during
+training but explodes with depth in `eval_fidelity.py`, and chance-level downstream scores.
+Enable **scheduled sampling** (`--student-forcing-prob`, so blocks also train on the
+student's own drifted input), **normalized block MSE** (`--normalize-block-mse`, so deep
+high-norm layers don't dominate the gradient), and an **LR schedule** (`--warmup-steps` +
+`--cosine-decay`, vs the spiky constant-LR default):
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
+    --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
+    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
+    --out-dir train_out/qwen3_5_9b_n16_d4 \
+    --max-steps 4000 --seq-len 4096 --batch-size 5 --activation-checkpoint \
+    --student-forcing-prob 0.5 --student-forcing-warmup 2000 \
+    --normalize-block-mse --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
+    --eval-every 200 --save-every 1000
 ```
 
 ## Evaluate

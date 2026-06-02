@@ -173,6 +173,35 @@ def main() -> int:
     p.add_argument("--lambda-kl", type=float, default=1.0)
     p.add_argument("--lambda-ce", type=float, default=0.5)
     p.add_argument("--kl-temperature", type=float, default=1.0)
+    p.add_argument("--student-forcing-prob", type=float, default=0.0,
+                   help="Scheduled-sampling probability of feeding a block the student's "
+                        "OWN synced hidden (instead of the teacher's) as input, while the MSE "
+                        "target stays the teacher hidden. Trains each block to correct from a "
+                        "drifted student input toward the teacher output, closing the "
+                        "exposure-bias gap between teacher-forced training and free-running "
+                        "inference (the cause of the depth-exploding block_mse). 0.0 (default) "
+                        "= legacy fully-teacher-forced path; recommended ~0.5. The per-block "
+                        "decision is deterministic across ranks (seeded by --seed + step).")
+    p.add_argument("--student-forcing-warmup", type=int, default=0,
+                   help="Steps over which --student-forcing-prob ramps linearly 0 → prob "
+                        "(scheduled-sampling anneal: start teacher-forced, increase student-"
+                        "forcing). 0 = constant at --student-forcing-prob from step 0. "
+                        "Recommended ~half of --max-steps.")
+    p.add_argument("--normalize-block-mse", action=argparse.BooleanOptionalAction, default=False,
+                   help="Relative (scale-free) block MSE Σ(s−t)²/Σt² per block instead of the "
+                        "raw masked mean. The residual-stream norm grows with depth, so the raw "
+                        "MSE lets deep layers dominate the gradient (and spike the grad norm); "
+                        "normalizing makes each block O(1) so every depth contributes comparably. "
+                        "Default off (bit-identical legacy loss). Rescales the block term, so "
+                        "--lambda-block becomes a relative weight (1.0 is a fine start).")
+    p.add_argument("--block-mse-clamp", type=float, default=10.0,
+                   help="Cap the normalized per-block relative MSE at this value (only active "
+                        "with --normalize-block-mse). Under student forcing a block can be fed "
+                        "the student's own drifted hidden, occasionally blowing the ratio up to "
+                        "100+ on one batch — a spike that inflates the gradient and trips the "
+                        "--max-grad-norm clip, throttling the whole step. Clamping saturates the "
+                        "gradient above the cap (outlier rejection); normal ratios (~0.5–1.5) are "
+                        "untouched. <=0 disables the clamp.")
     p.add_argument("--kl-ce-chunk-size", type=int, default=512,
                    help="Seq-chunk size for the KL+CE pass; caps the per-chunk fp32 "
                         "(B, chunk, V/world) expansion. Each chunk runs 3 small all-reduces "
@@ -188,9 +217,16 @@ def main() -> int:
     p.add_argument("--min-improvement", type=float, default=0.01,
                    help="Min val_kl drop to count as an improvement.")
     p.add_argument("--warmup-steps", type=int, default=0,
-                   help="Linear warmup steps. 0 disables the LR schedule entirely.")
+                   help="Linear LR warmup steps. 0 = no warmup phase. A schedule is built "
+                        "when this is >0 OR --cosine-decay is set.")
+    p.add_argument("--cosine-decay", action=argparse.BooleanOptionalAction, default=False,
+                   help="Cosine-decay the LR from --lr down to --lr*--lr-min-ratio over the "
+                        "run (after any warmup). Default off (constant LR). Decoupled from "
+                        "--warmup-steps, so you can have warmup, decay, both, or neither. "
+                        "Recommended on (with a short --warmup-steps) — the legacy constant-LR "
+                        "default produced grad-norm spikes / wasted clipped steps.")
     p.add_argument("--lr-min-ratio", type=float, default=0.1,
-                   help="Cosine decay floor as a fraction of --lr.")
+                   help="Cosine decay floor as a fraction of --lr (only used with --cosine-decay).")
     p.add_argument("--seed", type=int, default=42,
                    help="Seed for torch / cuda / python / numpy RNGs. Same on every rank "
                         "(no per-rank randomness in this pipeline). Restored from a "
@@ -392,15 +428,21 @@ def main() -> int:
     )
     mem_stage("optimizer constructed (AdamW state lazy)")
 
+    # A schedule is built when warmup OR cosine decay is requested (decoupled):
+    # warmup-only holds at peak LR after the ramp; cosine-only decays from step 0;
+    # both ramps then decays; neither leaves the LR constant (scheduler stays None).
     scheduler = None
-    if args.warmup_steps > 0:
+    if args.warmup_steps > 0 or args.cosine_decay:
         warmup = args.warmup_steps
         total = args.max_steps
         min_ratio = args.lr_min_ratio
+        cosine = args.cosine_decay
 
         def lr_lambda(s: int) -> float:
-            if s < warmup:
+            if warmup > 0 and s < warmup:
                 return (s + 1) / max(1, warmup)
+            if not cosine:
+                return 1.0
             progress = (s - warmup) / max(1, total - warmup)
             progress = min(max(progress, 0.0), 1.0)
             return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
@@ -422,6 +464,8 @@ def main() -> int:
         lambda_ce=args.lambda_ce,
         kl_temperature=args.kl_temperature,
         kl_ce_chunk_size=args.kl_ce_chunk_size,
+        normalize_block_mse=args.normalize_block_mse,
+        block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
     )
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -591,10 +635,21 @@ def main() -> int:
         do_mem_capture = step == mem_report_step
         step_mem: dict[str, dict[str, float]] | None = {} if do_mem_capture else None
 
+        # Scheduled-sampling probability for this step (ramp 0 → prob over the
+        # warmup window). The per-block draw inside distill_step is seeded by
+        # (seed, step) so every rank makes identical teacher/student choices.
+        if args.student_forcing_warmup > 0:
+            sf_p = args.student_forcing_prob * min(1.0, step / args.student_forcing_warmup)
+        else:
+            sf_p = args.student_forcing_prob
+
         optim.zero_grad(set_to_none=True)
         # distill_step now backwards each block immediately to bound peak
         # memory; gradients accumulate on student params internally.
-        losses = distill_step(student, teacher, batch, distill_cfg, timings=timings, mem=step_mem)
+        losses = distill_step(
+            student, teacher, batch, distill_cfg, timings=timings, mem=step_mem,
+            student_forcing_prob=sf_p, forcing_seed=(args.seed, step),
+        )
         sync_replicated_grads(replication_plan)
 
         # Global, replication-deduplicated grad norm. Same scalar on every rank,

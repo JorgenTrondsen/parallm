@@ -20,6 +20,7 @@ same minibatch; gradients accumulate before `optimizer.step()`.
 """
 from __future__ import annotations
 
+import random
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -386,6 +387,14 @@ class DistillConfig:
     lambda_kl: float = 1.0
     lambda_ce: float = 0.5
     kl_temperature: float = 1.0
+    # Relative (scale-free) block MSE: Σ(s−t)²/Σt² per block instead of the raw
+    # masked mean. Rescales the block term to O(1)/block so deep, large-norm
+    # layers no longer dominate the gradient. See losses.block_mse.
+    normalize_block_mse: bool = False
+    # Cap the (normalized) per-block relative MSE so a single student-forced batch
+    # whose ratio blows up can't spike the gradient and trip the grad-norm clip.
+    # None = no clamp. Only applies when normalize_block_mse is True.
+    block_mse_clamp: float | None = None
     # Seq-chunk size for the KL+CE pass. The (B, T, V) fp32 softmax expansions
     # would OOM at training seq_len; chunking caps the per-chunk transient at
     # (chunk_size/T)x. Under vocab-parallel the expansion is per-rank only
@@ -396,6 +405,22 @@ class DistillConfig:
     # (per-rank fp32 transient (B, chunk, V/world) ≈ 63 MB/tensor at B=1). The
     # transient grows ×B, so at large batch keep this moderate rather than maxing.
     kl_ce_chunk_size: int = 512
+
+
+def _combine_seed(forcing_seed: object) -> object:
+    """Fold a tuple/list seed (e.g. ``(seed, step)``) into a single int.
+
+    Pure integer arithmetic, so the result is deterministic and
+    process-independent — every rank derives the same value (unlike ``hash`` of
+    str/bytes, which is randomized under PYTHONHASHSEED). Non-tuple seeds
+    (int/str/bytes/None) pass straight through to ``random.Random``.
+    """
+    if isinstance(forcing_seed, (tuple, list)):
+        combined = 0
+        for v in forcing_seed:
+            combined = combined * 1_000_003 + int(v)
+        return combined
+    return forcing_seed
 
 
 def _block_ranges(num_layers: int, sync_indices: tuple[int, ...]) -> list[tuple[int, int]]:
@@ -458,6 +483,8 @@ def distill_step(
     cfg: DistillConfig,
     timings: dict[str, float] | None = None,
     mem: dict[str, dict[str, float]] | None = None,
+    student_forcing_prob: float = 0.0,
+    forcing_seed: object = 0,
 ) -> dict[str, torch.Tensor]:
     """Run one distillation step. Backward is done internally, per block.
 
@@ -465,11 +492,25 @@ def distill_step(
     peak memory holds at most a single block's activations rather than every
     block plus the final forward simultaneously. Mathematically equivalent to
     a single `backward()` on the summed loss because the block forwards are
-    independent (teacher-forced — each block reads ``prev_teacher_h.detach()``).
+    independent — each block reads its input ``.detach()``ed.
+
+    Scheduled sampling (``student_forcing_prob`` > 0): per block, with probability
+    ``student_forcing_prob`` the *next* block is fed the student's own synced
+    hidden (``h_synced.detach()``) instead of the teacher's hidden, while the MSE
+    target stays the teacher hidden. This trains each block to correct from a
+    drifted (student) input toward the teacher output — closing the exposure-bias
+    gap between teacher-forced training and free-running inference. The decision is
+    drawn from ``random.Random(forcing_seed)`` so it is IDENTICAL on every rank:
+    all ranks run the same block on the same input and all-reduce in
+    ``sync_module``; a per-rank-divergent choice would corrupt that sum.
+    ``forcing_prob == 0`` reproduces the legacy fully-teacher-forced path bit-for-bit.
 
     Returns a dict of *detached* scalar tensors for logging. The caller is
     responsible for ``sync_replicated_grads(plan)``, clip, and ``optim.step()``.
     """
+    # A tuple seed (e.g. ``(seed, step)``) is combined into a single int so every
+    # rank derives the same generator — see _combine_seed.
+    forcing_rng = random.Random(_combine_seed(forcing_seed))
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
     labels = batch["labels"]
@@ -526,13 +567,23 @@ def distill_step(
             h_synced = student.sync_module(h_post_list, prev_h)
             # pop (not index): release this hidden from the captures dict once
             # consumed so only ~1 teacher hidden stays resident, not all 8.
-            # Reused as both the MSE target and the next block's input (detach:
-            # teacher-forced, no grad flows back into the teacher).
+            # The teacher hidden is always the MSE target (detached: no grad
+            # flows back into the teacher).
             t_end = teacher_hiddens.pop(end).detach()
-            block_loss_b = block_mse(h_synced, t_end, attention_mask=attention_mask)
+            block_loss_b = block_mse(
+                h_synced, t_end, attention_mask=attention_mask,
+                normalize=cfg.normalize_block_mse,
+                clamp_max=cfg.block_mse_clamp,
+            )
             (cfg.lambda_block * block_loss_b).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
-            prev_h = t_end
+            # Next block's input: teacher hidden (teacher forcing) or the
+            # student's own synced output (student forcing, prob student_forcing_prob).
+            # Either way detach() keeps the per-block backward memory-bounded.
+            # Draw BEFORE branching so the RNG stream is consumed identically on
+            # every rank regardless of the outcome.
+            use_student = forcing_rng.random() < student_forcing_prob
+            prev_h = h_synced.detach() if use_student else t_end
 
     # ----- Final-logit KL + LM CE (full student forward, chunked lm_head) -----
     # All ranks call the full forward so cross-track SyncBoundary all-reduces
