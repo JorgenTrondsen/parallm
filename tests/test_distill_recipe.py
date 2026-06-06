@@ -125,7 +125,7 @@ def test_forcing_decisions_are_deterministic_per_seed():
 
 # ----- distill_step end-to-end with the new recipe -----
 
-def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4):
+def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4, teacher_hook_all=False):
     torch.manual_seed(13)
     dense = Qwen3_5TextModel(cfg).eval()
     dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
@@ -134,7 +134,8 @@ def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4):
     tracks, manifest = slice_model_to_tracks(
         dense, n_tracks=n_tracks, sync_block_depth=sync_block_depth, text_config_attr="config"
     )
-    assert manifest.sync_layer_indices == [3, 7]
+    if sync_block_depth == 4:
+        assert manifest.sync_layer_indices == [3, 7]
 
     student = PTWrappedModel(
         text_config=cfg,
@@ -146,9 +147,14 @@ def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4):
     student.load_track_state_dicts({i: tracks[i] for i in range(n_tracks)}, strict=False)
     student.train()
 
+    # Intra-window per-layer MSE needs a teacher hidden at every layer, not just
+    # the sync boundaries.
+    hook_indices = (
+        list(range(cfg.num_hidden_layers)) if teacher_hook_all else manifest.sync_layer_indices
+    )
     teacher = HookedTeacher(
         text_model=dense, lm_head=dense.lm_head,
-        sync_layer_indices=manifest.sync_layer_indices,
+        sync_layer_indices=hook_indices,
     )
     return student, teacher, manifest
 
@@ -198,6 +204,56 @@ def test_distill_step_forcing_prob_zero_matches_legacy_default():
     out_b = distill_step(
         student_b, teacher_b, batch,
         DistillConfig(sync_layer_indices=tuple(manifest.sync_layer_indices)),
+    )
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.allclose(out_a[key], out_b[key], atol=1e-5), key
+
+
+# ----- intra-window per-layer MSE (lever c) -----
+
+def test_intra_window_mse_runs_at_d4():
+    """D=4 window (incl. the full-attention layer mid-window): the per-layer
+    supervised path runs end-to-end, stays finite, and propagates gradients."""
+    cfg = _tiny_config()
+    student, teacher, manifest = _build_teacher_student(
+        cfg, sync_block_depth=4, teacher_hook_all=True
+    )
+    distill_cfg = DistillConfig(
+        sync_layer_indices=tuple(manifest.sync_layer_indices),
+        normalize_block_mse=True,
+        block_mse_clamp=10.0,
+        intra_window_mse=True,
+    )
+    student.zero_grad(set_to_none=True)
+    losses = distill_step(
+        student, teacher, _batch(cfg), distill_cfg,
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.isfinite(losses[key]).all(), key
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in student.parameters())
+
+
+def test_intra_window_mse_equals_boundary_at_d1():
+    """At D=1 every window is a single layer, so per-layer supervision (averaged
+    over one layer) must reduce bit-for-bit to the boundary-only path."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=1)
+    out_a = distill_step(
+        s_a, t_a, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      normalize_block_mse=True, intra_window_mse=False),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=1)
+    out_b = distill_step(
+        s_b, t_b, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      normalize_block_mse=True, intra_window_mse=True),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
     )
     for key in ("total", "block_mse", "kl", "ce"):
         assert torch.allclose(out_a[key], out_b[key], atol=1e-5), key

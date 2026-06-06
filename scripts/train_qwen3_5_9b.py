@@ -41,6 +41,7 @@ import os
 import random
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -112,14 +113,32 @@ def main() -> int:
                    help="Add a custom training source (repeatable). Empty CONFIG/KEY fields keep "
                         "defaults, e.g. 'DKYoon/SlimPajama-6B::text:0.7'. If any --data-source "
                         "is given it REPLACES --data-preset.")
-    p.add_argument("--val-dataset-name", default="Salesforce/wikitext",
-                   help="Held-out validation dataset (single source). Defaults to WikiText-103 "
-                        "validation: a FIXED comparator keeps val_kl/val_ce comparable across "
-                        "runs (and to history) for early-stop / best-checkpoint selection, "
-                        "independent of the training mixture.")
-    p.add_argument("--val-dataset-config", default="wikitext-103-raw-v1")
-    p.add_argument("--val-split", default="validation")
-    p.add_argument("--val-text-key", default="text")
+    p.add_argument("--val-dataset-name", default=None,
+                   help="Held-out validation source. DEFAULT (unset): a HELD-OUT slice of the "
+                        "TRAINING mixture — val mirrors the train sources (same seed) but reads the "
+                        "front while the train stream skips the first --val-holdout-docs documents, "
+                        "so the two are disjoint and val_kl measures the in-distribution "
+                        "generalization gap (directly comparable to the per-step kl/ce). Set this "
+                        "to an external dataset (e.g. Salesforce/wikitext) to use a FIXED cross-run "
+                        "comparator instead (the legacy default; already disjoint, so no train "
+                        "skip). NOTE: leaving the default means val_kl is on the training mixture, "
+                        "not comparable to WikiText-103 history.")
+    p.add_argument("--val-dataset-config", default="wikitext-103-raw-v1",
+                   help="Dataset config for an external --val-dataset-name (ignored in the default "
+                        "mirror-the-training-mixture mode).")
+    p.add_argument("--val-split", default="validation",
+                   help="Split for an external --val-dataset-name (ignored in mirror mode).")
+    p.add_argument("--val-text-key", default="text",
+                   help="Text column for an external --val-dataset-name (ignored in mirror mode).")
+    p.add_argument("--val-holdout-docs", type=int, default=16384,
+                   help="Mirror mode only: number of leading mixture documents reserved for the "
+                        "held-out val set. The TRAIN stream skips them once at startup (a one-time "
+                        "read of that many raw docs) and val reads the front, keeping the two "
+                        "disjoint. Must exceed the docs val consumes "
+                        "(~val_batches × batch_size × seq_len / tokens-per-doc); the 16384 default "
+                        "covers the default eval config down to ~25 tokens/doc — raise it if you "
+                        "bump --val-batches/--batch-size on a short-document source. Unused when "
+                        "--val-dataset-name is set.")
     p.add_argument("--activation-checkpoint", action="store_true",
                    help="Per-layer activation checkpointing of the full student forward. "
                         "Under vocab-parallel (default) EVERY rank backwards through that "
@@ -232,6 +251,16 @@ def main() -> int:
                         "--max-grad-norm clip, throttling the whole step. Clamping saturates the "
                         "gradient above the cap (outlier rejection); normal ratios (~0.5–1.5) are "
                         "untouched. <=0 disables the clamp.")
+    p.add_argument("--intra-window-mse", action="store_true",
+                   help="Supervise EVERY layer inside each sync window, not just the boundary. At "
+                        "each within-window layer the synced reconstruction is MSE'd against the "
+                        "teacher's hidden at that depth (the forward still feeds each track its "
+                        "PARTIAL residual — the taps are sync-for-loss-only), pinning the "
+                        "within-window layers to the teacher trajectory. Targets the uniform-D≥2 "
+                        "stall, where the mid-window (esp. full-attention) layers run on partial "
+                        "residuals. Hooks the teacher at every layer (more captures). Per-window "
+                        "loss is averaged over its layers, so --lambda-block keeps its meaning and "
+                        "D=1 is bit-identical to the boundary-only path. Off by default.")
     p.add_argument("--kl-ce-chunk-size", type=int, default=512,
                    help="Seq-chunk size for the KL+CE pass; caps the per-chunk fp32 "
                         "(B, chunk, V/world) expansion. Each chunk runs 3 small all-reduces "
@@ -240,7 +269,9 @@ def main() -> int:
                         "at 128, ~4x fewer collectives) at negligible extra memory. The fp32 "
                         "transient grows ×batch, so keep this moderate at large --batch-size.")
     p.add_argument("--eval-every", type=int, default=0,
-                   help="0 disables validation. >0 runs val_batches batches of WT-103 val every N steps.")
+                   help="0 disables validation. >0 runs val_batches batches of the held-out val set "
+                        "(default: a held-out slice of the training mixture; see --val-dataset-name) "
+                        "every N steps.")
     p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--early-stop-patience", type=int, default=0,
                    help="0 disables early stop. Otherwise stop after N eval windows with no val_kl improvement.")
@@ -279,6 +310,14 @@ def main() -> int:
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
+
+    # ----- Run configuration -----
+    # Dump every parsed arg (rank 0) so a run's full config is self-documented in
+    # its log — invaluable when comparing runs after the fact. Sorted for a stable
+    # diff between logs.
+    _log(rank, f"[config] world_size={world_size}")
+    for k in sorted(vars(args)):
+        _log(rank, f"[config] {k}={getattr(args, k)}")
 
     # ----- Memory-report lifecycle hook -----
     # Records a device_mem() snapshot at each init stage (for the final report's
@@ -367,10 +406,18 @@ def main() -> int:
         teacher_lm_head = teacher_model.lm_head
         fsdp_lm_head = teacher_model.lm_head
 
+    # Intra-window per-layer MSE needs a teacher hidden at EVERY layer (not just
+    # the sync boundaries); otherwise hook only the boundaries (the targets the
+    # block loop consumes). Extra captures cost ~one (B,T,H) bf16 tensor per layer.
+    teacher_hook_indices = (
+        list(range(manifest.num_layers))
+        if args.intra_window_mse
+        else manifest.sync_layer_indices
+    )
     teacher = HookedTeacher(
         text_model=text_model,
         lm_head=teacher_lm_head,
-        sync_layer_indices=manifest.sync_layer_indices,
+        sync_layer_indices=teacher_hook_indices,
     )
     wrap_teacher_with_fsdp(
         text_model, fsdp_lm_head,
@@ -439,23 +486,50 @@ def main() -> int:
         train_sources = [parse_source_spec(s) for s in args.data_source]
     else:
         train_sources = preset_sources(args.data_preset)
-    train_cfg = CalibrationDataConfig(sources=train_sources, seq_len=args.seq_len, seed=args.seed)
+
+    # Validation mode:
+    #   * default (--val-dataset-name unset): val is a HELD-OUT slice of the
+    #     training mixture. Val mirrors the train sources with the same seed but
+    #     reads the front (skip_docs=0) while the train stream skips the first
+    #     --val-holdout-docs documents, so the two cover disjoint doc ranges and
+    #     val_kl measures the in-distribution generalization gap (comparable to
+    #     the per-step kl/ce).
+    #   * --val-dataset-name set: val is a FIXED external comparator (e.g. WT-103);
+    #     it's a different dataset (already disjoint) so the train stream is NOT
+    #     skipped.
+    val_mirrors_train = args.eval_every > 0 and args.val_dataset_name is None
+    train_skip = args.val_holdout_docs if val_mirrors_train else 0
+    train_cfg = CalibrationDataConfig(
+        sources=train_sources, seq_len=args.seq_len, seed=args.seed, skip_docs=train_skip,
+    )
     _log(rank, "[data] train sources: "
-               + ", ".join(f"{s.dataset_name}(w={s.weight:g})" for s in train_sources))
+               + ", ".join(f"{s.dataset_name}(w={s.weight:g})" for s in train_sources)
+               + (f"  [holding out first {train_skip} docs for val]" if train_skip else ""))
     ds = PackedTokenStream(tok, train_cfg)
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     val_loader = None
     if args.eval_every > 0:
-        # Val stays a single FIXED comparator (WT-103 val by default) so val_kl is
-        # comparable across runs regardless of the training mixture.
-        val_cfg = CalibrationDataConfig.single(
-            dataset_name=args.val_dataset_name,
-            dataset_config=args.val_dataset_config,
-            split=args.val_split,
-            text_key=args.val_text_key,
-            seq_len=args.seq_len,
-            seed=args.seed,
-        )
+        if val_mirrors_train:
+            # Held-out slice of the SAME mixture: identical sources + seed, reading
+            # the front of the sequence the train stream skips past (skip_docs=0).
+            # Fresh source copies so the two configs don't alias the same list.
+            val_cfg = CalibrationDataConfig(
+                sources=[replace(s) for s in train_sources],
+                seq_len=args.seq_len, seed=args.seed, skip_docs=0,
+            )
+            _log(rank, f"[data] val: held-out front slice of the training mixture "
+                       f"(first {train_skip} docs, mirror sources)")
+        else:
+            # External FIXED comparator (the legacy WT-103 path).
+            val_cfg = CalibrationDataConfig.single(
+                dataset_name=args.val_dataset_name,
+                dataset_config=args.val_dataset_config,
+                split=args.val_split,
+                text_key=args.val_text_key,
+                seq_len=args.seq_len,
+                seed=args.seed,
+            )
+            _log(rank, f"[data] val: external comparator {args.val_dataset_name}")
         val_ds = PackedTokenStream(tok, val_cfg)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, num_workers=0)
 
@@ -514,6 +588,7 @@ def main() -> int:
         kl_ce_chunk_size=args.kl_ce_chunk_size,
         normalize_block_mse=args.normalize_block_mse,
         block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
+        intra_window_mse=args.intra_window_mse,
     )
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)

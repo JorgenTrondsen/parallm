@@ -39,7 +39,14 @@ from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_wi
 from pt_converter.dist.groups import build_groups
 from pt_converter.eval.fidelity import fidelity_step
 from pt_converter.model.pt_model import PTWrappedModel
-from pt_converter.train.data import CalibrationDataConfig, PackedTokenStream
+from pt_converter.train.data import (
+    DEFAULT_PRESET,
+    CalibrationDataConfig,
+    PackedTokenStream,
+    parse_source_spec,
+    preset_names,
+    preset_sources,
+)
 from pt_converter.train.teacher import HookedTeacher
 from pt_converter.utils.checkpoint import load_manifest, load_track
 
@@ -55,9 +62,30 @@ def main() -> int:
     p.add_argument("--checkpoint-dir", required=True,
                    help="Per-rank checkpoint dir with track_*.safetensors and manifest.json "
                         "(e.g. ./pt_train_out/best, ./pt_train_out/final, or a step_N dir).")
-    p.add_argument("--dataset-name", default="Salesforce/wikitext")
-    p.add_argument("--dataset-config", default="wikitext-103-raw-v1")
-    p.add_argument("--split", default="validation")
+    p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names(),
+                   help="Streamed eval mixture (DEFAULT). 'qwen-mix' is the training mixture, so "
+                        "fidelity is measured on the SAME distribution the student was distilled on "
+                        "(directly comparable to the training val_kl). Reads the held-out FRONT slice "
+                        "(--skip-docs 0) — the docs the default training val held out. NOTE: qwen-mix's "
+                        "the-stack-dedup is GATED (export HF_TOKEN), or pass --data-preset slimpajama / "
+                        "--dataset-name. Overridden by --data-source or --dataset-name.")
+    p.add_argument("--data-source", action="append", default=None, metavar="NAME[:CONFIG[:KEY[:WEIGHT]]]",
+                   help="Custom eval source(s), repeatable; if any given it REPLACES --data-preset.")
+    p.add_argument("--dataset-name", default=None,
+                   help="Legacy single-dataset override (e.g. 'Salesforce/wikitext' for the old "
+                        "WikiText-103 comparator). If set, used instead of --data-preset.")
+    p.add_argument("--dataset-config", default="wikitext-103-raw-v1",
+                   help="Config for --dataset-name (ignored unless --dataset-name is set).")
+    p.add_argument("--split", default="validation",
+                   help="Split for --dataset-name (ignored unless --dataset-name is set).")
+    p.add_argument("--text-key", default="text",
+                   help="Text column for --dataset-name (ignored unless --dataset-name is set).")
+    p.add_argument("--skip-docs", type=int, default=0,
+                   help="Skip the first N docs of the preset/--data-source stream before packing. "
+                        "0 reads the held-out front the default training val used; raise to match a "
+                        "non-default --val-holdout-docs if you need strict disjointness from training.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Mixture interleave seed; keep equal across ranks (matches training).")
     p.add_argument("--num-batches", type=int, default=200,
                    help="Number of packed sequences to evaluate.")
     p.add_argument("--seq-len", type=int, default=4096)
@@ -128,16 +156,30 @@ def main() -> int:
 
     # ----- Data. PackedTokenStream is reused as-is; switching dataset is just
     # a CalibrationDataConfig change. -----
+    # Eval source priority: --data-source > --dataset-name (legacy single) > --data-preset.
+    # Default is the qwen-mix training mixture's held-out front slice, so fidelity is
+    # measured in-distribution and lines up with the training val_kl.
     tok = AutoTokenizer.from_pretrained(args.hf_model)
-    ds = PackedTokenStream(
-        tok,
-        CalibrationDataConfig.single(
-            dataset_name=args.dataset_name,
-            dataset_config=args.dataset_config,
-            split=args.split,
-            seq_len=args.seq_len,
-        ),
-    )
+    if args.data_source:
+        data_cfg = CalibrationDataConfig(
+            sources=[parse_source_spec(s) for s in args.data_source],
+            seq_len=args.seq_len, seed=args.seed, skip_docs=args.skip_docs,
+        )
+        data_desc = "custom --data-source"
+    elif args.dataset_name:
+        data_cfg = CalibrationDataConfig.single(
+            dataset_name=args.dataset_name, dataset_config=args.dataset_config,
+            split=args.split, text_key=args.text_key, seq_len=args.seq_len, seed=args.seed,
+        )
+        data_desc = f"{args.dataset_name}/{args.dataset_config}/{args.split}"
+    else:
+        data_cfg = CalibrationDataConfig(
+            sources=preset_sources(args.data_preset),
+            seq_len=args.seq_len, seed=args.seed, skip_docs=args.skip_docs,
+        )
+        data_desc = f"preset:{args.data_preset} (held-out front, skip_docs={args.skip_docs})"
+    _log(rank, f"[data] eval source: {data_desc}")
+    ds = PackedTokenStream(tok, data_cfg)
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
 
     sync_indices = tuple(manifest.sync_layer_indices)
@@ -172,8 +214,7 @@ def main() -> int:
         kl_rev = sums["kl_reverse"].item()
         print()
         print(f"===== Fidelity over {n_batches} batches "
-              f"({args.dataset_name}/{args.dataset_config}/{args.split}, "
-              f"seq_len={args.seq_len}) =====")
+              f"({data_desc}, seq_len={args.seq_len}) =====")
         print(f"  perplexity   : student={s_ppl:.4f}  teacher={t_ppl:.4f}  gap={s_ppl - t_ppl:+.4f}")
         print(f"  nll          : student={s_nll:.4f}  teacher={t_nll:.4f}  delta={s_nll - t_nll:+.4f}")
         print(f"  KL forward (t‖s) = {kl_fwd:.4f} nats")

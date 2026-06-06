@@ -395,6 +395,16 @@ class DistillConfig:
     # whose ratio blows up can't spike the gradient and trip the grad-norm clip.
     # None = no clamp. Only applies when normalize_block_mse is True.
     block_mse_clamp: float | None = None
+    # Supervise EVERY layer inside each sync window, not just the boundary.
+    # At each within-window layer the synced reconstruction is MSE'd against the
+    # teacher's hidden at that depth (the forward still feeds each track its
+    # PARTIAL residual — the loss taps are sync-for-loss-only), pinning the
+    # within-window layers (which run on partial residuals at D≥2) to the teacher
+    # trajectory. The per-window loss is AVERAGED over its layers so the loss
+    # scale (and `lambda_block`) stays comparable to the boundary-only path; at
+    # D=1 (one layer per window) it is bit-identical to the legacy boundary MSE.
+    # Requires the teacher to be hooked at every layer (see scripts/train_*.py).
+    intra_window_mse: bool = False
     # Seq-chunk size for the KL+CE pass. The (B, T, V) fp32 softmax expansions
     # would OOM at training seq_len; chunking caps the per-chunk transient at
     # (chunk_size/T)x. Under vocab-parallel the expansion is per-rank only
@@ -554,27 +564,70 @@ def distill_step(
     prev_h = inputs_embeds.detach()
     with _phase("block_loop", timings, mem):
         for start, end in ranges:
-            h_post_list = _run_student_block(
-                student,
-                prev_h,
-                start,
-                end,
-                position_embeddings,
-                text_position_ids,
-                causal_mask,
-                linear_attn_mask,
-            )
-            h_synced = student.sync_module(h_post_list, prev_h)
-            # pop (not index): release this hidden from the captures dict once
-            # consumed so only ~1 teacher hidden stays resident, not all 8.
-            # The teacher hidden is always the MSE target (detached: no grad
-            # flows back into the teacher).
-            t_end = teacher_hiddens.pop(end).detach()
-            block_loss_b = block_mse(
-                h_synced, t_end, attention_mask=attention_mask,
-                normalize=cfg.normalize_block_mse,
-                clamp_max=cfg.block_mse_clamp,
-            )
+            if cfg.intra_window_mse:
+                # Per-layer supervision: run the window track-locally and at EACH
+                # layer compute the synced reconstruction and MSE it against the
+                # teacher hidden at that depth. The synced taps are loss-only — the
+                # forward keeps feeding each track its PARTIAL hidden to the next
+                # layer (the D≥2 semantics). h_synced after the last layer is the
+                # real boundary reconstruction (what carries to the next window).
+                per_track_h = [prev_h for _ in student.text_models]
+                win_loss = torch.zeros((), device=input_ids.device)
+                t_end = None
+                for layer_idx in range(start, end + 1):
+                    new_h: list[torch.Tensor] = []
+                    for k, tm in enumerate(student.text_models):
+                        layer = tm.layers[layer_idx]
+                        layer_mask = (
+                            linear_attn_mask
+                            if tm.config.layer_types[layer_idx] == "linear_attention"
+                            else causal_mask
+                        )
+                        new_h.append(
+                            layer(
+                                per_track_h[k],
+                                position_embeddings=position_embeddings,
+                                attention_mask=layer_mask,
+                                position_ids=text_position_ids,
+                                past_key_values=None,
+                                use_cache=False,
+                            )
+                        )
+                    h_synced = student.sync_module(new_h, prev_h)
+                    t_l = teacher_hiddens.pop(layer_idx).detach()
+                    if layer_idx == end:
+                        t_end = t_l  # boundary target, reused for teacher forcing
+                    win_loss = win_loss + block_mse(
+                        h_synced, t_l, attention_mask=attention_mask,
+                        normalize=cfg.normalize_block_mse,
+                        clamp_max=cfg.block_mse_clamp,
+                    )
+                    per_track_h = new_h
+                # Average over the window so the scale (and lambda_block) matches
+                # the boundary-only path; identical to it when the window is 1 layer.
+                block_loss_b = win_loss / (end - start + 1)
+            else:
+                h_post_list = _run_student_block(
+                    student,
+                    prev_h,
+                    start,
+                    end,
+                    position_embeddings,
+                    text_position_ids,
+                    causal_mask,
+                    linear_attn_mask,
+                )
+                h_synced = student.sync_module(h_post_list, prev_h)
+                # pop (not index): release this hidden from the captures dict once
+                # consumed so only ~1 teacher hidden stays resident, not all 8.
+                # The teacher hidden is always the MSE target (detached: no grad
+                # flows back into the teacher).
+                t_end = teacher_hiddens.pop(end).detach()
+                block_loss_b = block_mse(
+                    h_synced, t_end, attention_mask=attention_mask,
+                    normalize=cfg.normalize_block_mse,
+                    clamp_max=cfg.block_mse_clamp,
+                )
             (cfg.lambda_block * block_loss_b).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
             # Next block's input: teacher hidden (teacher forcing) or the
