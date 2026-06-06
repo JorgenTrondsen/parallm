@@ -127,6 +127,46 @@ def test_empty_documents_are_skipped():
     assert flat == expected[: len(out) * seq_len]
 
 
+# ----- held-out skip_docs (disjoint train/val on the same mixture) -----
+
+def _flat(stream):
+    return [t for item in stream for t in item["input_ids"].tolist()]
+
+
+def test_skip_docs_holds_out_front_disjoint():
+    """skip_docs=N drops the first N docs; the train (N) and val (0) streams over
+    the same source cover disjoint document ranges."""
+    seq_len = 4
+    docs = [{"text": c * 4} for c in "abcdef"]  # 6 docs × 4 tokens
+    full = _flat(PackedTokenStream(
+        _CharTok(), CalibrationDataConfig(sources=[DataSourceSpec("x")], seq_len=seq_len),
+        _streams=[list(docs)]))
+    skipped = _flat(PackedTokenStream(
+        _CharTok(), CalibrationDataConfig(sources=[DataSourceSpec("x")], seq_len=seq_len, skip_docs=2),
+        _streams=[list(docs)]))
+
+    held_out = [ord(c) for d in docs[:2] for c in d["text"]]   # first 2 docs reserved for "val"
+    kept = [ord(c) for d in docs[2:] for c in d["text"]]       # what "train" sees
+    # val (full, reads the front) covers the held-out region; train (skipped) does not.
+    assert full[: len(held_out)] == held_out
+    assert skipped == kept[: len(skipped)]
+    # disjoint: no held-out token leaks into the skipped stream.
+    assert not (set(skipped) & set(held_out))
+
+
+def test_skip_docs_counts_empty_documents():
+    """The boundary is content-independent: empty docs count toward skip_docs so the
+    cut is identical regardless of which docs happen to be empty (and across ranks)."""
+    seq_len = 4
+    docs = [{"text": ""}, {"text": "aaaa"}, {"text": "bbbb"}, {"text": "cccc"}]
+    # skip_docs=2 discards the empty doc + "aaaa", leaving "bbbb"/"cccc".
+    skipped = _flat(PackedTokenStream(
+        _CharTok(), CalibrationDataConfig(sources=[DataSourceSpec("x")], seq_len=seq_len, skip_docs=2),
+        _streams=[list(docs)]))
+    expected = [ord(c) for c in "bbbbcccc"]
+    assert skipped == expected[: len(skipped)]
+
+
 # ----- interleave determinism (needs `datasets`) -----
 
 def _build_two_source_stream(seed):

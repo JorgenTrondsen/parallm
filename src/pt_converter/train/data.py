@@ -102,6 +102,12 @@ class CalibrationDataConfig:
     # vocab-parallel every rank backwards the same batch and the SyncBoundary
     # all-reduce assumes identical inputs). Keep this equal across ranks.
     seed: int = 42
+    # Held-out boundary: discard the first ``skip_docs`` raw documents of the
+    # (interleaved) stream before packing. Used to carve a disjoint val set out of
+    # the SAME mixture: the train stream sets ``skip_docs=N`` while a mirror val set
+    # reads the front (``skip_docs=0``) of the identical seeded sequence, so the two
+    # cover non-overlapping document ranges. 0 = read from the start (legacy).
+    skip_docs: int = 0
 
     @classmethod
     def from_preset(cls, name: str, **kwargs) -> "CalibrationDataConfig":
@@ -182,7 +188,17 @@ class PackedTokenStream(IterableDataset):
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         buf: list[int] = []
         seq_len = self.cfg.seq_len
+        # Skip the held-out prefix: counted on EVERY raw example (before the
+        # empty-text check below) so the boundary is content-independent and
+        # identical across ranks — the train stream (skip_docs=N) and a mirror
+        # val stream (skip_docs=0) then read disjoint document ranges of the same
+        # seeded sequence. The train loader is iterated once per run, so this is a
+        # one-time advance; a mirror val (skip_docs=0) pays nothing.
+        skip_remaining = self.cfg.skip_docs
         for example in self.ds:
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
             text = example.get("text", "")
             if not text:
                 continue
