@@ -33,6 +33,11 @@ class PTManifest:
     # single track only (e.g. embed_tokens, lm_head). Absence means "every
     # track holds this param" (replicated or sliced).
     top_level_owners: dict[str, int] = field(default_factory=dict)
+    # How sync_layer_indices was derived: "uniform" (every D layers) or
+    # "full_attn_aligned" (a sync immediately before each full-attention layer
+    # so it reads a synced — exactly decomposable — residual). Self-documenting;
+    # defaulted so old manifests (which omit it) still load.
+    sync_schedule: str = "uniform"
 
 
 def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
@@ -58,12 +63,46 @@ def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
     return out
 
 
-def _resolve_sync_schedule(num_layers: int, block_depth: int) -> list[int]:
+def _resolve_sync_schedule(
+    num_layers: int,
+    block_depth: int,
+    layer_types: list[str] | None = None,
+    align_full_attention: bool = False,
+) -> list[int]:
     """Return layer indices after which a sync boundary fires.
 
-    Block depth D means sync after every D layers. Indices are 0-based and
-    point to the *last* layer of a block, so the last block is included.
+    Uniform mode (default): block depth D means sync after every D layers.
+    Indices are 0-based and point to the *last* layer of a block, so the last
+    block is included.
+
+    Full-attention-aligned mode (``align_full_attention``): place a sync
+    immediately *before* every full-attention layer (i.e. after layer ``f-1``)
+    so each full-attention layer reads a synced — exactly decomposable —
+    residual, plus a final sync after the last layer so the post-stack norm
+    reads a synced hidden. Gaps longer than ``block_depth`` are subdivided
+    (counting back from each mandatory point) so no window exceeds D layers.
+    Needs ``layer_types``. Does NOT require D to evenly divide ``num_layers``.
+    For D >= the full-attention interval this collapses to one sync per
+    interval (you cannot align every full-attention layer with fewer syncs).
     """
+    if align_full_attention:
+        if layer_types is None:
+            raise ValueError("align_full_attention requires layer_types")
+        full = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+        # Mandatory syncs: before each full-attention layer (after f-1; skip
+        # f-1 < 0, i.e. a leading full-attention layer reads the already-synced
+        # embedding) and after the final layer (for the post-stack norm).
+        mandatory = sorted({f - 1 for f in full if f - 1 >= 0} | {num_layers - 1})
+        syncs = set(mandatory)
+        prev = -1
+        for b in mandatory:
+            x = b - block_depth
+            while x > prev:
+                syncs.add(x)
+                x -= block_depth
+            prev = b
+        return sorted(syncs)
+
     if num_layers % block_depth != 0:
         raise ValueError(
             f"sync_block_depth {block_depth} does not evenly divide num_layers {num_layers}; "
@@ -101,6 +140,7 @@ def slice_model_to_tracks(
     n_tracks: int,
     sync_block_depth: int,
     text_config_attr: str = "config.text_config",
+    align_full_attention: bool = False,
 ) -> tuple[list[dict[str, torch.Tensor]], PTManifest]:
     """Convert `model` into `n_tracks` per-track state_dicts plus a PTManifest.
 
@@ -111,6 +151,11 @@ def slice_model_to_tracks(
     `text_config_attr` says where to find the sub-config that has
     `num_attention_heads` / `num_key_value_heads` / etc. For Qwen3.5 this
     is `config.text_config`; for plain text models it can be `config`.
+
+    `align_full_attention` selects the full-attention-aligned sync schedule
+    (a sync immediately before every full-attention layer) instead of the
+    uniform every-D-layers schedule. The per-track weights are identical either
+    way — only `manifest.sync_layer_indices` differs.
     """
     # resolve nested attr
     obj: Any = model
@@ -134,7 +179,10 @@ def slice_model_to_tracks(
             f"but config produced unknown types {sorted(unknown)}"
         )
 
-    sync_indices = _resolve_sync_schedule(num_layers, sync_block_depth)
+    sync_indices = _resolve_sync_schedule(
+        num_layers, sync_block_depth,
+        layer_types=layer_types, align_full_attention=align_full_attention,
+    )
     manifest = PTManifest(
         model_type=model_type,
         n_tracks=n_tracks,
@@ -142,6 +190,7 @@ def slice_model_to_tracks(
         num_layers=num_layers,
         layer_types=layer_types,
         sync_layer_indices=sync_indices,
+        sync_schedule="full_attn_aligned" if align_full_attention else "uniform",
     )
 
     source_state = dict(model.state_dict())

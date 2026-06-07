@@ -104,7 +104,8 @@ pt_converter/
 | `--hf-model` | required | Path or HF id of the dense source model. |
 | `--out-dir` | required | Output dir for per-track safetensors + manifest. |
 | `--n-tracks` | `max_tracks_for_config(...)` | Number of tracks (defaults to the max valid N for the model). |
-| `--sync-block-depth` | `4` | Sync every D layers. |
+| `--sync-block-depth` | `4` | Sync every D layers (the cadence / communication budget). |
+| `--sync-schedule` | `full-attn-aligned` | Where sync boundaries fall. `full-attn-aligned` (default): a sync immediately **before every full-attention layer** so it reads a synced (exactly decomposable) residual, plus a final sync before the norm (`D=4` → 2,6,…,30,31). Full attention is the global mixer — feeding it the partial residual the `uniform` schedule leaves it with breaks the per-track decomposition, so aligning is the high-leverage fix at `D≥2` (it drove `val_kl` ~1.4 → 0.77 on n16/d2). `uniform` (legacy): every D layers (`D=4` → after 3,7,…,31). Per-track **weights are identical** either way (only `sync_layer_indices` differ), so a manifest trains/evaluates against existing track shards regardless of schedule. For `D ≥ full_attention_interval` the aligned schedule collapses to one sync per interval. |
 | `--device` | `cpu` | Device for slicing. |
 | `--dtype` | `bfloat16` | One of `bfloat16` / `float16` / `float32`. |
 
@@ -114,6 +115,13 @@ python scripts/convert_qwen3_5_9b.py \
     --out-dir convert_out/qwen3_5_9b_n16_d4 \
     --n-tracks 16 --sync-block-depth 4
 ```
+
+This defaults to `--sync-schedule full-attn-aligned` — a sync right *before* every
+full-attention layer so the global mixers read a synced (exactly decomposable)
+residual instead of the partial one the legacy `uniform` schedule leaves them with.
+Pass `--sync-schedule uniform` for the every-D-layers schedule. Per-track weights are
+identical either way (only the manifest's `sync_layer_indices` change), so a manifest
+trains/evaluates against existing track shards regardless of schedule.
 
 ## Train
 
@@ -186,16 +194,22 @@ inference the deep blocks compound error — the symptom is a block_mse that is 
 training but explodes with depth in `eval_fidelity.py`, and chance-level downstream scores.
 Enable **scheduled sampling** (`--student-forcing-prob`, so blocks also train on the
 student's own drifted input), **normalized block MSE** (`--normalize-block-mse`, so deep
-high-norm layers don't dominate the gradient), and an **LR schedule** (`--warmup-steps` +
-`--cosine-decay`, vs the spiky constant-LR default):
+high-norm layers don't dominate the gradient), **intra-window per-layer MSE**
+(`--intra-window-mse`, so the mid-window layers — which run on partial residuals at `D≥2` —
+are pinned to the teacher trajectory), and an **LR schedule** (`--warmup-steps` +
+`--cosine-decay`, vs the spiky constant-LR default). At `D≥2` also convert with
+`--sync-schedule full-attn-aligned` (above): the two address different gaps — the aligned
+schedule makes each full-attention layer's per-track split *structurally* exact, while
+student-forcing closes the free-running exposure-bias gap:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
-    --out-dir train_out/qwen3_5_9b_n16_d4 \
+    --tracks-dir convert_out/qwen3_5_9b_n16_d2 \
+    --out-dir train_out/qwen3_5_9b_n16_d2 \
     --max-steps 4000 --seq-len 4096 --batch-size 5 --activation-checkpoint \
+    --intra-window-mse \
     --student-forcing-prob 0.5 --student-forcing-warmup 2000 \
     --normalize-block-mse --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
     --eval-every 200 --save-every 1000
