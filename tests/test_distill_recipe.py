@@ -24,7 +24,12 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.slicer.convert import slice_model_to_tracks
-from pt_converter.train.distill import DistillConfig, _combine_seed, distill_step
+from pt_converter.train.distill import (
+    DistillConfig,
+    _combine_seed,
+    _depth_weights,
+    distill_step,
+)
 from pt_converter.train.losses import block_mse
 from pt_converter.train.teacher import HookedTeacher
 
@@ -257,3 +262,68 @@ def test_intra_window_mse_equals_boundary_at_d1():
     )
     for key in ("total", "block_mse", "kl", "ce"):
         assert torch.allclose(out_a[key], out_b[key], atol=1e-5), key
+
+
+# ----- depth-weighted block-MSE -----
+
+def test_depth_weights_mean_one_and_monotone():
+    """γ>0 gives a strictly increasing, mean-1 weight ramp; γ=0 (and L=1) is all-ones."""
+    L = 8
+    w = _depth_weights(L, gamma=3.0)
+    assert len(w) == L
+    assert abs(sum(w) / L - 1.0) < 1e-9              # mean exactly 1 (preserves magnitude)
+    assert all(w[i] < w[i + 1] for i in range(L - 1))  # deeper layers weigh more
+    assert w[0] < 1.0 < w[-1]                         # shallow down-weighted, deep up-weighted
+    # γ=0 ⇒ uniform; single-layer ⇒ uniform regardless of γ.
+    assert _depth_weights(L, gamma=0.0) == [1.0] * L
+    assert _depth_weights(1, gamma=5.0) == [1.0]
+
+
+def test_block_depth_weight_zero_matches_unweighted():
+    """block_depth_weight=0.0 must reproduce the unweighted path bit-for-bit, on
+    both the boundary-only and intra-window supervision paths."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    for intra in (False, True):
+        s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=intra)
+        base = DistillConfig(
+            sync_layer_indices=tuple(man.sync_layer_indices),
+            normalize_block_mse=True, intra_window_mse=intra,
+        )
+        out_a = distill_step(s_a, t_a, batch, base, student_forcing_prob=0.0, forcing_seed=(42, 0))
+
+        s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=intra)
+        weighted_zero = DistillConfig(
+            sync_layer_indices=tuple(man.sync_layer_indices),
+            normalize_block_mse=True, intra_window_mse=intra, block_depth_weight=0.0,
+        )
+        out_b = distill_step(s_b, t_b, batch, weighted_zero, student_forcing_prob=0.0, forcing_seed=(42, 0))
+        for key in ("total", "block_mse", "kl", "ce"):
+            assert torch.allclose(out_a[key], out_b[key], atol=1e-6), (intra, key)
+
+
+def test_block_depth_weight_changes_block_loss_and_grads():
+    """γ>0 actually re-weights: the block_mse term differs from the unweighted run,
+    and gradients still flow (the run stays finite)."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+
+    s0, t0, man = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=True)
+    out0 = distill_step(
+        s0, t0, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      normalize_block_mse=True, intra_window_mse=True, block_depth_weight=0.0),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+
+    sg, tg, _ = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=True)
+    sg.zero_grad(set_to_none=True)
+    outg = distill_step(
+        sg, tg, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      normalize_block_mse=True, intra_window_mse=True, block_depth_weight=4.0),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+    assert torch.isfinite(outg["block_mse"]).all()
+    assert not torch.allclose(out0["block_mse"], outg["block_mse"])
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in sg.parameters())

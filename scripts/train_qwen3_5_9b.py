@@ -261,6 +261,16 @@ def main() -> int:
                         "residuals. Hooks the teacher at every layer (more captures). Per-window "
                         "loss is averaged over its layers, so --lambda-block keeps its meaning and "
                         "D=1 is bit-identical to the boundary-only path. Off by default.")
+    p.add_argument("--block-depth-weight", type=float, default=0.0,
+                   help="Depth-weight the per-block / per-layer block-MSE by a monotone linear "
+                        "ramp (gamma), mean-1 normalized over all layers. With --normalize-block-mse "
+                        "every layer's MSE is already O(1), so shallow and deep layers claim EQUAL "
+                        "gradient budget even though the deep layers carry all the free-running "
+                        "drift (the depth-exploding eval block_mse); gamma>0 tilts that budget "
+                        "toward the deep layers WITHOUT changing the total block-loss magnitude "
+                        "(lambda_block keeps its meaning). Try 2-5. 0.0 (default) = uniform weights, "
+                        "bit-identical to the unweighted path. Pure loss-side: no change to the sync "
+                        "schedule / communication.")
     p.add_argument("--kl-ce-chunk-size", type=int, default=512,
                    help="Seq-chunk size for the KL+CE pass; caps the per-chunk fp32 "
                         "(B, chunk, V/world) expansion. Each chunk runs 3 small all-reduces "
@@ -589,6 +599,7 @@ def main() -> int:
         normalize_block_mse=args.normalize_block_mse,
         block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
         intra_window_mse=args.intra_window_mse,
+        block_depth_weight=args.block_depth_weight,
     )
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)

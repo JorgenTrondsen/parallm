@@ -154,6 +154,7 @@ trains/evaluates against existing track shards regardless of schedule.
 | `--student-forcing-prob` / `--student-forcing-warmup` | `0.0` / `0` | Scheduled sampling: per block, with this probability feed the block the **student's own** synced hidden (instead of the teacher's) as input, while the MSE target stays the teacher hidden. Closes the exposure-bias gap between teacher-forced training and free-running inference (the cause of the depth-exploding block_mse / chance-level downstream). `--student-forcing-warmup` ramps the prob `0 → prob` over N steps (start teacher-forced). Recommended `0.5` / ~half of `--max-steps`. The per-block draw is deterministic across ranks (seeded by `--seed` + step), so the SyncBoundary all-reduce stays consistent. `0.0` = legacy fully-teacher-forced path. |
 | `--normalize-block-mse` | off | Relative (scale-free) block MSE `Σ(s−t)²/Σt²` per block instead of the raw masked mean. The residual-stream norm grows with depth, so the raw MSE lets deep layers dominate the gradient (and spike the grad norm); normalizing makes every depth contribute comparably. Rescales the block term, so `--lambda-block` becomes a relative weight (1.0 is a fine start). |
 | `--block-mse-clamp` | `10.0` | Cap the normalized per-block relative MSE (only active with `--normalize-block-mse`). Under student forcing a block can be fed the student's own drifted hidden, occasionally blowing the ratio up to 100+ on a single batch — a spike that inflates the gradient and trips the `--max-grad-norm` clip, throttling the whole step. Clamping saturates the gradient above the cap (outlier rejection); normal per-block ratios (~0.5–1.5) are untouched. `<=0` disables it. |
+| `--block-depth-weight` | `0.0` | Depth-weight the per-block / per-layer block MSE by a monotone linear ramp `γ`, mean-1 normalized over all layers. With `--normalize-block-mse` every layer's MSE is already `O(1)`, so shallow and deep layers claim **equal** gradient budget even though the deep layers carry all the free-running drift (the depth-exploding `eval_fidelity` block_mse). `γ>0` tilts that budget toward the deep layers **without** changing the total block-loss magnitude (so `--lambda-block` keeps its meaning); try `2`–`5`. `0.0` (default) = uniform weights, bit-identical to the unweighted path. Pure loss-side — no change to the sync schedule / communication budget. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
 | `--eval-every` / `--val-batches` | `0` / `20` | Held-out KL(teacher ‖ student) eval cadence and size; val_ce also logged. |
 | `--early-stop-patience` / `--min-improvement` | `0` / `0.01` | Optional early stopping. |
@@ -200,7 +201,11 @@ are pinned to the teacher trajectory), and an **LR schedule** (`--warmup-steps` 
 `--cosine-decay`, vs the spiky constant-LR default). At `D≥2` also convert with
 `--sync-schedule full-attn-aligned` (above): the two address different gaps — the aligned
 schedule makes each full-attention layer's per-track split *structurally* exact, while
-student-forcing closes the free-running exposure-bias gap:
+student-forcing closes the free-running exposure-bias gap. If the deep layers still
+lag (the `eval_fidelity` block_mse keeps exploding with depth) and you want to hold
+the communication budget fixed, add `--block-depth-weight` (e.g. `3`): a loss-only
+lever that shifts gradient budget from the near-perfect shallow layers onto the
+drift-prone deep ones, no schedule/comm change:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -209,7 +214,7 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --tracks-dir convert_out/qwen3_5_9b_n16_d2 \
     --out-dir train_out/qwen3_5_9b_n16_d2 \
     --max-steps 4000 --seq-len 4096 --batch-size 5 --activation-checkpoint \
-    --intra-window-mse \
+    --intra-window-mse --block-depth-weight 3.0 \
     --student-forcing-prob 0.5 --student-forcing-warmup 2000 \
     --normalize-block-mse --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
     --eval-every 200 --save-every 1000

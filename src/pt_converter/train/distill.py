@@ -405,6 +405,14 @@ class DistillConfig:
     # D=1 (one layer per window) it is bit-identical to the legacy boundary MSE.
     # Requires the teacher to be hooked at every layer (see scripts/train_*.py).
     intra_window_mse: bool = False
+    # Depth-weight the per-block / per-layer MSE by a monotone linear ramp (γ),
+    # normalized to mean 1 over all layers (see _depth_weights). With
+    # normalize_block_mse each layer's MSE is already O(1), so shallow and deep
+    # layers claim EQUAL gradient budget even though the deep layers carry all the
+    # free-running drift; γ>0 tilts that budget toward the deep layers without
+    # changing the total block-loss magnitude (so lambda_block keeps its meaning).
+    # 0.0 (default) ⇒ all weights 1 ⇒ bit-identical to the unweighted path.
+    block_depth_weight: float = 0.0
     # Seq-chunk size for the KL+CE pass. The (B, T, V) fp32 softmax expansions
     # would OOM at training seq_len; chunking caps the per-chunk transient at
     # (chunk_size/T)x. Under vocab-parallel the expansion is per-rank only
@@ -431,6 +439,22 @@ def _combine_seed(forcing_seed: object) -> object:
             combined = combined * 1_000_003 + int(v)
         return combined
     return forcing_seed
+
+
+def _depth_weights(num_layers: int, gamma: float) -> list[float]:
+    """Per-layer block-MSE weights: a monotone linear depth ramp, mean-normalized.
+
+    ``w_raw(l) = 1 + gamma * l/(L-1)`` rescaled so ``mean_l w(l) == 1``. The
+    mean-1 normalization keeps the total block-loss magnitude (and the meaning of
+    ``lambda_block``) unchanged while shifting gradient budget toward the deep,
+    drift-prone layers. ``gamma == 0`` (or a single layer) returns all-ones, so
+    the weighting is a bit-identical no-op for the legacy path.
+    """
+    if gamma == 0.0 or num_layers <= 1:
+        return [1.0] * num_layers
+    raw = [1.0 + gamma * (l / (num_layers - 1)) for l in range(num_layers)]
+    mean = sum(raw) / num_layers
+    return [w / mean for w in raw]
 
 
 def _block_ranges(num_layers: int, sync_indices: tuple[int, ...]) -> list[tuple[int, int]]:
@@ -558,6 +582,10 @@ def distill_step(
     # across iterations; the next block's forward starts fresh from a
     # detached teacher hidden state.
     ranges = _block_ranges(len(tm0.layers), cfg.sync_layer_indices)
+    # Per-layer depth weights (mean-1 normalized; all-ones when block_depth_weight
+    # is 0). Indexed by layer depth so deeper supervised layers/boundaries claim a
+    # larger share of the block-MSE gradient.
+    depth_w = _depth_weights(len(tm0.layers), cfg.block_depth_weight)
     block_loss_val = torch.zeros((), device=input_ids.device)
     # Block 0 reads the synced student embedding (detached); subsequent blocks
     # read the teacher's post-block hidden state at the previous sync index.
@@ -597,7 +625,7 @@ def distill_step(
                     t_l = teacher_hiddens.pop(layer_idx).detach()
                     if layer_idx == end:
                         t_end = t_l  # boundary target, reused for teacher forcing
-                    win_loss = win_loss + block_mse(
+                    win_loss = win_loss + depth_w[layer_idx] * block_mse(
                         h_synced, t_l, attention_mask=attention_mask,
                         normalize=cfg.normalize_block_mse,
                         clamp_max=cfg.block_mse_clamp,
@@ -623,7 +651,7 @@ def distill_step(
                 # The teacher hidden is always the MSE target (detached: no grad
                 # flows back into the teacher).
                 t_end = teacher_hiddens.pop(end).detach()
-                block_loss_b = block_mse(
+                block_loss_b = depth_w[end] * block_mse(
                     h_synced, t_end, attention_mask=attention_mask,
                     normalize=cfg.normalize_block_mse,
                     clamp_max=cfg.block_mse_clamp,
