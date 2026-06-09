@@ -170,10 +170,21 @@ def fidelity_step(
 
     if student_logits is not None:
         for layer_idx in sync_layer_indices:
+            # Raw masked-mean MSE (absolute) AND the scale-free relative ratio
+            # Σ(s−t)²/Σt². The residual-stream norm grows with depth, so the raw
+            # value inflates with depth even at a constant relative error; the
+            # normalized ratio divides that norm out, so the two together separate
+            # "deep layers are genuinely worse" from "deep layers are just bigger".
             metrics[f"block_mse_l{layer_idx}"] = block_mse(
                 student_sync_hiddens[layer_idx],
                 teacher_hiddens[layer_idx],
                 attention_mask=attention_mask,
+            ).detach().float()
+            metrics[f"block_relmse_l{layer_idx}"] = block_mse(
+                student_sync_hiddens[layer_idx],
+                teacher_hiddens[layer_idx],
+                attention_mask=attention_mask,
+                normalize=True,
             ).detach().float()
         metrics.update(
             _fidelity_logit_metrics(
@@ -184,6 +195,7 @@ def fidelity_step(
         zero = torch.zeros((), device=device, dtype=torch.float32)
         for layer_idx in sync_layer_indices:
             metrics[f"block_mse_l{layer_idx}"] = zero.clone()
+            metrics[f"block_relmse_l{layer_idx}"] = zero.clone()
         for name in _LOGIT_METRIC_NAMES:
             metrics[name] = zero.clone()
 

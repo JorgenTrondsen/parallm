@@ -20,6 +20,7 @@ same minibatch; gradients accumulate before `optimizer.step()`.
 """
 from __future__ import annotations
 
+import math
 import random
 import time
 from contextlib import contextmanager
@@ -88,9 +89,14 @@ def _kl_ce_chunked(
     lambda_ce: float,
     kl_temperature: float,
     chunk_size: int,
+    loss_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute lambda_kl * KL + lambda_ce * CE in seq-chunks; one backward
     into the student forward graph at the end.
+
+    ``loss_scale`` (gradient-accumulation: 1/grad_accum_steps) multiplies the
+    accumulated gradients only — the returned KL/CE scalars stay UNSCALED so
+    logging reports the true loss.
 
     Two memory pressures motivate this design:
 
@@ -181,9 +187,9 @@ def _kl_ce_chunked(
         grads = torch.autograd.grad(
             chunk_loss, [h_anchor, *lm_head_params], retain_graph=False
         )
-        grad_h_accum.add_(grads[0])
+        grad_h_accum.add_(grads[0] * loss_scale)
         for p, g in zip(lm_head_params, grads[1:]):
-            p.grad.add_(g)
+            p.grad.add_(g * loss_scale)
         kl_acc = kl_acc + kl_chunk.detach()
         ce_acc = ce_acc + ce_chunk.detach()
 
@@ -303,6 +309,7 @@ def _kl_ce_vocab_parallel(
     group,
     world_size: int,
     compute_grads: bool = True,
+    loss_scale: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Vocab-parallel KL+CE: runs on EVERY rank, each owning vocab rows [v_lo, v_hi).
 
@@ -370,8 +377,8 @@ def _kl_ce_vocab_parallel(
         )
         if compute_grads:
             grads = torch.autograd.grad(loss, [h_src, W], retain_graph=False)
-            grad_h_accum.add_(grads[0])
-            W.grad.add_(grads[1])
+            grad_h_accum.add_(grads[0] * loss_scale)
+            W.grad.add_(grads[1] * loss_scale)
         kl_acc = kl_acc + kl_d
         ce_acc = ce_acc + ce_d
 
@@ -405,14 +412,6 @@ class DistillConfig:
     # D=1 (one layer per window) it is bit-identical to the legacy boundary MSE.
     # Requires the teacher to be hooked at every layer (see scripts/train_*.py).
     intra_window_mse: bool = False
-    # Depth-weight the per-block / per-layer MSE by a monotone linear ramp (γ),
-    # normalized to mean 1 over all layers (see _depth_weights). With
-    # normalize_block_mse each layer's MSE is already O(1), so shallow and deep
-    # layers claim EQUAL gradient budget even though the deep layers carry all the
-    # free-running drift; γ>0 tilts that budget toward the deep layers without
-    # changing the total block-loss magnitude (so lambda_block keeps its meaning).
-    # 0.0 (default) ⇒ all weights 1 ⇒ bit-identical to the unweighted path.
-    block_depth_weight: float = 0.0
     # Seq-chunk size for the KL+CE pass. The (B, T, V) fp32 softmax expansions
     # would OOM at training seq_len; chunking caps the per-chunk transient at
     # (chunk_size/T)x. Under vocab-parallel the expansion is per-rank only
@@ -441,20 +440,76 @@ def _combine_seed(forcing_seed: object) -> object:
     return forcing_seed
 
 
-def _depth_weights(num_layers: int, gamma: float) -> list[float]:
-    """Per-layer block-MSE weights: a monotone linear depth ramp, mean-normalized.
+def _effective_block_weights(
+    adaptive_weights: "dict[int, float] | None",
+    tap_indices: list[int],
+) -> dict[int, float]:
+    """Per-tap block-MSE weights from the optional adaptive (running-relMSE) map.
 
-    ``w_raw(l) = 1 + gamma * l/(L-1)`` rescaled so ``mean_l w(l) == 1``. The
-    mean-1 normalization keeps the total block-loss magnitude (and the meaning of
-    ``lambda_block``) unchanged while shifting gradient budget toward the deep,
-    drift-prone layers. ``gamma == 0`` (or a single layer) returns all-ones, so
-    the weighting is a bit-identical no-op for the legacy path.
+    ``adaptive_weights is None`` ⇒ all-ones (uniform; bit-identical to the
+    unweighted path). When given, each tap weight is ``adaptive_weights.get(l,
+    1.0)`` renormalized to **mean 1 over the supervised taps**, so the total
+    block-loss magnitude (and the meaning of ``lambda_block``) is preserved while
+    gradient budget shifts toward the taps with the largest running relative error.
     """
-    if gamma == 0.0 or num_layers <= 1:
-        return [1.0] * num_layers
-    raw = [1.0 + gamma * (l / (num_layers - 1)) for l in range(num_layers)]
-    mean = sum(raw) / num_layers
-    return [w / mean for w in raw]
+    if adaptive_weights is None:
+        return {l: 1.0 for l in tap_indices}
+    raw = {l: adaptive_weights.get(l, 1.0) for l in tap_indices}
+    mean = sum(raw.values()) / max(1, len(raw))
+    if mean <= 0:
+        return {l: 1.0 for l in tap_indices}
+    return {l: w / mean for l, w in raw.items()}
+
+
+def adaptive_weights_from_relmse(
+    relmse: "dict[int, float]", power: float = 1.0
+) -> dict[int, float]:
+    """Mean-1 per-tap weights from a running relative-MSE map.
+
+    ``weight(l) ∝ relmse[l] ** power``, normalized so the mean over taps is 1 (the
+    form ``_effective_block_weights`` consumes). ``power`` sharpens (>1) or softens
+    (<1) the tilt toward the worst-fitting layers. Empty input ⇒ empty output; an
+    all-zero map ⇒ uniform 1.0 (no information to tilt on yet).
+    """
+    if not relmse:
+        return {}
+    raw = {l: max(0.0, v) ** power for l, v in relmse.items()}
+    mean = sum(raw.values()) / len(raw)
+    if mean <= 0:
+        return {l: 1.0 for l in relmse}
+    return {l: w / mean for l, w in raw.items()}
+
+
+def student_forcing_schedule(
+    step: int,
+    prob: float,
+    warmup: int,
+    max_steps: int,
+    shape: str = "hold",
+) -> float:
+    """Per-step student-forcing probability under one of two schedule shapes.
+
+    ``shape="hold"`` (default): the legacy ramp — linear ``prob * min(1, step/warmup)``
+    that reaches ``prob`` at ``warmup`` and then HOLDS there for the rest of the run
+    (``warmup == 0`` ⇒ constant ``prob`` from step 0). Bit-identical to the old inline
+    computation.
+
+    ``shape="cosine-full"``: a free-running CURRICULUM — ``prob * 0.5*(1 - cos(pi *
+    step/max_steps))`` ramps 0 → ``prob`` across the WHOLE run with a cosine ease, so the
+    high-forcing regime (where deep blocks compound free-running drift) is approached
+    gently and only reached near the end. This closes the train(teacher-forced) /
+    eval(free-running) gap without the unstable long tail of holding at a high ``prob``.
+    ``warmup`` is ignored in this shape (the whole run is the ramp).
+    """
+    if shape == "cosine-full":
+        if max_steps <= 0:
+            return prob
+        frac = min(1.0, max(0.0, step / max_steps))
+        return prob * 0.5 * (1.0 - math.cos(math.pi * frac))
+    # "hold": legacy linear-ramp-then-hold.
+    if warmup > 0:
+        return prob * min(1.0, step / warmup)
+    return prob
 
 
 def _block_ranges(num_layers: int, sync_indices: tuple[int, ...]) -> list[tuple[int, int]]:
@@ -519,6 +574,9 @@ def distill_step(
     mem: dict[str, dict[str, float]] | None = None,
     student_forcing_prob: float = 0.0,
     forcing_seed: object = 0,
+    loss_scale: float = 1.0,
+    adaptive_weights: "dict[int, float] | None" = None,
+    track_layer_relmse: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Run one distillation step. Backward is done internally, per block.
 
@@ -538,6 +596,16 @@ def distill_step(
     all ranks run the same block on the same input and all-reduce in
     ``sync_module``; a per-rank-divergent choice would corrupt that sum.
     ``forcing_prob == 0`` reproduces the legacy fully-teacher-forced path bit-for-bit.
+
+    ``loss_scale`` (gradient accumulation: 1/grad_accum_steps) multiplies every
+    backward'd loss so the grads accumulated across microbatches average rather than
+    sum; the returned scalars stay UNSCALED for logging. ``adaptive_weights`` (per
+    supervised-tap layer index → weight) sets the per-layer block-MSE weight
+    (renormalized to mean 1; ``None`` ⇒ uniform, bit-identical to the unweighted
+    path). ``track_layer_relmse`` additionally returns a detached
+    per-tap relative MSE (``Σ(s−t)²/Σt²``) under ``losses["layer_relmse"]`` — the signal
+    the caller folds into the adaptive-weight EMA. The relMSE is computed from the
+    *synced* hidden (identical on every rank), so the EMA stays in lock-step.
 
     Returns a dict of *detached* scalar tensors for logging. The caller is
     responsible for ``sync_replicated_grads(plan)``, clip, and ``optim.step()``.
@@ -581,11 +649,19 @@ def distill_step(
     # immediately, drop the graph. Gradients accumulate on student params
     # across iterations; the next block's forward starts fresh from a
     # detached teacher hidden state.
-    ranges = _block_ranges(len(tm0.layers), cfg.sync_layer_indices)
-    # Per-layer depth weights (mean-1 normalized; all-ones when block_depth_weight
-    # is 0). Indexed by layer depth so deeper supervised layers/boundaries claim a
-    # larger share of the block-MSE gradient.
-    depth_w = _depth_weights(len(tm0.layers), cfg.block_depth_weight)
+    num_layers = len(tm0.layers)
+    ranges = _block_ranges(num_layers, cfg.sync_layer_indices)
+    # Supervised taps: every layer (intra-window) or just the sync boundaries.
+    # Per-tap block-MSE weight = optional adaptive (running-relMSE) weight, mean-1
+    # over the taps (adaptive None ⇒ uniform, bit-identical to the unweighted path).
+    if cfg.intra_window_mse:
+        tap_indices = [l for (s, e) in ranges for l in range(s, e + 1)]
+    else:
+        tap_indices = [e for (_, e) in ranges]
+    eff_w = _effective_block_weights(adaptive_weights, tap_indices)
+    # Detached per-tap relative MSE signal for the adaptive-weight EMA (only when
+    # requested; the loss values are unaffected either way — the signal is detached).
+    layer_relmse: dict[int, torch.Tensor] = {}
     block_loss_val = torch.zeros((), device=input_ids.device)
     # Block 0 reads the synced student embedding (detached); subsequent blocks
     # read the teacher's post-block hidden state at the previous sync index.
@@ -625,11 +701,15 @@ def distill_step(
                     t_l = teacher_hiddens.pop(layer_idx).detach()
                     if layer_idx == end:
                         t_end = t_l  # boundary target, reused for teacher forcing
-                    win_loss = win_loss + depth_w[layer_idx] * block_mse(
+                    win_loss = win_loss + eff_w[layer_idx] * block_mse(
                         h_synced, t_l, attention_mask=attention_mask,
                         normalize=cfg.normalize_block_mse,
                         clamp_max=cfg.block_mse_clamp,
                     )
+                    if track_layer_relmse:
+                        layer_relmse[layer_idx] = block_mse(
+                            h_synced, t_l, attention_mask=attention_mask, normalize=True,
+                        ).detach()
                     per_track_h = new_h
                 # Average over the window so the scale (and lambda_block) matches
                 # the boundary-only path; identical to it when the window is 1 layer.
@@ -651,18 +731,22 @@ def distill_step(
                 # The teacher hidden is always the MSE target (detached: no grad
                 # flows back into the teacher).
                 t_end = teacher_hiddens.pop(end).detach()
-                block_loss_b = depth_w[end] * block_mse(
+                block_loss_b = eff_w[end] * block_mse(
                     h_synced, t_end, attention_mask=attention_mask,
                     normalize=cfg.normalize_block_mse,
                     clamp_max=cfg.block_mse_clamp,
                 )
-            (cfg.lambda_block * block_loss_b).backward()
+                if track_layer_relmse:
+                    layer_relmse[end] = block_mse(
+                        h_synced, t_end, attention_mask=attention_mask, normalize=True,
+                    ).detach()
+            (cfg.lambda_block * block_loss_b * loss_scale).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
             # Next block's input: teacher hidden (teacher forcing) or the
-            # student's own synced output (student forcing, prob student_forcing_prob).
-            # Either way detach() keeps the per-block backward memory-bounded.
-            # Draw BEFORE branching so the RNG stream is consumed identically on
-            # every rank regardless of the outcome.
+            # student's own synced output (student forcing). Either way detach()
+            # keeps the per-block backward memory-bounded. The draw is seeded by
+            # forcing_seed so it is identical on every rank, keeping the cross-rank
+            # SyncBoundary choices in lock-step.
             use_student = forcing_rng.random() < student_forcing_prob
             prev_h = h_synced.detach() if use_student else t_end
 
@@ -689,6 +773,7 @@ def distill_step(
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
                 kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
                 group=student.vp_group, world_size=student.vp_world_size,
+                loss_scale=loss_scale,
             )
     elif student.lm_head is not None:
         # Legacy: only the track-0 owner has lm_head; peers run the forward for
@@ -698,6 +783,7 @@ def distill_step(
                 hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
                 kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
+                loss_scale=loss_scale,
             )
     else:
         kl_val = torch.zeros((), device=input_ids.device)
@@ -709,6 +795,9 @@ def distill_step(
         "block_mse": block_loss_val,
         "kl": kl_val,
         "ce": ce_val,
+        # Per-tap relative MSE (detached; empty unless track_layer_relmse). NOT a
+        # scalar loss — the caller reads it to update the adaptive-weight EMA.
+        "layer_relmse": layer_relmse,
     }
 
 

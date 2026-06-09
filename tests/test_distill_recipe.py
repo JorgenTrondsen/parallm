@@ -27,9 +27,12 @@ from pt_converter.slicer.convert import slice_model_to_tracks
 from pt_converter.train.distill import (
     DistillConfig,
     _combine_seed,
-    _depth_weights,
+    _effective_block_weights,
+    adaptive_weights_from_relmse,
     distill_step,
+    student_forcing_schedule,
 )
+from pt_converter.eval.fidelity import fidelity_step
 from pt_converter.train.losses import block_mse
 from pt_converter.train.teacher import HookedTeacher
 
@@ -264,66 +267,145 @@ def test_intra_window_mse_equals_boundary_at_d1():
         assert torch.allclose(out_a[key], out_b[key], atol=1e-5), key
 
 
-# ----- depth-weighted block-MSE -----
+# ----- fidelity normalized per-boundary report -----
 
-def test_depth_weights_mean_one_and_monotone():
-    """γ>0 gives a strictly increasing, mean-1 weight ramp; γ=0 (and L=1) is all-ones."""
-    L = 8
-    w = _depth_weights(L, gamma=3.0)
-    assert len(w) == L
-    assert abs(sum(w) / L - 1.0) < 1e-9              # mean exactly 1 (preserves magnitude)
-    assert all(w[i] < w[i + 1] for i in range(L - 1))  # deeper layers weigh more
-    assert w[0] < 1.0 < w[-1]                         # shallow down-weighted, deep up-weighted
-    # γ=0 ⇒ uniform; single-layer ⇒ uniform regardless of γ.
-    assert _depth_weights(L, gamma=0.0) == [1.0] * L
-    assert _depth_weights(1, gamma=5.0) == [1.0]
+def test_fidelity_emits_raw_and_relative_block_mse():
+    """fidelity_step emits both block_mse_l{i} (raw) and block_relmse_l{i}
+    (normalized), and the relative one equals block_mse(normalize=True)."""
+    cfg = _tiny_config()
+    student, teacher, man = _build_teacher_student(cfg, sync_block_depth=4)
+    m = fidelity_step(student, teacher, _batch(cfg), tuple(man.sync_layer_indices), chunk_size=8)
+    for idx in man.sync_layer_indices:
+        assert f"block_mse_l{idx}" in m
+        assert f"block_relmse_l{idx}" in m
+        # relative ≥ 0 and finite; raw and relative are distinct scale-free vs absolute.
+        assert torch.isfinite(m[f"block_relmse_l{idx}"]).all()
+        assert m[f"block_relmse_l{idx}"].item() >= 0.0
 
 
-def test_block_depth_weight_zero_matches_unweighted():
-    """block_depth_weight=0.0 must reproduce the unweighted path bit-for-bit, on
-    both the boundary-only and intra-window supervision paths."""
+# ----- A: free-running student-forcing curriculum schedule -----
+
+def test_student_forcing_schedule_hold_matches_legacy():
+    """'hold' reproduces the legacy ``prob * min(1, step/warmup)`` ramp-then-hold."""
+    prob, warmup, max_steps = 0.5, 100, 1000
+    for step in (0, 50, 100, 200, 999):
+        legacy = prob * min(1.0, step / warmup)
+        assert student_forcing_schedule(step, prob, warmup, max_steps, "hold") == legacy
+    # warmup=0 ⇒ constant prob from step 0 (the no-warmup branch).
+    assert student_forcing_schedule(0, prob, 0, max_steps, "hold") == prob
+    assert student_forcing_schedule(500, prob, 0, max_steps, "hold") == prob
+
+
+def test_student_forcing_schedule_cosine_full_curriculum():
+    """'cosine-full' ramps 0→prob across the whole run, monotone, warmup ignored."""
+    prob, warmup, max_steps = 0.9, 100, 1000
+    assert student_forcing_schedule(0, prob, warmup, max_steps, "cosine-full") == 0.0
+    end = student_forcing_schedule(max_steps, prob, warmup, max_steps, "cosine-full")
+    assert abs(end - prob) < 1e-9                       # reaches prob only at the end
+    vals = [student_forcing_schedule(s, prob, warmup, max_steps, "cosine-full")
+            for s in range(0, max_steps + 1, 100)]
+    assert all(vals[i] < vals[i + 1] for i in range(len(vals) - 1))  # strictly increasing
+    assert all(0.0 <= v <= prob + 1e-9 for v in vals)
+    # warmup is ignored in this shape: same value regardless of warmup arg.
+    assert (student_forcing_schedule(400, prob, 100, max_steps, "cosine-full")
+            == student_forcing_schedule(400, prob, 999, max_steps, "cosine-full"))
+
+
+# ----- B: gradient-accumulation loss_scale -----
+
+def test_loss_scale_halves_grads_not_losses():
+    """loss_scale=0.5 scales every accumulated grad by 0.5 while leaving the returned
+    (unscaled) loss scalars unchanged — the gradient-accumulation contract."""
     cfg = _tiny_config()
     batch = _batch(cfg)
-    for intra in (False, True):
-        s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=intra)
-        base = DistillConfig(
-            sync_layer_indices=tuple(man.sync_layer_indices),
-            normalize_block_mse=True, intra_window_mse=intra,
-        )
-        out_a = distill_step(s_a, t_a, batch, base, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    kw = dict(student_forcing_prob=0.0, forcing_seed=(42, 0))
 
-        s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=intra)
-        weighted_zero = DistillConfig(
-            sync_layer_indices=tuple(man.sync_layer_indices),
-            normalize_block_mse=True, intra_window_mse=intra, block_depth_weight=0.0,
-        )
-        out_b = distill_step(s_b, t_b, batch, weighted_zero, student_forcing_prob=0.0, forcing_seed=(42, 0))
-        for key in ("total", "block_mse", "kl", "ce"):
-            assert torch.allclose(out_a[key], out_b[key], atol=1e-6), (intra, key)
+    s_full, t_full, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices), normalize_block_mse=True)
+    s_full.zero_grad(set_to_none=True)
+    out_full = distill_step(s_full, t_full, batch, dcfg, loss_scale=1.0, **kw)
+    grads_full = {n: p.grad.detach().clone() for n, p in s_full.named_parameters() if p.grad is not None}
+
+    s_half, t_half, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    s_half.zero_grad(set_to_none=True)
+    out_half = distill_step(s_half, t_half, batch, dcfg, loss_scale=0.5, **kw)
+    grads_half = {n: p.grad.detach().clone() for n, p in s_half.named_parameters() if p.grad is not None}
+
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.allclose(out_full[key], out_half[key], atol=1e-5), key
+    assert grads_full and grads_full.keys() == grads_half.keys()
+    for n in grads_full:
+        assert torch.allclose(grads_half[n], 0.5 * grads_full[n], atol=1e-6, rtol=1e-4), n
 
 
-def test_block_depth_weight_changes_block_loss_and_grads():
-    """γ>0 actually re-weights: the block_mse term differs from the unweighted run,
-    and gradients still flow (the run stays finite)."""
+# ----- C: adaptive error-proportional layer weighting -----
+
+def test_adaptive_weights_from_relmse_mean_one():
+    """Weights ∝ relMSE**power, mean-1 normalized; worse layers weigh more; edges handled."""
+    w = adaptive_weights_from_relmse({3: 2.0, 7: 6.0}, power=1.0)
+    assert abs(sum(w.values()) / len(w) - 1.0) < 1e-9
+    assert w[7] > w[3]                                   # higher relMSE ⇒ more weight
+    w2 = adaptive_weights_from_relmse({3: 2.0, 7: 6.0}, power=2.0)
+    assert w2[7] / w2[3] > w[7] / w[3]                   # power sharpens the tilt
+    assert adaptive_weights_from_relmse({}) == {}
+    assert adaptive_weights_from_relmse({3: 0.0, 7: 0.0}) == {3: 1.0, 7: 1.0}
+
+
+def test_effective_block_weights_none_is_uniform():
+    """adaptive None ⇒ all-ones (uniform); adaptive given ⇒ mean-1 over the taps."""
+    taps = [3, 7]
+    assert _effective_block_weights(None, taps) == {3: 1.0, 7: 1.0}
+    adapt = _effective_block_weights({3: 1.0, 7: 3.0}, taps)
+    assert abs((adapt[3] + adapt[7]) / 2 - 1.0) < 1e-9
+    assert adapt[7] > adapt[3]
+
+
+def test_distill_step_adaptive_none_matches_default():
+    """adaptive_weights=None with track_layer_relmse on is bit-identical to the plain
+    call — the relMSE signal is detached and must not perturb the loss or grads."""
     cfg = _tiny_config()
     batch = _batch(cfg)
+    base = lambda man: DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                                     normalize_block_mse=True)
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    out_a = distill_step(s_a, t_a, batch, base(man), student_forcing_prob=0.0, forcing_seed=(42, 0))
 
-    s0, t0, man = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=True)
-    out0 = distill_step(
-        s0, t0, batch,
-        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
-                      normalize_block_mse=True, intra_window_mse=True, block_depth_weight=0.0),
-        student_forcing_prob=0.0, forcing_seed=(42, 0),
-    )
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    out_b = distill_step(s_b, t_b, batch, base(man), student_forcing_prob=0.0, forcing_seed=(42, 0),
+                         adaptive_weights=None, track_layer_relmse=True)
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.allclose(out_a[key], out_b[key], atol=1e-6), key
 
-    sg, tg, _ = _build_teacher_student(cfg, sync_block_depth=4, teacher_hook_all=True)
-    sg.zero_grad(set_to_none=True)
-    outg = distill_step(
-        sg, tg, batch,
-        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
-                      normalize_block_mse=True, intra_window_mse=True, block_depth_weight=4.0),
-        student_forcing_prob=0.0, forcing_seed=(42, 0),
+
+def test_distill_step_returns_layer_relmse():
+    """track_layer_relmse=True returns a finite, ≥0 relMSE per supervised tap."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    out = distill_step(
+        s, t, _batch(cfg),
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices)),
+        student_forcing_prob=0.0, forcing_seed=(42, 0), track_layer_relmse=True,
     )
-    assert torch.isfinite(outg["block_mse"]).all()
-    assert not torch.allclose(out0["block_mse"], outg["block_mse"])
-    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in sg.parameters())
+    rel = out["layer_relmse"]
+    assert set(rel.keys()) == set(man.sync_layer_indices)   # boundary taps
+    for v in rel.values():
+        assert torch.isfinite(v).all() and v.item() >= 0.0
+
+
+def test_distill_step_adaptive_weights_change_block_loss_and_grads():
+    """Non-uniform adaptive_weights re-weight the block term vs the depth-only path,
+    and gradients still flow finitely."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    base = lambda man: DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                                     normalize_block_mse=True)
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    out_a = distill_step(s_a, t_a, batch, base(man), student_forcing_prob=0.0, forcing_seed=(42, 0))
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    s_b.zero_grad(set_to_none=True)
+    out_b = distill_step(s_b, t_b, batch, base(man), student_forcing_prob=0.0, forcing_seed=(42, 0),
+                         adaptive_weights={3: 0.2, 7: 1.8})   # taps [3, 7]; tilt to the deep one
+    assert not torch.allclose(out_a["block_mse"], out_b["block_mse"])
+    assert torch.isfinite(out_b["total"]).all()
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in s_b.parameters())

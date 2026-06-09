@@ -136,8 +136,9 @@ trains/evaluates against existing track shards regardless of schedule.
 | `--vocab-parallel` / `--no-vocab-parallel` | on | Vocab/tensor-parallel `embed_tokens` + `lm_head` + KL/CE across all ranks (balanced memory, parallel KL/CE, uniform layout). `--no-vocab-parallel` selects the legacy track-0-owner path (memory-heavy at `n_tracks=16` on 40 GB). |
 | `--sync-attention-heads` / `--no-sync-attention-heads` | off | Keep the full-attention head params (`k_proj`, `v_proj`, `q_norm`, `k_norm`) bit-identical within each kv-group (legacy dense-GQA-equivalent path). Default **off**: those copies **diverge** per track (each track gets its own KV head — GQA → per-track MHA), a capacity superset that is free on memory and drops the per-step kv-group all-reduces. Residual-stream norms stay synced regardless. |
 | `--compile-teacher` / `--no-compile-teacher` | on | `torch.compile` each frozen-teacher decoder layer (inference-only); disable alone if it conflicts with FSDP2 / the sync-boundary hooks. |
-| `--max-steps` | `1000` | Training steps. |
+| `--max-steps` | `1000` | Training steps (counts **optimizer** steps; with `--grad-accum-steps>1` each consumes that many microbatches). |
 | `--seq-len` / `--batch-size` | `4096` / `1` | Sequence length and per-rank batch. |
+| `--grad-accum-steps` | `1` | Accumulate gradients over this many microbatches before each optimizer step (effective batch = `--batch-size` × this × world). Each microbatch's losses are scaled `1/grad-accum` so the grads **average**, giving a less noisy small-batch block-MSE/KL signal at fixed memory. `--max-steps` / `--eval-every` / the LR schedule all count optimizer steps. `1` = no accumulation (bit-identical to the legacy single-microbatch loop). |
 | `--data-preset` | `qwen-mix` | Streamed training mixture. **`qwen-mix`** = `DKYoon/SlimPajama-6B` (0.70) + `open-web-math` (0.15) + `bigcode/the-stack-dedup` (0.15, `content` key), interleaved to approximate Qwen3.5's code/math-heavy distribution. **`the-stack-dedup` is gated** — accept its terms and export `HF_TOKEN`, or use the ungated `slimpajama` / `wikitext` presets. Sources stream, so corpus size is irrelevant (only consumed tokens are fetched); point `HF_HOME` at scratch to save quota. |
 | `--data-source` | `None` | Add a custom training source, `NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]]`, repeatable. Empty `CONFIG`/`TEXT_KEY` fields keep defaults (e.g. `DKYoon/SlimPajama-6B::text:0.7`). If **any** `--data-source` is passed it **replaces** `--data-preset`. Sources are normalized to a common `text` column and seed-interleaved by weight. |
 | `--val-dataset-name` / `--val-dataset-config` / `--val-split` / `--val-text-key` | `Salesforce/wikitext` / `wikitext-103-raw-v1` / `validation` / `text` | Held-out validation source (single dataset) for the KL eval. Defaults to **WikiText-103 validation on purpose**: a *fixed* comparator keeps `val_kl`/`val_ce` comparable across runs (and to history) for early-stop / `best/` selection, independent of the training mixture. |
@@ -152,9 +153,10 @@ trains/evaluates against existing track shards regardless of schedule.
 | `--lambda-block` / `--lambda-kl` / `--lambda-ce` | `1.0` / `1.0` / `0.5` | Loss weights. |
 | `--kl-temperature` | `1.0` | KL temperature. |
 | `--student-forcing-prob` / `--student-forcing-warmup` | `0.0` / `0` | Scheduled sampling: per block, with this probability feed the block the **student's own** synced hidden (instead of the teacher's) as input, while the MSE target stays the teacher hidden. Closes the exposure-bias gap between teacher-forced training and free-running inference (the cause of the depth-exploding block_mse / chance-level downstream). `--student-forcing-warmup` ramps the prob `0 → prob` over N steps (start teacher-forced). Recommended `0.5` / ~half of `--max-steps`. The per-block draw is deterministic across ranks (seeded by `--seed` + step), so the SyncBoundary all-reduce stays consistent. `0.0` = legacy fully-teacher-forced path. |
+| `--student-forcing-schedule` | `hold` | Shape of the student-forcing prob over the run. `hold` (default, legacy): linear ramp `0 → --student-forcing-prob` over `--student-forcing-warmup` then **hold**. `cosine-full`: a free-running **curriculum** — cosine ramp `0 → --student-forcing-prob` across the **whole** run, approaching the high-forcing regime gently and reaching it only near the end. Directly closes the train(teacher-forced)/eval(free-running) gap that drives the depth-exploding block_mse, without the unstable long tail of holding at a high prob. Recommended with `--student-forcing-prob ~0.9` (`--student-forcing-warmup` is ignored in this shape). |
 | `--normalize-block-mse` | off | Relative (scale-free) block MSE `Σ(s−t)²/Σt²` per block instead of the raw masked mean. The residual-stream norm grows with depth, so the raw MSE lets deep layers dominate the gradient (and spike the grad norm); normalizing makes every depth contribute comparably. Rescales the block term, so `--lambda-block` becomes a relative weight (1.0 is a fine start). |
 | `--block-mse-clamp` | `10.0` | Cap the normalized per-block relative MSE (only active with `--normalize-block-mse`). Under student forcing a block can be fed the student's own drifted hidden, occasionally blowing the ratio up to 100+ on a single batch — a spike that inflates the gradient and trips the `--max-grad-norm` clip, throttling the whole step. Clamping saturates the gradient above the cap (outlier rejection); normal per-block ratios (~0.5–1.5) are untouched. `<=0` disables it. |
-| `--block-depth-weight` | `0.0` | Depth-weight the per-block / per-layer block MSE by a monotone linear ramp `γ`, mean-1 normalized over all layers. With `--normalize-block-mse` every layer's MSE is already `O(1)`, so shallow and deep layers claim **equal** gradient budget even though the deep layers carry all the free-running drift (the depth-exploding `eval_fidelity` block_mse). `γ>0` tilts that budget toward the deep layers **without** changing the total block-loss magnitude (so `--lambda-block` keeps its meaning); try `2`–`5`. `0.0` (default) = uniform weights, bit-identical to the unweighted path. Pure loss-side — no change to the sync schedule / communication budget. |
+| `--adaptive-layer-weight` (+ `--adaptive-layer-weight-ema` `0.9` / `--adaptive-layer-weight-power` `1.0`) | off | Adaptively weight each supervised tap's block-MSE by its **own** running relative error. A per-tap EMA of the relative MSE `Σ(s−t)²/Σt²` is kept; the per-step weight `∝ EMA**power`, mean-1 normalized over the taps, so gradient budget flows to wherever the student is **currently** worst (which the relative metric shows need not be monotone in depth — the worst band is the upper-middle layers, not the deepest) without changing the total block-loss magnitude (so `--lambda-block` keeps its meaning). The relMSE is read off the **synced** hidden (identical on every rank), so the EMA — and the weights — stay in lock-step across ranks. Off = uniform weights. Pure loss-side — no change to the sync schedule / communication budget. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
 | `--eval-every` / `--val-batches` | `0` / `20` | Held-out KL(teacher ‖ student) eval cadence and size; val_ce also logged. |
 | `--early-stop-patience` / `--min-improvement` | `0` / `0.01` | Optional early stopping. |
@@ -193,19 +195,28 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
 distillation trains each block only on the teacher's (correct) input, so at free-running
 inference the deep blocks compound error — the symptom is a block_mse that is small during
 training but explodes with depth in `eval_fidelity.py`, and chance-level downstream scores.
-Enable **scheduled sampling** (`--student-forcing-prob`, so blocks also train on the
-student's own drifted input), **normalized block MSE** (`--normalize-block-mse`, so deep
-high-norm layers don't dominate the gradient), **intra-window per-layer MSE**
-(`--intra-window-mse`, so the mid-window layers — which run on partial residuals at `D≥2` —
-are pinned to the teacher trajectory), and an **LR schedule** (`--warmup-steps` +
-`--cosine-decay`, vs the spiky constant-LR default). At `D≥2` also convert with
-`--sync-schedule full-attn-aligned` (above): the two address different gaps — the aligned
-schedule makes each full-attention layer's per-track split *structurally* exact, while
-student-forcing closes the free-running exposure-bias gap. If the deep layers still
-lag (the `eval_fidelity` block_mse keeps exploding with depth) and you want to hold
-the communication budget fixed, add `--block-depth-weight` (e.g. `3`): a loss-only
-lever that shifts gradient budget from the near-perfect shallow layers onto the
-drift-prone deep ones, no schedule/comm change:
+The combination that closes this gap (and brought `n16/d2` to `val_kl ≈ 0.59`, with the deep
+relative error dropping onto the `D=1` floor):
+
+- **A free-running curriculum** — `--student-forcing-schedule cosine-full` with
+  `--student-forcing-prob ~0.9`: scheduled sampling that ramps `0 → 0.9` across the **whole**
+  run, so the deep blocks are progressively trained on the *drifted* inputs they see at
+  inference. This is the dominant lever — the deep-layer gap is mostly free-running exposure
+  bias, and it's training-recoverable without extra communication.
+- **Normalized block MSE** (`--normalize-block-mse` + `--block-mse-clamp 10`) so deep,
+  high-norm layers don't dominate / spike the gradient.
+- **Intra-window per-layer MSE** (`--intra-window-mse`) so the mid-window layers — which run
+  on partial residuals at `D≥2` — are pinned to the teacher trajectory.
+- **Adaptive layer weighting** (`--adaptive-layer-weight`) steers gradient budget to whichever
+  taps have the highest *running relative* error (the upper-middle band, not strictly the
+  deepest), data-driven rather than a fixed depth ramp.
+- **Gradient accumulation** (`--grad-accum-steps 2`) averages the noisy small-batch block-MSE
+  gradient before each step.
+- An **LR schedule** (`--warmup-steps` + `--cosine-decay`, vs the spiky constant-LR default).
+
+At `D≥2` also convert with `--sync-schedule full-attn-aligned` (above): it makes each
+full-attention layer's per-track split *structurally* exact, complementary to the curriculum's
+exposure-bias fix.
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
@@ -213,11 +224,12 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
     --tracks-dir convert_out/qwen3_5_9b_n16_d2 \
     --out-dir train_out/qwen3_5_9b_n16_d2 \
-    --max-steps 4000 --seq-len 4096 --batch-size 5 --activation-checkpoint \
-    --intra-window-mse --block-depth-weight 3.0 \
-    --student-forcing-prob 0.5 --student-forcing-warmup 2000 \
-    --normalize-block-mse --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
-    --eval-every 200 --save-every 1000
+    --max-steps 2001 --seq-len 4096 --batch-size 5 --grad-accum-steps 2 --activation-checkpoint \
+    --intra-window-mse --adaptive-layer-weight \
+    --student-forcing-prob 0.9 --student-forcing-schedule cosine-full \
+    --normalize-block-mse --block-mse-clamp 10 \
+    --lr 1e-4 --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
+    --eval-every 200
 ```
 
 ## Evaluate

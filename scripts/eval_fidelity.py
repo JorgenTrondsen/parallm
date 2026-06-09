@@ -222,9 +222,11 @@ def main() -> int:
         print(f"  top1_agree   = {sums['top1_agree'].item():.4f}")
         print(f"  top5_agree   = {sums['top5_agree'].item():.4f}  (teacher top-1 ∈ student top-5)")
         print(f"  top5_set_iou = {sums['top5_set_iou'].item():.4f}")
-        print(f"  per-sync-boundary block_mse:")
+        print(f"  per-sync-boundary block_mse (raw | rel=Σ(s−t)²/Σt²):")
         for layer_idx in sync_indices:
-            print(f"    layer {layer_idx:3d}: {sums[f'block_mse_l{layer_idx}'].item():.6e}")
+            raw = sums[f"block_mse_l{layer_idx}"].item()
+            rel = sums[f"block_relmse_l{layer_idx}"].item()
+            print(f"    layer {layer_idx:3d}: raw={raw:.6e}  rel={rel:.6e}")
         print()
 
     teacher.remove_hooks()

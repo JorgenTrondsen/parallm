@@ -64,7 +64,13 @@ from pt_converter.train.data import (
     preset_names,
     preset_sources,
 )
-from pt_converter.train.distill import DistillConfig, distill_step, validate_step
+from pt_converter.train.distill import (
+    DistillConfig,
+    adaptive_weights_from_relmse,
+    distill_step,
+    student_forcing_schedule,
+    validate_step,
+)
 from pt_converter.train.sync_grads import (
     assert_replicated_consistent,
     build_replication_plan,
@@ -97,6 +103,14 @@ def main() -> int:
     p.add_argument("--max-steps", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Accumulate gradients over this many microbatches before each "
+                        "optimizer step (effective batch = --batch-size × this × world). "
+                        "Each microbatch's losses are scaled 1/grad-accum so the grads "
+                        "AVERAGE rather than sum, giving a less noisy small-batch block-MSE/"
+                        "KL signal at fixed memory. --max-steps / --eval-every / the LR "
+                        "schedule all count OPTIMIZER steps. 1 (default) = no accumulation, "
+                        "bit-identical to the legacy single-microbatch loop.")
     p.add_argument("--lr", type=float, default=3e-5)
     # ----- Training data (streamed + packed; see train/data.py) -----
     p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names(),
@@ -236,6 +250,17 @@ def main() -> int:
                         "(scheduled-sampling anneal: start teacher-forced, increase student-"
                         "forcing). 0 = constant at --student-forcing-prob from step 0. "
                         "Recommended ~half of --max-steps.")
+    p.add_argument("--student-forcing-schedule", default="hold", choices=["hold", "cosine-full"],
+                   help="Shape of the student-forcing probability over the run. 'hold' "
+                        "(default, legacy): linear ramp 0 → --student-forcing-prob over "
+                        "--student-forcing-warmup steps, then HOLD. 'cosine-full': a "
+                        "free-running CURRICULUM — cosine ramp 0 → --student-forcing-prob "
+                        "across the WHOLE run, approaching the high-forcing regime gently and "
+                        "reaching it only near the end. Closes the train(teacher-forced)/"
+                        "eval(free-running) gap that drives the depth-exploding block_mse, "
+                        "without the unstable long tail of holding at a high prob. Recommended "
+                        "with --student-forcing-prob ~0.9 (--student-forcing-warmup is ignored "
+                        "in this shape).")
     p.add_argument("--normalize-block-mse", action=argparse.BooleanOptionalAction, default=False,
                    help="Relative (scale-free) block MSE Σ(s−t)²/Σt² per block instead of the "
                         "raw masked mean. The residual-stream norm grows with depth, so the raw "
@@ -261,16 +286,24 @@ def main() -> int:
                         "residuals. Hooks the teacher at every layer (more captures). Per-window "
                         "loss is averaged over its layers, so --lambda-block keeps its meaning and "
                         "D=1 is bit-identical to the boundary-only path. Off by default.")
-    p.add_argument("--block-depth-weight", type=float, default=0.0,
-                   help="Depth-weight the per-block / per-layer block-MSE by a monotone linear "
-                        "ramp (gamma), mean-1 normalized over all layers. With --normalize-block-mse "
-                        "every layer's MSE is already O(1), so shallow and deep layers claim EQUAL "
-                        "gradient budget even though the deep layers carry all the free-running "
-                        "drift (the depth-exploding eval block_mse); gamma>0 tilts that budget "
-                        "toward the deep layers WITHOUT changing the total block-loss magnitude "
-                        "(lambda_block keeps its meaning). Try 2-5. 0.0 (default) = uniform weights, "
-                        "bit-identical to the unweighted path. Pure loss-side: no change to the sync "
-                        "schedule / communication.")
+    p.add_argument("--adaptive-layer-weight", action=argparse.BooleanOptionalAction, default=False,
+                   help="Adaptively weight each supervised tap's block-MSE by its OWN running "
+                        "relative error. A per-tap EMA of the relative MSE Σ(s−t)²/Σt² is "
+                        "maintained; the per-step weight ∝ EMA**power, mean-1 normalized over the "
+                        "taps, so gradient budget flows to wherever the student is CURRENTLY worst "
+                        "(which the relative metric shows need not be monotone in depth) without "
+                        "changing the total block-loss magnitude (lambda_block keeps its meaning). "
+                        "The relMSE is read off the SYNCED hidden (identical on every rank), so the "
+                        "EMA — and thus the weights — stay in lock-step across ranks. Off by "
+                        "default (uniform weights). Pure loss-side: no change to the sync schedule "
+                        "/ communication.")
+    p.add_argument("--adaptive-layer-weight-ema", type=float, default=0.9,
+                   help="EMA decay for the per-tap relative-MSE estimate that drives "
+                        "--adaptive-layer-weight (higher = smoother / slower to react).")
+    p.add_argument("--adaptive-layer-weight-power", type=float, default=1.0,
+                   help="Exponent on the EMA relative MSE before mean-1 normalization "
+                        "(--adaptive-layer-weight). >1 sharpens the tilt toward the worst taps, "
+                        "<1 softens it. 1.0 = weight directly proportional to relative error.")
     p.add_argument("--kl-ce-chunk-size", type=int, default=512,
                    help="Seq-chunk size for the KL+CE pass; caps the per-chunk fp32 "
                         "(B, chunk, V/world) expansion. Each chunk runs 3 small all-reduces "
@@ -599,7 +632,6 @@ def main() -> int:
         normalize_block_mse=args.normalize_block_mse,
         block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
         intra_window_mse=args.intra_window_mse,
-        block_depth_weight=args.block_depth_weight,
     )
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -652,6 +684,7 @@ def main() -> int:
             "step": step,
             "best_val_kl": best_val_kl,
             "windows_since_best": windows_since_best,
+            "relmse_ema": relmse_ema,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state(),
         }
@@ -700,12 +733,16 @@ def main() -> int:
         # start val_kl tracking fresh on resume from such a checkpoint.
         best_val_kl = float(resume_state.get("best_val_kl", float("inf")))
         windows_since_best = int(resume_state.get("windows_since_best", 0))
+        relmse_ema = resume_state.get("relmse_ema", None)
         _log(rank, f"[init] resumed at step={step} best_val_kl={best_val_kl:.4f} "
                    f"windows_since_best={windows_since_best}")
     else:
         step = 0
         best_val_kl = float("inf")
         windows_since_best = 0
+        # Per-tap relative-MSE EMA for --adaptive-layer-weight (None until the
+        # first step measures it). Identical on every rank (built from synced relMSE).
+        relmse_ema = None
     stop_now = False
 
     # Step on which --mem-report captures per-phase memory + the resident-component
@@ -750,40 +787,92 @@ def main() -> int:
         if prof is not None and not prof_running and step == TRACE_START:
             prof.start()
             prof_running = True
-        # Time the (num_workers=0, inline) data fetch separately from compute.
-        t_fetch = time.perf_counter()
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            break
-        data_wait = time.perf_counter() - t_fetch
-
-        t_step = time.perf_counter()
-        batch = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in batch.items()}
-        if batch["input_ids"].ndim == 1:
-            batch = {k: v.unsqueeze(0) for k, v in batch.items()}
-
         timings: dict[str, float] | None = {} if args.profile else None
         # --mem-report captures per-phase memory on a single designated step
         # (passing `mem` resets peak stats each phase, so we never pass it every step).
         do_mem_capture = step == mem_report_step
         step_mem: dict[str, dict[str, float]] | None = {} if do_mem_capture else None
 
-        # Scheduled-sampling probability for this step (ramp 0 → prob over the
-        # warmup window). The per-block draw inside distill_step is seeded by
-        # (seed, step) so every rank makes identical teacher/student choices.
-        if args.student_forcing_warmup > 0:
-            sf_p = args.student_forcing_prob * min(1.0, step / args.student_forcing_warmup)
-        else:
-            sf_p = args.student_forcing_prob
-
-        optim.zero_grad(set_to_none=True)
-        # distill_step now backwards each block immediately to bound peak
-        # memory; gradients accumulate on student params internally.
-        losses = distill_step(
-            student, teacher, batch, distill_cfg, timings=timings, mem=step_mem,
-            student_forcing_prob=sf_p, forcing_seed=(args.seed, step),
+        # Student-forcing probability for this OPTIMIZER step (same across the G
+        # microbatches; depends only on `step`, so identical on every rank). The
+        # per-block draw inside distill_step is seeded by (seed, step, micro) so
+        # every rank makes identical teacher/student choices on each microbatch.
+        sf_p = student_forcing_schedule(
+            step, args.student_forcing_prob, args.student_forcing_warmup,
+            args.max_steps, args.student_forcing_schedule,
         )
+        # Adaptive per-tap block-MSE weights from the running relMSE EMA (None on
+        # the first step → depth-only). The EMA is built from the SYNCED relMSE, so
+        # it — and these weights — are identical on every rank.
+        adaptive_weights = (
+            adaptive_weights_from_relmse(relmse_ema, args.adaptive_layer_weight_power)
+            if (args.adaptive_layer_weight and relmse_ema)
+            else None
+        )
+
+        # ----- Gradient accumulation: G microbatches per optimizer step -----
+        # Each microbatch's losses are scaled 1/G so the grads ACCUMULATE into the
+        # per-step MEAN (no zero_grad between microbatches); the logged losses are
+        # the unscaled per-microbatch mean. --max-steps / --eval-every / the LR
+        # schedule all count optimizer steps. G=1 ⇒ the legacy single-batch loop.
+        G = max(1, args.grad_accum_steps)
+        loss_scale = 1.0 / G
+        optim.zero_grad(set_to_none=True)
+        loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0}
+        relmse_sums: dict[int, torch.Tensor] = {}
+        data_wait = 0.0
+        micro_count = 0
+        t_step = time.perf_counter()
+        for micro in range(G):
+            # Time the (num_workers=0, inline) data fetch separately from compute.
+            t_fetch = time.perf_counter()
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                break
+            data_wait += time.perf_counter() - t_fetch
+            batch = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in batch.items()}
+            if batch["input_ids"].ndim == 1:
+                batch = {k: v.unsqueeze(0) for k, v in batch.items()}
+            # Pass the mem-capture dict on the FIRST microbatch only (it resets peak stats).
+            micro_mem = step_mem if (do_mem_capture and micro == 0) else None
+            # distill_step backwards each block immediately to bound peak memory;
+            # grads accumulate on student params across blocks AND microbatches.
+            losses = distill_step(
+                student, teacher, batch, distill_cfg, timings=timings, mem=micro_mem,
+                student_forcing_prob=sf_p,
+                forcing_seed=(args.seed, step, micro),
+                loss_scale=loss_scale,
+                adaptive_weights=adaptive_weights,
+                track_layer_relmse=args.adaptive_layer_weight,
+            )
+            for k in loss_sums:
+                loss_sums[k] = loss_sums[k] + losses[k].detach()
+            for l, v in losses["layer_relmse"].items():
+                relmse_sums[l] = (relmse_sums[l] + v) if l in relmse_sums else v
+            micro_count += 1
+        if micro_count == 0:
+            break  # data stream exhausted before this step consumed anything
+        # Per-microbatch mean of the (unscaled) losses, for logging.
+        mean_losses = {k: loss_sums[k] / micro_count for k in loss_sums}
+
+        # Fold this step's per-tap relMSE (mean over microbatches) into the EMA.
+        # One .tolist() sync per step, only when adaptive weighting is on.
+        if args.adaptive_layer_weight and relmse_sums:
+            keys = sorted(relmse_sums)
+            measured = dict(zip(
+                keys,
+                (torch.stack([relmse_sums[l] for l in keys]) / micro_count).tolist(),
+            ))
+            if relmse_ema is None:
+                relmse_ema = measured
+            else:
+                beta = args.adaptive_layer_weight_ema
+                relmse_ema = {
+                    l: beta * relmse_ema.get(l, measured[l]) + (1.0 - beta) * measured[l]
+                    for l in measured
+                }
+
         sync_replicated_grads(replication_plan)
 
         # Global, replication-deduplicated grad norm. Same scalar on every rank,
@@ -796,7 +885,7 @@ def main() -> int:
             _log(
                 rank,
                 f"[step {step}] SKIP non-finite grad "
-                f"(loss={losses['total'].item()}, grad_norm=nan/inf)",
+                f"(loss={mean_losses['total'].item()}, grad_norm=nan/inf)",
             )
             optim.zero_grad(set_to_none=True)
             if prof is not None:
@@ -832,9 +921,13 @@ def main() -> int:
             torch.cuda.reset_peak_memory_stats()
 
         if args.profile:
+            # t_step is set before the microbatch loop and the data fetches happen
+            # inside it, so step_total already includes data_wait (a subset). The
+            # per-phase `timings` accumulated across all G microbatches inside
+            # distill_step (the _phase timer adds, not overwrites).
             timings["data_wait"] = data_wait
             torch.cuda.synchronize()
-            step_total = (time.perf_counter() - t_step) + data_wait
+            step_total = time.perf_counter() - t_step
             accounted = sum(timings.get(k, 0.0) for k in phase_keys)
             other = step_total - accounted
             # Step 0 carries one-time warmup (cuDNN autotune, lazy allocs, first
@@ -854,9 +947,9 @@ def main() -> int:
             lr_now = optim.param_groups[0]["lr"]
             _log(
                 rank,
-                f"[step {step}] total={losses['total'].item():.4f} "
-                f"block_mse={losses['block_mse'].item():.4f} "
-                f"kl={losses['kl'].item():.4f} ce={losses['ce'].item():.4f} "
+                f"[step {step}] total={mean_losses['total'].item():.4f} "
+                f"block_mse={mean_losses['block_mse'].item():.4f} "
+                f"kl={mean_losses['kl'].item():.4f} ce={mean_losses['ce'].item():.4f} "
                 f"grad_norm={total_norm.item():.3e} "
                 f"lr={lr_now:.2e} elapsed={elapsed:.1f}s",
             )
