@@ -409,3 +409,163 @@ def test_distill_step_adaptive_weights_change_block_loss_and_grads():
     assert not torch.allclose(out_a["block_mse"], out_b["block_mse"])
     assert torch.isfinite(out_b["total"]).all()
     assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in s_b.parameters())
+
+
+# ----- D: free-running feature matching + zero-lambda klce skip -----
+
+def _grads(student):
+    return {n: p.grad.detach().clone() for n, p in student.named_parameters() if p.grad is not None}
+
+
+def test_free_running_off_matches_plain_call():
+    """cfg.free_running_mse=False with an explicit free_running_scale is bit-identical
+    to the plain call (the klce-return refactor must not perturb losses or grads),
+    and fr_mse is reported as zero."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    dcfg = lambda man: DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                                     normalize_block_mse=True)
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    s_a.zero_grad(set_to_none=True)
+    out_a = distill_step(s_a, t_a, batch, dcfg(man), student_forcing_prob=0.0, forcing_seed=(42, 0))
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    s_b.zero_grad(set_to_none=True)
+    out_b = distill_step(s_b, t_b, batch, dcfg(man), student_forcing_prob=0.0, forcing_seed=(42, 0),
+                         free_running_scale=1.0)
+    for key in ("total", "block_mse", "kl", "ce", "fr_mse"):
+        assert torch.allclose(out_a[key], out_b[key], atol=1e-6), key
+    assert out_a["fr_mse"].item() == 0.0
+    ga, gb = _grads(s_a), _grads(s_b)
+    assert ga and ga.keys() == gb.keys()
+    for n in ga:
+        assert torch.equal(ga[n], gb[n]), n
+
+
+def test_free_running_grads_flow_cross_window():
+    """Free-running MSE on the deep tap only (boundaries [3, 7] → tap {7}) must put
+    nonzero gradients on the FIRST window's layers — only possible if the gradient
+    flows through the whole free-running forward, across the window boundary the
+    block loop detaches at. All other lambdas are 0."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0,
+        free_running_mse=True, lambda_free_running=1.0, free_running_taps="deep-half",
+    )
+    s.zero_grad(set_to_none=True)
+    out = distill_step(s, t, _batch(cfg), dcfg, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    assert torch.isfinite(out["fr_mse"]).all() and out["fr_mse"].item() > 0.0
+    assert set(out["fr_layer_relmse"].keys()) == {7}
+    layer0_grads = [
+        p.grad for tm in s.text_models for p in tm.layers[0].parameters() if p.grad is not None
+    ]
+    assert layer0_grads
+    assert any(g.abs().sum().item() > 0 for g in layer0_grads)
+    assert all(torch.isfinite(g).all() for g in layer0_grads)
+
+
+def test_free_running_all_taps_reports_every_boundary():
+    """free_running_taps='all' supervises every sync boundary ([3, 7] at D=4)."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        free_running_mse=True,
+    )
+    out = distill_step(s, t, _batch(cfg), dcfg, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    assert set(out["fr_layer_relmse"].keys()) == set(man.sync_layer_indices)
+    for v in out["fr_layer_relmse"].values():
+        assert torch.isfinite(v).all() and v.item() >= 0.0
+
+
+def test_zero_lambda_skip_keeps_klce_logging():
+    """All lambdas 0 and fr off: the full forward runs under no_grad (the previously
+    zero-gradient backward is skipped) but kl/ce are still computed for logging and
+    match a grad-bearing run's values; no parameter receives a nonzero grad."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    out_a = distill_step(
+        s_a, t_a, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices)),  # kl=1.0, ce=0.5
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    s_b.zero_grad(set_to_none=True)
+    out_b = distill_step(
+        s_b, t_b, batch,
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+    )
+    # The kl/ce METRICS are lambda-independent (same weights, same batch).
+    assert torch.allclose(out_a["kl"], out_b["kl"], atol=1e-5)
+    assert torch.allclose(out_a["ce"], out_b["ce"], atol=1e-5)
+    for n, p in s_b.named_parameters():
+        assert p.grad is None or p.grad.abs().sum().item() == 0.0, n
+
+
+def test_free_running_loss_scale_halves_grads_not_loss():
+    """loss_scale scales the fr gradients (the grad-accum contract) but not the
+    reported fr_mse."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    dcfg = lambda man: DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0,
+        free_running_mse=True,
+    )
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    s_a.zero_grad(set_to_none=True)
+    out_a = distill_step(s_a, t_a, batch, dcfg(man), student_forcing_prob=0.0,
+                         forcing_seed=(42, 0), loss_scale=1.0)
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    s_b.zero_grad(set_to_none=True)
+    out_b = distill_step(s_b, t_b, batch, dcfg(man), student_forcing_prob=0.0,
+                         forcing_seed=(42, 0), loss_scale=0.5)
+    assert torch.allclose(out_a["fr_mse"], out_b["fr_mse"], atol=1e-6)
+    ga, gb = _grads(s_a), _grads(s_b)
+    assert ga and ga.keys() == gb.keys()
+    for n in ga:
+        assert torch.allclose(gb[n], 0.5 * ga[n], atol=1e-7, rtol=1e-4), n
+
+
+def test_free_running_scale_zero_logs_without_grads():
+    """free_running_scale=0 (the cosine ramp at step 0) still reports fr_mse but the
+    effective weight is 0 — combined with zero kl/ce lambdas, no grads anywhere."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    s.zero_grad(set_to_none=True)
+    out = distill_step(
+        s, t, _batch(cfg),
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0,
+                      free_running_mse=True),
+        student_forcing_prob=0.0, forcing_seed=(42, 0), free_running_scale=0.0,
+    )
+    assert torch.isfinite(out["fr_mse"]).all() and out["fr_mse"].item() > 0.0
+    for n, p in s.named_parameters():
+        assert p.grad is None or p.grad.abs().sum().item() == 0.0, n
+
+
+def test_total_includes_fr_term():
+    """total = λ_block·block + λ_kl·kl + λ_ce·ce + (λ_fr·scale)·fr_mse."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        lambda_block=1.0, lambda_kl=1.0, lambda_ce=0.5,
+        normalize_block_mse=True,
+        free_running_mse=True, lambda_free_running=0.7,
+    )
+    out = distill_step(s, t, _batch(cfg), dcfg, student_forcing_prob=0.0,
+                       forcing_seed=(42, 0), free_running_scale=0.5)
+    expected = (
+        1.0 * out["block_mse"] + 1.0 * out["kl"] + 0.5 * out["ce"]
+        + 0.7 * 0.5 * out["fr_mse"]
+    )
+    assert torch.allclose(out["total"], expected, atol=1e-6)

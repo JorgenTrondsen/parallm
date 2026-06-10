@@ -156,6 +156,7 @@ trains/evaluates against existing track shards regardless of schedule.
 | `--student-forcing-schedule` | `hold` | Shape of the student-forcing prob over the run. `hold` (default, legacy): linear ramp `0 → --student-forcing-prob` over `--student-forcing-warmup` then **hold**. `cosine-full`: a free-running **curriculum** — cosine ramp `0 → --student-forcing-prob` across the **whole** run, approaching the high-forcing regime gently and reaching it only near the end. Directly closes the train(teacher-forced)/eval(free-running) gap that drives the depth-exploding block_mse, without the unstable long tail of holding at a high prob. Recommended with `--student-forcing-prob ~0.9` (`--student-forcing-warmup` is ignored in this shape). |
 | `--normalize-block-mse` | off | Relative (scale-free) block MSE `Σ(s−t)²/Σt²` per block instead of the raw masked mean. The residual-stream norm grows with depth, so the raw MSE lets deep layers dominate the gradient (and spike the grad norm); normalizing makes every depth contribute comparably. Rescales the block term, so `--lambda-block` becomes a relative weight (1.0 is a fine start). |
 | `--block-mse-clamp` | `10.0` | Cap the normalized per-block relative MSE (only active with `--normalize-block-mse`). Under student forcing a block can be fed the student's own drifted hidden, occasionally blowing the ratio up to 100+ on a single batch — a spike that inflates the gradient and trips the `--max-grad-norm` clip, throttling the whole step. Clamping saturates the gradient above the cap (outlier rejection); normal per-block ratios (~0.5–1.5) are untouched. `<=0` disables it. |
+| `--free-running-mse` (+ `--lambda-free-running` `1.0` / `--free-running-schedule` `constant` / `--free-running-taps` `all`) | off | **Free-running feature matching.** Relative-MSE the end-to-end **free-running** student forward's synced hiddens (the same full forward the KL/CE pass uses — the student runs on its *own* hiddens throughout) against the teacher hiddens at the sync boundaries, with gradients through the **whole** forward. The block loop detaches at every boundary, so it never trains multi-window error compounding — the deep free-running relMSE plateau is exactly what it cannot see; this term supervises it directly. Reuses the already-paid `student_fwd` pass and shares its single backward with KL/CE, so the marginal compute is ~zero; retaining the boundary teacher hiddens costs ~2.5 GB/rank at `B=5` `D=2` (`--free-running-taps deep-half` halves it, supervising only the deep boundaries where the error concentrates). `--free-running-schedule cosine-full` ramps the weight 0 → 1 across the run (recommended from scratch — early free-running hiddens are garbage); `constant` applies full weight from step 0 (warm-started finishing runs). The term is the mean-over-taps relative MSE clamped by `--block-mse-clamp`, so `--lambda-free-running 1.0` is comparable to a normalized `--lambda-block`. |
 | `--adaptive-layer-weight` (+ `--adaptive-layer-weight-ema` `0.9` / `--adaptive-layer-weight-power` `1.0`) | off | Adaptively weight each supervised tap's block-MSE by its **own** running relative error. A per-tap EMA of the relative MSE `Σ(s−t)²/Σt²` is kept; the per-step weight `∝ EMA**power`, mean-1 normalized over the taps, so gradient budget flows to wherever the student is **currently** worst (which the relative metric shows need not be monotone in depth — the worst band is the upper-middle layers, not the deepest) without changing the total block-loss magnitude (so `--lambda-block` keeps its meaning). The relMSE is read off the **synced** hidden (identical on every rank), so the EMA — and the weights — stay in lock-step across ranks. Off = uniform weights. Pure loss-side — no change to the sync schedule / communication budget. |
 | `--save-every` / `--save-final` | `0` / off | Checkpoint cadence and final-step save. |
 | `--eval-every` / `--val-batches` | `0` / `20` | Held-out KL(teacher ‖ student) eval cadence and size; val_ce also logged. |
@@ -207,6 +208,11 @@ relative error dropping onto the `D=1` floor):
   high-norm layers don't dominate / spike the gradient.
 - **Intra-window per-layer MSE** (`--intra-window-mse`) so the mid-window layers — which run
   on partial residuals at `D≥2` — are pinned to the teacher trajectory.
+- **Free-running feature matching** (`--free-running-mse` +
+  `--free-running-schedule cosine-full`) — the block loop detaches at every boundary, so
+  nothing above trains *multi-window* error compounding with gradient flow; this term MSEs the
+  end-to-end free-running forward's synced hiddens against the teacher's, backwarding through
+  the whole forward, at ~zero extra compute (it shares the already-paid `student_fwd` pass).
 - **Adaptive layer weighting** (`--adaptive-layer-weight`) steers gradient budget to whichever
   taps have the highest *running relative* error (the upper-middle band, not strictly the
   deepest), data-driven rather than a fixed depth ramp.
@@ -228,6 +234,8 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --intra-window-mse --adaptive-layer-weight \
     --student-forcing-prob 0.9 --student-forcing-schedule cosine-full \
     --normalize-block-mse --block-mse-clamp 10 \
+    --free-running-mse --free-running-schedule cosine-full \
+    --lambda-kl 0 --lambda-ce 0 \
     --lr 1e-4 --warmup-steps 50 --cosine-decay --lr-min-ratio 0.1 \
     --eval-every 200
 ```

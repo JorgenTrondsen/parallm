@@ -99,22 +99,25 @@ def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size):
     V, D = lm_w.shape
     kw = dict(lambda_kl=1.0, lambda_ce=0.5, kl_temperature=kl_temperature, chunk_size=chunk_size)
 
-    # Dense reference.
+    # Dense reference. The helper now RETURNS the grad w.r.t. hidden; the caller
+    # drives the backward (one traversal, combinable with other graph-rooted losses).
     h_dense = hidden0.clone().requires_grad_(True)
     lm_dense = nn.Linear(D, V, bias=False)
     lm_dense.weight.data.copy_(lm_w)
-    kl_d, ce_d = _kl_ce_chunked(
+    kl_d, ce_d, grad_h_d = _kl_ce_chunked(
         h_dense, lm_dense, teacher_logits, labels, attn, **kw
     )
+    h_dense.backward(grad_h_d)
 
     # Vocab-parallel, single shard (world_size=1, no group).
     h_vp = hidden0.clone().requires_grad_(True)
     lm_vp = nn.Linear(D, V, bias=False)
     lm_vp.weight.data.copy_(lm_w)
-    kl_v, ce_v = _kl_ce_vocab_parallel(
+    kl_v, ce_v, grad_h_v = _kl_ce_vocab_parallel(
         h_vp, lm_vp, 0, V, teacher_logits, labels, attn,
         group=None, world_size=1, **kw,
     )
+    h_vp.backward(grad_h_v)
 
     assert torch.allclose(kl_d, kl_v, atol=1e-5, rtol=1e-4), (kl_d, kl_v)
     assert torch.allclose(ce_d, ce_v, atol=1e-5, rtol=1e-4), (ce_d, ce_v)
@@ -156,11 +159,12 @@ def _worker(rank, world_size, port, payload, results):
     lm = nn.Linear(D, hi - lo, bias=False)
     lm.weight.data.copy_(lm_w[lo:hi])
     # teacher_logits is now passed as this rank's vocab shard (B,T,Vs).
-    kl, ce = _kl_ce_vocab_parallel(
+    kl, ce, grad_h = _kl_ce_vocab_parallel(
         h, lm, lo, hi, teacher_logits[:, :, lo:hi], labels, attn,
         lambda_kl=1.0, lambda_ce=0.5, kl_temperature=2.0, chunk_size=7,
         group=dist.group.WORLD, world_size=world_size,
     )
+    h.backward(grad_h)
     # Sum hidden grad across ranks → should equal the dense hidden grad.
     h_grad = h.grad.clone()
     dist.all_reduce(h_grad, op=dist.ReduceOp.SUM)
@@ -186,7 +190,8 @@ def test_vp_klce_two_rank_matches_dense():
     h_dense = hidden0.clone().requires_grad_(True)
     lm_dense = nn.Linear(D, V, bias=False)
     lm_dense.weight.data.copy_(lm_w)
-    kl_d, ce_d = _kl_ce_chunked(h_dense, lm_dense, teacher_logits, labels, attn, **kw)
+    kl_d, ce_d, grad_h_d = _kl_ce_chunked(h_dense, lm_dense, teacher_logits, labels, attn, **kw)
+    h_dense.backward(grad_h_d)
 
     world_size = 2
     mgr = mp.Manager()

@@ -286,6 +286,33 @@ def main() -> int:
                         "residuals. Hooks the teacher at every layer (more captures). Per-window "
                         "loss is averaged over its layers, so --lambda-block keeps its meaning and "
                         "D=1 is bit-identical to the boundary-only path. Off by default.")
+    p.add_argument("--free-running-mse", action="store_true",
+                   help="Free-running feature matching: relative-MSE the END-TO-END student "
+                        "forward's synced hiddens (the same full forward the KL/CE pass uses — "
+                        "the student runs on its OWN hiddens throughout) against the teacher "
+                        "hiddens at the sync boundaries, with gradients through the WHOLE "
+                        "forward. Unlike the block loop (detached at every boundary) this "
+                        "trains multi-window error compounding directly — the deep free-running "
+                        "relMSE plateau the block loop cannot see. Reuses the already-paid "
+                        "student_fwd pass (shares its single backward with KL/CE), so the "
+                        "marginal cost is ~zero; retaining the boundary teacher hiddens costs "
+                        "~2.5 GB/rank at B=5 D=2 (halve with --free-running-taps deep-half).")
+    p.add_argument("--lambda-free-running", type=float, default=1.0,
+                   help="Weight on the free-running feature-matching term (multiplied by the "
+                        "--free-running-schedule scale). The term is the relative MSE (mean "
+                        "over taps, clamped by --block-mse-clamp), so 1.0 is comparable to a "
+                        "normalized --lambda-block.")
+    p.add_argument("--free-running-schedule", default="constant", choices=["constant", "cosine-full"],
+                   help="Per-step scale on --lambda-free-running. 'constant' (default): full "
+                        "weight from step 0 (right for warm-started finishing runs). "
+                        "'cosine-full': cosine ramp 0 → 1 across the whole run — for "
+                        "from-scratch runs, where the early free-running hiddens are garbage "
+                        "and the term should phase in as the blocks converge (mirrors the "
+                        "--student-forcing-schedule cosine-full curriculum).")
+    p.add_argument("--free-running-taps", default="all", choices=["all", "deep-half"],
+                   help="Which sync boundaries the free-running MSE supervises. 'deep-half': "
+                        "only the deeper half — where the free-running error concentrates — "
+                        "halving the retained-teacher-hidden memory.")
     p.add_argument("--adaptive-layer-weight", action=argparse.BooleanOptionalAction, default=False,
                    help="Adaptively weight each supervised tap's block-MSE by its OWN running "
                         "relative error. A per-tap EMA of the relative MSE Σ(s−t)²/Σt² is "
@@ -632,6 +659,9 @@ def main() -> int:
         normalize_block_mse=args.normalize_block_mse,
         block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
         intra_window_mse=args.intra_window_mse,
+        free_running_mse=args.free_running_mse,
+        lambda_free_running=args.lambda_free_running,
+        free_running_taps=args.free_running_taps,
     )
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
@@ -762,7 +792,7 @@ def main() -> int:
     prof_dir = None
     TRACE_START = 3          # steps before this run un-traced (clean warmup)
     TRACE_ACTIVE = 2         # number of steps captured in the trace
-    phase_keys = ["teacher_fwd", "setup", "block_loop", "student_fwd", "klce", "data_wait"]
+    phase_keys = ["teacher_fwd", "setup", "block_loop", "student_fwd", "fr_mse", "klce", "bwd_full", "data_wait"]
     phase_totals: dict[str, float] = {}
     profiled_steps = 0
     if args.profile_trace:
@@ -801,6 +831,13 @@ def main() -> int:
             step, args.student_forcing_prob, args.student_forcing_warmup,
             args.max_steps, args.student_forcing_schedule,
         )
+        # Free-running feature-matching scale for this step ('constant' reuses the
+        # warmup-0 "hold" shape ⇒ 1.0 every step). Depends only on `step`, so it
+        # is identical on every rank.
+        fr_scale = student_forcing_schedule(
+            step, 1.0, 0, args.max_steps,
+            "hold" if args.free_running_schedule == "constant" else "cosine-full",
+        )
         # Adaptive per-tap block-MSE weights from the running relMSE EMA (None on
         # the first step → depth-only). The EMA is built from the SYNCED relMSE, so
         # it — and these weights — are identical on every rank.
@@ -818,7 +855,7 @@ def main() -> int:
         G = max(1, args.grad_accum_steps)
         loss_scale = 1.0 / G
         optim.zero_grad(set_to_none=True)
-        loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0}
+        loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0, "fr_mse": 0.0}
         relmse_sums: dict[int, torch.Tensor] = {}
         data_wait = 0.0
         micro_count = 0
@@ -845,6 +882,7 @@ def main() -> int:
                 loss_scale=loss_scale,
                 adaptive_weights=adaptive_weights,
                 track_layer_relmse=args.adaptive_layer_weight,
+                free_running_scale=fr_scale,
             )
             for k in loss_sums:
                 loss_sums[k] = loss_sums[k] + losses[k].detach()
@@ -949,6 +987,7 @@ def main() -> int:
                 rank,
                 f"[step {step}] total={mean_losses['total'].item():.4f} "
                 f"block_mse={mean_losses['block_mse'].item():.4f} "
+                f"fr_mse={mean_losses['fr_mse'].item():.4f} "
                 f"kl={mean_losses['kl'].item():.4f} ce={mean_losses['ce'].item():.4f} "
                 f"grad_norm={total_norm.item():.3e} "
                 f"lr={lr_now:.2e} elapsed={elapsed:.1f}s",
