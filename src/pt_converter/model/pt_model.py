@@ -26,6 +26,23 @@ from torch.utils.checkpoint import checkpoint
 from pt_converter.model.sync import SyncBoundary
 
 
+def _window_ranges(num_layers: int, sync_indices: Sequence[int]) -> list[tuple[int, int]]:
+    """Sync layer indices → (start, end_inclusive) window ranges covering all layers.
+
+    Mirrors ``train.distill._block_ranges`` (kept local — distill imports this
+    module). Every sync index ends a window; a trailing remainder window is
+    appended if the last layer is not itself a sync boundary.
+    """
+    ranges: list[tuple[int, int]] = []
+    prev_end = -1
+    for idx in sync_indices:
+        ranges.append((prev_end + 1, idx))
+        prev_end = idx
+    if prev_end != num_layers - 1:
+        ranges.append((prev_end + 1, num_layers - 1))
+    return ranges
+
+
 @dataclass
 class PTTrackTextModelConfig:
     """The engine→adapter contract for instantiating a per-track text model.
@@ -56,6 +73,7 @@ class PTWrappedModel(nn.Module):
         sync_after_layers: list[int],
         track_group: "torch.distributed.ProcessGroup | None" = None,
         activation_checkpoint: bool = False,
+        checkpoint_granularity: str = "window",
         compile_layers: bool = False,
         compile_mode: str = "default",
         vocab_parallel: bool = False,
@@ -87,7 +105,24 @@ class PTWrappedModel(nn.Module):
         # ordering and pay no recompute.) The KL/CE backward is a single
         # `hidden.backward` either way (not per-chunk). This is the lever for
         # fitting larger batch sizes at seq_len=4096 on 40 GB GPUs.
+        #
+        # Granularity: "window" (default) checkpoints each whole sync window
+        # (the D layers between boundaries) per track, so only the SHARED synced
+        # window input is saved — one (B,T,H) tensor per window instead of the
+        # ~K+1 per window that per-"layer" wrapping pins (window input + each
+        # track's mid-window hiddens). Math is bit-identical and each layer is
+        # recomputed exactly once either way; the saved-tensor set shrinks (~5 GB
+        # at n16/d2 B=5 seq=4096) at the cost of a larger transient while a
+        # window's backward re-runs its D·K-layer graph. The SyncBoundary stays
+        # OUTSIDE the checkpoint, so no collective ever runs inside a recompute
+        # (backward remains collective-free on every rank). At D=1 the two
+        # granularities coincide. "layer" keeps the legacy per-layer wrap.
+        if checkpoint_granularity not in ("window", "layer"):
+            raise ValueError(
+                f"checkpoint_granularity must be 'window' or 'layer', got {checkpoint_granularity!r}"
+            )
         self._use_checkpoint = activation_checkpoint
+        self._ckpt_granularity = checkpoint_granularity
 
         # ----- Vocab-parallel (tensor-parallel over V) setup -----
         # When enabled, embed_tokens + lm_head + the KL/CE softmax are sharded
@@ -138,6 +173,12 @@ class PTWrappedModel(nn.Module):
                 for layer in tm.layers:
                     layer.compile(mode=compile_mode, dynamic=False)
 
+        # Sync windows (start, end_inclusive) — the forward's iteration unit and
+        # the "window" checkpointing granule. Every sync index ends a window.
+        self._window_ranges = _window_ranges(
+            len(self.text_models[0].layers), self.sync_after_layers
+        )
+
         if vocab_parallel:
             # Vocab-parallel: every rank holds the embed + lm_head shard for its
             # vocab range [v_lo, v_hi). The embedding is summed across ranks
@@ -162,6 +203,39 @@ class PTWrappedModel(nn.Module):
                 self.lm_head = nn.Linear(text_config.hidden_size, text_config.vocab_size, bias=False)
             else:
                 self.lm_head = None
+
+    @staticmethod
+    def _run_track_window(
+        tm,
+        start: int,
+        end_inclusive: int,
+        h: torch.Tensor,
+        position_embeddings,
+        text_position_ids,
+        causal_mask,
+        linear_attn_mask,
+    ) -> torch.Tensor:
+        """Run ONE track's layers [start..end_inclusive] from the synced window input.
+
+        The "window" checkpointing granule: collective-free (the SyncBoundary is
+        applied by the caller, outside any checkpoint), so it is safe to recompute
+        during backward on every rank independently.
+        """
+        for layer_idx in range(start, end_inclusive + 1):
+            mask = (
+                linear_attn_mask
+                if tm.config.layer_types[layer_idx] == "linear_attention"
+                else causal_mask
+            )
+            h = tm.layers[layer_idx](
+                h,
+                position_embeddings=position_embeddings,
+                attention_mask=mask,
+                position_ids=text_position_ids,
+                past_key_values=None,
+                use_cache=False,
+            )
+        return h
 
     def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Full input embedding (B, S, H), grad-connected, identical on every rank.
@@ -225,49 +299,67 @@ class PTWrappedModel(nn.Module):
         )
         position_embeddings = tm0.rotary_emb(h, position_ids_resolved)
 
-        # 3. Lockstep layer iteration with per-block syncs.
+        # 3. Lockstep window iteration with per-block syncs. Iterating windows
+        # (not layers) is what lets "window" checkpointing wrap each track's
+        # whole window in ONE checkpoint — saving only the shared synced window
+        # input instead of every mid-window per-track hidden. Sync positions are
+        # identical to the legacy per-layer loop (every sync index ends a window).
         block_start = h
         sync_set = set(self.sync_after_layers)
         sync_hiddens: dict[int, torch.Tensor] = {} if return_sync_hiddens else None
         per_track_h = [block_start for _ in self.text_models]
         use_ckpt = self._use_checkpoint and torch.is_grad_enabled()
-        for layer_idx in range(len(tm0.layers)):
-            new_h: list[torch.Tensor] = []
-            for k, tm in enumerate(self.text_models):
-                layer = tm.layers[layer_idx]
-                mask = (
-                    linear_attn_mask
-                    if tm.config.layer_types[layer_idx] == "linear_attention"
-                    else causal_mask
-                )
-                if use_ckpt:
-                    out = checkpoint(
-                        layer,
-                        per_track_h[k],
-                        position_embeddings=position_embeddings,
-                        attention_mask=mask,
-                        position_ids=text_position_ids,
-                        past_key_values=None,
-                        use_cache=False,
+        window_ckpt = use_ckpt and self._ckpt_granularity == "window"
+        for start, end in self._window_ranges:
+            if window_ckpt:
+                per_track_h = [
+                    checkpoint(
+                        self._run_track_window,
+                        tm, start, end, per_track_h[k],
+                        position_embeddings, text_position_ids,
+                        causal_mask, linear_attn_mask,
                         use_reentrant=False,
                     )
-                else:
-                    out = layer(
-                        per_track_h[k],
-                        position_embeddings=position_embeddings,
-                        attention_mask=mask,
-                        position_ids=text_position_ids,
-                        past_key_values=None,
-                        use_cache=False,
-                    )
-                new_h.append(out)
-            per_track_h = new_h
-            if layer_idx in sync_set:
+                    for k, tm in enumerate(self.text_models)
+                ]
+            else:
+                for layer_idx in range(start, end + 1):
+                    new_h: list[torch.Tensor] = []
+                    for k, tm in enumerate(self.text_models):
+                        layer = tm.layers[layer_idx]
+                        mask = (
+                            linear_attn_mask
+                            if tm.config.layer_types[layer_idx] == "linear_attention"
+                            else causal_mask
+                        )
+                        if use_ckpt:
+                            out = checkpoint(
+                                layer,
+                                per_track_h[k],
+                                position_embeddings=position_embeddings,
+                                attention_mask=mask,
+                                position_ids=text_position_ids,
+                                past_key_values=None,
+                                use_cache=False,
+                                use_reentrant=False,
+                            )
+                        else:
+                            out = layer(
+                                per_track_h[k],
+                                position_embeddings=position_embeddings,
+                                attention_mask=mask,
+                                position_ids=text_position_ids,
+                                past_key_values=None,
+                                use_cache=False,
+                            )
+                        new_h.append(out)
+                    per_track_h = new_h
+            if end in sync_set:
                 h = self.sync_module(per_track_h, block_start)
                 block_start = h
                 per_track_h = [h for _ in self.text_models]
                 if sync_hiddens is not None:
-                    sync_hiddens[layer_idx] = h
+                    sync_hiddens[end] = h
 
         h = tm0.norm(h)
         # The caller may want the post-norm hidden state instead of logits so

@@ -230,21 +230,36 @@ def compute_global_grad_norm(
     Must be called *after* ``sync_replicated_grads`` so every member of a
     replication group already holds the same synced gradient. Returns a 0-d
     fp32 tensor on this rank's device.
+
+    The per-param ``|g|²`` reductions run through ``torch._foreach_norm`` in
+    chunks (multi-tensor kernels instead of ~3 launches per param — the
+    per-track params are tiny and number ~1000/rank). The norms are taken on
+    fp32 casts, so precision matches the old per-param ``float().pow(2).sum()``
+    path up to 1-ulp (sqrt→square round-trip); the chunking bounds the fp32
+    transient. The computation order is identical on every rank, so the
+    returned scalar — and the clip bit-equality argument above — still hold.
     """
     replicated_denom: dict[int, float] = {}
     for cg in plan:
         for p in cg.local_params:
             replicated_denom[id(p)] = float(cg.group_size)
 
-    sum_sq: "torch.Tensor | None" = None
+    grads_by_denom: dict[float, list[torch.Tensor]] = {}
     for p in student.parameters():
         if p.grad is None:
             continue
-        sq = p.grad.detach().float().pow(2).sum()
         denom = replicated_denom.get(id(p), 1.0)
-        if denom != 1.0:
-            sq = sq / denom
-        sum_sq = sq if sum_sq is None else sum_sq + sq
+        grads_by_denom.setdefault(denom, []).append(p.grad.detach())
+
+    sum_sq: "torch.Tensor | None" = None
+    _CHUNK = 256  # bounds the transient fp32 grad copies to a chunk at a time
+    for denom, grads in grads_by_denom.items():
+        for i in range(0, len(grads), _CHUNK):
+            norms = torch._foreach_norm([g.float() for g in grads[i:i + _CHUNK]])
+            sq = torch.stack(norms).pow(2).sum()
+            if denom != 1.0:
+                sq = sq / denom
+            sum_sq = sq if sum_sq is None else sum_sq + sq
 
     if sum_sq is None:
         # No grads on this rank — still participate in the collective so peers don't hang.

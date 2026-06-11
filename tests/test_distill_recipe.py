@@ -133,7 +133,8 @@ def test_forcing_decisions_are_deterministic_per_seed():
 
 # ----- distill_step end-to-end with the new recipe -----
 
-def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4, teacher_hook_all=False):
+def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4, teacher_hook_all=False,
+                           student_kwargs=None):
     torch.manual_seed(13)
     dense = Qwen3_5TextModel(cfg).eval()
     dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
@@ -151,6 +152,7 @@ def _build_teacher_student(cfg, n_tracks=2, sync_block_depth=4, teacher_hook_all
         local_track_ids=tuple(range(n_tracks)),
         sync_after_layers=manifest.sync_layer_indices,
         track_group=None,
+        **(student_kwargs or {}),
     )
     student.load_track_state_dicts({i: tracks[i] for i in range(n_tracks)}, strict=False)
     student.train()
@@ -569,3 +571,137 @@ def test_total_includes_fr_term():
         + 0.7 * 0.5 * out["fr_mse"]
     )
     assert torch.allclose(out["total"], expected, atol=1e-6)
+
+
+# ----- metrics-only KL/CE gating (compute_klce_metrics) -----
+
+def test_metrics_off_skips_klce_and_teacher_lm_head():
+    """lambda_kl=lambda_ce=0 + compute_klce_metrics=False: the KL/CE pass AND
+    the teacher lm_head are skipped (zero kl/ce returned), while the block
+    losses and the accumulated grads are identical to the metrics-on step —
+    the pass was contributing nothing but logging."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+
+    def dcfg(man):
+        return DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                             lambda_kl=0.0, lambda_ce=0.0, normalize_block_mse=True)
+
+    s_on, t_on, man = _build_teacher_student(cfg)
+    s_on.zero_grad(set_to_none=True)
+    out_on = distill_step(s_on, t_on, batch, dcfg(man), student_forcing_prob=0.0,
+                          forcing_seed=(42, 0), compute_klce_metrics=True)
+    grads_on = {n: p.grad.detach().clone()
+                for n, p in s_on.named_parameters() if p.grad is not None}
+    assert out_on["kl"].item() > 0.0          # metrics still computed when requested
+
+    s_off, t_off, _ = _build_teacher_student(cfg)
+
+    class _Boom(nn.Module):
+        def forward(self, *a, **k):
+            raise AssertionError("teacher lm_head must not run with metrics off")
+
+    t_off.lm_head = _Boom()                    # observable skip of the logits matmul
+    s_off.zero_grad(set_to_none=True)
+    out_off = distill_step(s_off, t_off, batch, dcfg(man), student_forcing_prob=0.0,
+                           forcing_seed=(42, 0), compute_klce_metrics=False)
+    grads_off = {n: p.grad.detach().clone()
+                 for n, p in s_off.named_parameters() if p.grad is not None}
+
+    assert out_off["kl"].item() == 0.0 and out_off["ce"].item() == 0.0
+    assert torch.allclose(out_on["block_mse"], out_off["block_mse"], atol=1e-6)
+    assert grads_on and grads_on.keys() == grads_off.keys()
+    for n in grads_on:
+        assert torch.allclose(grads_on[n], grads_off[n], atol=1e-7), n
+
+
+def test_metrics_flag_inert_when_klce_losses_on():
+    """compute_klce_metrics gates METRICS-ONLY work: with a non-zero logit
+    lambda the KL/CE pass runs (and backwards) regardless of the flag."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+
+    def dcfg(man):
+        return DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                             lambda_kl=1.0, lambda_ce=0.5, normalize_block_mse=True)
+
+    s_a, t_a, man = _build_teacher_student(cfg)
+    out_a = distill_step(s_a, t_a, batch, dcfg(man), student_forcing_prob=0.0,
+                         forcing_seed=(42, 0), compute_klce_metrics=True)
+
+    s_b, t_b, _ = _build_teacher_student(cfg)
+    out_b = distill_step(s_b, t_b, batch, dcfg(man), student_forcing_prob=0.0,
+                         forcing_seed=(42, 0), compute_klce_metrics=False)
+    assert out_b["kl"].item() > 0.0
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.allclose(out_a[key], out_b[key], atol=1e-6), key
+
+
+def test_metrics_off_with_free_running_still_runs_full_forward():
+    """Metrics off but free-running MSE on: the full forward must still run
+    (fr needs the sync hiddens) and the fr term still backwards."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    s.zero_grad(set_to_none=True)
+    out = distill_step(
+        s, t, _batch(cfg),
+        DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                      lambda_kl=0.0, lambda_ce=0.0, normalize_block_mse=True,
+                      free_running_mse=True),
+        student_forcing_prob=0.0, forcing_seed=(42, 0),
+        free_running_scale=1.0, compute_klce_metrics=False,
+    )
+    assert out["kl"].item() == 0.0 and out["ce"].item() == 0.0
+    assert torch.isfinite(out["fr_mse"]).all() and out["fr_mse"].item() > 0.0
+    assert any(p.grad is not None and p.grad.abs().sum().item() > 0.0
+               for p in s.parameters())
+
+
+# ----- activation-checkpoint granularity (window vs layer vs off) -----
+
+def test_checkpoint_granularity_parity():
+    """Window-granular AC, per-layer AC, and no AC must produce identical losses
+    AND grads — checkpointing changes what is saved/recomputed, never the math.
+    Exercised through the full distill step (multi-layer D=4 windows, KL/CE +
+    free-running backward through the checkpointed forward)."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+
+    variants = [
+        None,                                                            # AC off
+        {"activation_checkpoint": True, "checkpoint_granularity": "layer"},
+        {"activation_checkpoint": True, "checkpoint_granularity": "window"},
+    ]
+    outs, grads = [], []
+    for student_kwargs in variants:
+        s, t, man = _build_teacher_student(cfg, sync_block_depth=4,
+                                           student_kwargs=student_kwargs)
+        dcfg = DistillConfig(
+            sync_layer_indices=tuple(man.sync_layer_indices),
+            lambda_kl=1.0, lambda_ce=0.5, normalize_block_mse=True,
+            free_running_mse=True,
+        )
+        s.zero_grad(set_to_none=True)
+        out = distill_step(s, t, batch, dcfg, student_forcing_prob=0.0,
+                           forcing_seed=(42, 0), free_running_scale=1.0)
+        outs.append(out)
+        grads.append({n: p.grad.detach().clone()
+                      for n, p in s.named_parameters() if p.grad is not None})
+
+    ref_out, ref_grads = outs[0], grads[0]
+    assert ref_grads
+    for out, g in zip(outs[1:], grads[1:]):
+        for key in ("total", "block_mse", "kl", "ce", "fr_mse"):
+            assert torch.allclose(out[key], ref_out[key], atol=1e-6), key
+        assert g.keys() == ref_grads.keys()
+        for n in ref_grads:
+            assert torch.allclose(g[n], ref_grads[n], atol=1e-6, rtol=1e-4), n
+
+
+def test_checkpoint_granularity_rejects_unknown():
+    cfg = _tiny_config()
+    import pytest
+    with pytest.raises(ValueError, match="checkpoint_granularity"):
+        _build_teacher_student(
+            cfg, student_kwargs={"checkpoint_granularity": "block"}
+        )

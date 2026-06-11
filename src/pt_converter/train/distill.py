@@ -611,6 +611,7 @@ def distill_step(
     adaptive_weights: "dict[int, float] | None" = None,
     track_layer_relmse: bool = False,
     free_running_scale: float = 1.0,
+    compute_klce_metrics: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Run one distillation step. Backward is done internally, per block.
 
@@ -647,6 +648,14 @@ def distill_step(
     free-running weight is 0 (ramp start) the term is still computed for logging
     but under ``no_grad``.
 
+    ``compute_klce_metrics=False``: when the logit losses are OFF
+    (``lambda_kl == lambda_ce == 0``) the whole KL/CE pass — the teacher
+    lm_head matmul feeding it included — is metrics-only logging. Passing
+    False skips it entirely (zero ``kl``/``ce`` returned); the caller enables
+    it only on the steps whose losses are actually printed. With either
+    lambda non-zero the pass always runs (the flag only gates metrics-only
+    work). Must be identical on every rank (it gates collectives).
+
     Returns a dict of *detached* scalar tensors for logging. The caller is
     responsible for ``sync_replicated_grads(plan)``, clip, and ``optim.step()``.
     """
@@ -657,9 +666,20 @@ def distill_step(
     attention_mask = batch.get("attention_mask")
     labels = batch["labels"]
 
+    # KL/CE work is needed when the logit losses backward (a lambda is non-zero)
+    # or when the caller wants the metrics logged this step. Both are step-level
+    # constants, identical on every rank, so the collectives they gate (teacher
+    # logit gathers, vocab-parallel softmax reduces) stay matched.
+    need_klce_grads = cfg.lambda_kl != 0.0 or cfg.lambda_ce != 0.0
+    need_klce = need_klce_grads or compute_klce_metrics
+
     # ----- Teacher forward (frozen) -----
+    # The teacher logits feed only the KL/CE pass — skip the lm_head matmul
+    # (and its gather, in batch-sharded mode) when that pass won't run.
     with _phase("teacher_fwd", timings, mem):
-        teacher_logits, teacher_hiddens = teacher.forward(input_ids, attention_mask=attention_mask)
+        teacher_logits, teacher_hiddens = teacher.forward(
+            input_ids, attention_mask=attention_mask, need_logits=need_klce,
+        )
 
     # ----- Embedding broadcast -----
     # Vocab-parallel: each rank embeds its vocab shard, summed across ranks.
@@ -705,8 +725,12 @@ def distill_step(
     # of this depends only on cfg + step-level scalars — identical on every rank.
     eff_lambda_fr = cfg.lambda_free_running * free_running_scale if cfg.free_running_mse else 0.0
     do_fr_backward = eff_lambda_fr != 0.0
-    need_klce_grads = cfg.lambda_kl != 0.0 or cfg.lambda_ce != 0.0
     fwd_needs_grad = need_klce_grads or do_fr_backward
+    # The full student forward feeds the KL/CE pass and the free-running MSE.
+    # When neither runs this step (block-only recipe, metrics not being
+    # logged), the forward itself is pure waste — skip it. Step-level
+    # constant, identical on every rank (the skipped sync all-reduces match).
+    run_full_forward = need_klce or cfg.free_running_mse
     boundaries = [e for (_, e) in ranges]
     if cfg.free_running_mse:
         fr_tap_set = set(
@@ -718,6 +742,31 @@ def distill_step(
     # Detached per-tap relative MSE signal for the adaptive-weight EMA (only when
     # requested; the loss values are unaffected either way — the signal is detached).
     layer_relmse: dict[int, torch.Tensor] = {}
+
+    def tap_loss_and_relmse(
+        h_synced: torch.Tensor, t_target: torch.Tensor
+    ) -> "tuple[torch.Tensor, torch.Tensor | None]":
+        """Per-tap (loss, detached relmse-or-None) in ONE block_mse eval where possible.
+
+        On the normalized path the unclamped relative MSE doubles as the loss
+        (clamped after — same op as clamping inside block_mse, so the loss is
+        bit-identical to the former two-call form) and, detached, as the
+        adaptive-EMA signal. Only the raw-loss + tracking combination still
+        needs a second (normalized) eval.
+        """
+        if cfg.normalize_block_mse:
+            r = block_mse(h_synced, t_target, attention_mask=attention_mask, normalize=True)
+            rel = r.detach() if track_layer_relmse else None
+            if cfg.block_mse_clamp is not None:
+                r = r.clamp(max=cfg.block_mse_clamp)
+            return r, rel
+        loss = block_mse(h_synced, t_target, attention_mask=attention_mask, normalize=False)
+        rel = (
+            block_mse(h_synced, t_target, attention_mask=attention_mask, normalize=True).detach()
+            if track_layer_relmse
+            else None
+        )
+        return loss, rel
     block_loss_val = torch.zeros((), device=input_ids.device)
     # Block 0 reads the synced student embedding (detached); subsequent blocks
     # read the teacher's post-block hidden state at the previous sync index.
@@ -761,15 +810,10 @@ def distill_step(
                             # Retain (by reference) for the free-running MSE after
                             # the block loop — extends this hidden's lifetime only.
                             fr_targets[end] = t_end
-                    win_loss = win_loss + eff_w[layer_idx] * block_mse(
-                        h_synced, t_l, attention_mask=attention_mask,
-                        normalize=cfg.normalize_block_mse,
-                        clamp_max=cfg.block_mse_clamp,
-                    )
-                    if track_layer_relmse:
-                        layer_relmse[layer_idx] = block_mse(
-                            h_synced, t_l, attention_mask=attention_mask, normalize=True,
-                        ).detach()
+                    tap_loss, tap_rel = tap_loss_and_relmse(h_synced, t_l)
+                    win_loss = win_loss + eff_w[layer_idx] * tap_loss
+                    if tap_rel is not None:
+                        layer_relmse[layer_idx] = tap_rel
                     per_track_h = new_h
                 # Average over the window so the scale (and lambda_block) matches
                 # the boundary-only path; identical to it when the window is 1 layer.
@@ -795,15 +839,10 @@ def distill_step(
                     # Retain (by reference) for the free-running MSE after the
                     # block loop — extends this hidden's lifetime only.
                     fr_targets[end] = t_end
-                block_loss_b = eff_w[end] * block_mse(
-                    h_synced, t_end, attention_mask=attention_mask,
-                    normalize=cfg.normalize_block_mse,
-                    clamp_max=cfg.block_mse_clamp,
-                )
-                if track_layer_relmse:
-                    layer_relmse[end] = block_mse(
-                        h_synced, t_end, attention_mask=attention_mask, normalize=True,
-                    ).detach()
+                tap_loss, tap_rel = tap_loss_and_relmse(h_synced, t_end)
+                block_loss_b = eff_w[end] * tap_loss
+                if tap_rel is not None:
+                    layer_relmse[end] = tap_rel
             (cfg.lambda_block * block_loss_b * loss_scale).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
             # Next block's input: teacher hidden (teacher forcing) or the
@@ -822,14 +861,16 @@ def distill_step(
     # lambda_kl / lambda_ce / the free-running term are 0) it runs under
     # no_grad: kl/ce/fr_mse are still computed for logging, but the graph —
     # and the full (previously zero-gradient) backward — are skipped entirely.
-    with _phase("student_fwd", timings, mem):
-        with torch.set_grad_enabled(fwd_needs_grad):
-            hidden, sync_hiddens = student(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_sync_hiddens=cfg.free_running_mse,
-                return_hidden_pre_lm_head=True,
-            )
+    hidden, sync_hiddens = None, None
+    if run_full_forward:
+        with _phase("student_fwd", timings, mem):
+            with torch.set_grad_enabled(fwd_needs_grad):
+                hidden, sync_hiddens = student(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_sync_hiddens=cfg.free_running_mse,
+                    return_hidden_pre_lm_head=True,
+                )
 
     # ----- Free-running feature matching -----
     # Relative-MSE the free-running forward's synced hiddens against the teacher
@@ -866,8 +907,21 @@ def distill_step(
             if do_fr_backward:
                 fr_root = fr_loss * (eff_lambda_fr * loss_scale)
 
+    # Metrics-only KL/CE (logit lambdas 0, computed just for logging) builds no
+    # graph, so smaller chunks cost almost nothing — cap at 256 to halve the
+    # fp32 (B, chunk, V/world) transients that otherwise set the klce peak.
+    # Gradient-carrying passes keep the configured chunk untouched.
+    klce_chunk = (
+        cfg.kl_ce_chunk_size if need_klce_grads else min(cfg.kl_ce_chunk_size, 256)
+    )
     grad_h = None
-    if student.vocab_parallel:
+    if not need_klce:
+        # Logit losses off AND metrics not wanted this step: the KL/CE pass —
+        # student lm_head + softmax reduces — is skipped wholesale. Zeros keep
+        # the returned dict's shape/semantics for the caller's accumulation.
+        kl_val = torch.zeros((), device=input_ids.device)
+        ce_val = torch.zeros((), device=input_ids.device)
+    elif student.vocab_parallel:
         # Vocab-parallel: EVERY rank computes its vocab shard's KL+CE and the
         # softmax normalizers are all-reduced — no rank-0 serial tail, and the
         # full-vocab fp32 expansion is sharded 1/world_size.
@@ -876,7 +930,7 @@ def distill_step(
                 hidden, student.lm_head, student.v_lo, student.v_hi,
                 teacher_logits.detach(), labels, attention_mask,
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
-                kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
+                kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 group=student.vp_group, world_size=student.vp_world_size,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
             )
@@ -887,7 +941,7 @@ def distill_step(
             kl_val, ce_val, grad_h = _kl_ce_chunked(
                 hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
-                kl_temperature=cfg.kl_temperature, chunk_size=cfg.kl_ce_chunk_size,
+                kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
             )
     else:
@@ -954,6 +1008,10 @@ def validate_step(
 
     Legacy: only the track-0 owner has lm_head and computes the metrics; peers
     return zero placeholders, so the caller aggregates with all_reduce SUM.
+
+    Always metrics-only (no graph), so the KL/CE chunk is capped at 256
+    regardless of ``chunk_size`` — halves the fp32 ``(B, chunk, V/world)``
+    transients (validation has OOM'd on them historically) at negligible cost.
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
@@ -969,7 +1027,7 @@ def validate_step(
             hidden, student.lm_head, student.v_lo, student.v_hi,
             teacher_logits.detach(), labels, attention_mask,
             lambda_kl=1.0, lambda_ce=1.0, kl_temperature=kl_temperature,
-            chunk_size=chunk_size, group=student.vp_group,
+            chunk_size=min(chunk_size, 256), group=student.vp_group,
             world_size=student.vp_world_size, compute_grads=False,
         )
         return {"ce": ce, "kl": kl}

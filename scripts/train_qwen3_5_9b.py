@@ -162,6 +162,17 @@ def main() -> int:
                         "(Legacy --no-vocab-parallel: only the lm_head-owner rank backwards, "
                         "so it helps that rank; peers pay no recompute.) Compute ↑, memory ↓ "
                         "— the lever for fitting a larger --batch-size at seq=4096 on 40 GB GPUs.")
+    p.add_argument("--checkpoint-granularity", default="window", choices=["window", "layer"],
+                   help="Activation-checkpointing granule (only with --activation-checkpoint). "
+                        "'window' (default): checkpoint each whole sync window (the D layers "
+                        "between boundaries) per track, saving only the SHARED synced window "
+                        "input — one (B,T,H) tensor per window instead of the window input "
+                        "PLUS every mid-window per-track hidden that per-layer wrapping pins "
+                        "(~5 GB less resident at n16/d2 B=5). Math is bit-identical and each "
+                        "layer is recomputed exactly once either way; a window's backward "
+                        "transiently re-materializes its D·K-layer graph. 'layer': the legacy "
+                        "per-layer wrap (smaller recompute transient, more saved tensors). "
+                        "At D=1 the two coincide.")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile each per-track decoder layer in place "
                         "(default: on; use --no-compile to disable). Inductor fusion of "
@@ -191,6 +202,18 @@ def main() -> int:
                         "(recommended). 'reduce-overhead' (CUDA graphs) is "
                         "experimental here — can conflict with activation-checkpoint "
                         "recompute and needs static memory.")
+    p.add_argument("--shard-teacher-fwd", action=argparse.BooleanOptionalAction, default=True,
+                   help="Batch-shard the frozen-teacher forward across the world (default: "
+                        "on). Every rank holds the IDENTICAL batch, so the legacy path "
+                        "computes the same full teacher forward world_size times; sharded, "
+                        "each rank forwards only ceil(B/world) rows and one all-gather per "
+                        "captured layer rebuilds the full-batch hiddens (bit-identical on "
+                        "every rank — training math unchanged). Teacher compute drops "
+                        "~world_size-fold; at seq=4096 the gathers are a small fraction of "
+                        "the saving. --no-shard-teacher-fwd restores the legacy redundant "
+                        "path (A/B / fallback). Rows pad to ceil(B/world)*world, so a B not "
+                        "divisible by world wastes the padded slots (B=5 on 8 ranks: 3 "
+                        "duplicate rows) — still ~B/world-fold cheaper.")
     p.add_argument("--compile-teacher", action=argparse.BooleanOptionalAction, default=True,
                    help="torch.compile each frozen-teacher decoder layer (in-place, before "
                         "fully_shard), inference-only. Separate from --compile so it can be "
@@ -484,10 +507,17 @@ def main() -> int:
         if args.intra_window_mse
         else manifest.sync_layer_indices
     )
+    # Batch-sharded teacher (default): each rank forwards ceil(B/world) rows and
+    # the captured hiddens are all-gathered back to the full batch on every rank
+    # — identical results, ~world_size-fold less teacher compute per rank.
+    shard_teacher = args.shard_teacher_fwd and world_size > 1
     teacher = HookedTeacher(
         text_model=text_model,
         lm_head=teacher_lm_head,
         sync_layer_indices=teacher_hook_indices,
+        shard_group=layout.track_group if shard_teacher else None,
+        shard_world_size=world_size if shard_teacher else 1,
+        shard_rank=rank,
     )
     wrap_teacher_with_fsdp(
         text_model, fsdp_lm_head,
@@ -504,6 +534,7 @@ def main() -> int:
         sync_after_layers=manifest.sync_layer_indices,
         track_group=layout.track_group,
         activation_checkpoint=args.activation_checkpoint,
+        checkpoint_granularity=args.checkpoint_granularity,
         compile_layers=args.compile,
         compile_mode=args.compile_mode,
         vocab_parallel=args.vocab_parallel,
@@ -846,6 +877,14 @@ def main() -> int:
             if (args.adaptive_layer_weight and relmse_ema)
             else None
         )
+        # With the logit losses OFF, the KL/CE pass (and the teacher logits
+        # feeding it) is metrics-only — compute it just on the steps whose
+        # losses are printed. Depends only on `step` ⇒ identical on every rank.
+        klce_metrics = (
+            args.lambda_kl != 0.0
+            or args.lambda_ce != 0.0
+            or step % args.log_every == 0
+        )
 
         # ----- Gradient accumulation: G microbatches per optimizer step -----
         # Each microbatch's losses are scaled 1/G so the grads ACCUMULATE into the
@@ -883,6 +922,7 @@ def main() -> int:
                 adaptive_weights=adaptive_weights,
                 track_layer_relmse=args.adaptive_layer_weight,
                 free_running_scale=fr_scale,
+                compute_klce_metrics=klce_metrics,
             )
             for k in loss_sums:
                 loss_sums[k] = loss_sums[k] + losses[k].detach()
@@ -933,9 +973,13 @@ def main() -> int:
 
         if args.max_grad_norm > 0:
             clip_coef = (args.max_grad_norm / (total_norm + 1e-6)).clamp(max=1.0)
-            for p in student.parameters():
-                if p.grad is not None:
-                    p.grad.mul_(clip_coef)
+            # One fused multi-tensor mul instead of ~1000 tiny per-param kernels.
+            # Same scalar applied to every grad, so it is bit-identical to the
+            # per-param loop (replicated-copy bit-equality survives unchanged).
+            torch._foreach_mul_(
+                [p.grad for p in student.parameters() if p.grad is not None],
+                clip_coef,
+            )
 
         optim.step()
         if scheduler is not None:
