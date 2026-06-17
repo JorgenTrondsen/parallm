@@ -445,6 +445,18 @@ class DistillConfig:
     # "deep-half" (the deeper half — where the free-running error concentrates;
     # halves the retained-teacher-hidden memory).
     free_running_taps: str = "all"
+    # Per-boundary gradient damping of the free-running unroll: during the FULL
+    # student forward the hidden continuing past each sync boundary is replaced
+    # by ``h.detach() + alpha*(h - h.detach())`` — forward value exactly h, but
+    # a tap j's gradient into window w is scaled alpha^(j-w). This geometrically
+    # truncates the through-depth Jacobian products whose amplification (and the
+    # gain-raising feedback they reward) makes the raw full-unroll term diverge.
+    # 1.0 = legacy full unroll; 0.0 = each tap trains only its own window on the
+    # true free-running input. The taps themselves are stored undamped. Applies
+    # only to the full forward (the block loop already detaches per boundary);
+    # the KL/CE backward shares the damped graph, so alpha<1 requires
+    # lambda_kl == lambda_ce == 0.
+    fr_grad_alpha: float = 1.0
     # Seq-chunk size for the KL+CE pass. The (B, T, V) fp32 softmax expansions
     # would OOM at training seq_len; chunking caps the per-chunk transient at
     # (chunk_size/T)x. Under vocab-parallel the expansion is per-rank only
@@ -519,26 +531,37 @@ def student_forcing_schedule(
     warmup: int,
     max_steps: int,
     shape: str = "hold",
+    power: float = 1.0,
 ) -> float:
     """Per-step student-forcing probability under one of two schedule shapes.
 
     ``shape="hold"`` (default): the legacy ramp — linear ``prob * min(1, step/warmup)``
     that reaches ``prob`` at ``warmup`` and then HOLDS there for the rest of the run
     (``warmup == 0`` ⇒ constant ``prob`` from step 0). Bit-identical to the old inline
-    computation.
+    computation. ``power`` is ignored.
 
-    ``shape="cosine-full"``: a free-running CURRICULUM — ``prob * 0.5*(1 - cos(pi *
-    step/max_steps))`` ramps 0 → ``prob`` across the WHOLE run with a cosine ease, so the
-    high-forcing regime (where deep blocks compound free-running drift) is approached
-    gently and only reached near the end. This closes the train(teacher-forced) /
-    eval(free-running) gap without the unstable long tail of holding at a high ``prob``.
-    ``warmup`` is ignored in this shape (the whole run is the ramp).
+    ``shape="cosine-full"``: a free-running CURRICULUM that ramps 0 → ``prob`` across
+    the WHOLE run with a cosine ease, so the high-forcing regime (where deep blocks
+    compound free-running drift) is approached gently and only reached near the end.
+    This closes the train(teacher-forced) / eval(free-running) gap without the unstable
+    long tail of holding at a high ``prob``. ``warmup`` is ignored in this shape (the
+    whole run is the ramp).
+
+    ``power`` (>0) sets the steepness: the per-step *gap to target*
+    ``gap = 0.5*(1 + cos(pi*frac))`` decays 1 → 0 over the run, and ``sf_p =
+    prob*(1 - gap**power)``. ``power=1`` recovers the plain cosine ``prob*0.5*(1 -
+    cos(pi*frac))`` (bit-identical); ``power>1`` closes the gap faster, reaching the
+    high-forcing regime EARLIER (steeper curriculum — useful on long runs where the
+    plain cosine only reaches high forcing near the end); ``power<1`` reaches it later.
     """
     if shape == "cosine-full":
         if max_steps <= 0:
             return prob
         frac = min(1.0, max(0.0, step / max_steps))
-        return prob * 0.5 * (1.0 - math.cos(math.pi * frac))
+        if power == 1.0:  # exact legacy expression (bit-identical default)
+            return prob * 0.5 * (1.0 - math.cos(math.pi * frac))
+        gap = 0.5 * (1.0 + math.cos(math.pi * frac))  # 1 → 0 over the run
+        return prob * (1.0 - gap ** power)
     # "hold": legacy linear-ramp-then-hold.
     if warmup > 0:
         return prob * min(1.0, step / warmup)
@@ -843,7 +866,8 @@ def distill_step(
                 block_loss_b = eff_w[end] * tap_loss
                 if tap_rel is not None:
                     layer_relmse[end] = tap_rel
-            (cfg.lambda_block * block_loss_b * loss_scale).backward()
+            if cfg.lambda_block != 0.0:
+                (cfg.lambda_block * block_loss_b * loss_scale).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
             # Next block's input: teacher hidden (teacher forcing) or the
             # student's own synced output (student forcing). Either way detach()
@@ -870,6 +894,7 @@ def distill_step(
                     attention_mask=attention_mask,
                     return_sync_hiddens=cfg.free_running_mse,
                     return_hidden_pre_lm_head=True,
+                    boundary_grad_alpha=cfg.fr_grad_alpha,
                 )
 
     # ----- Free-running feature matching -----

@@ -139,6 +139,7 @@ def fidelity_step(
     batch: dict[str, torch.Tensor],
     sync_layer_indices: Sequence[int],
     chunk_size: int = 128,
+    intra_window_taps: bool = False,
 ) -> dict[str, torch.Tensor]:
     """One eval batch worth of teacher-vs-student metrics.
 
@@ -151,6 +152,12 @@ def fidelity_step(
     names in ``_LOGIT_METRIC_NAMES``. Peer ranks (without ``lm_head``) emit
     zero placeholders so the caller can ``all_reduce(SUM)`` uniformly across
     the world.
+
+    With ``intra_window_taps`` the student also emits loss-only synced
+    reconstructions at the non-boundary depths (the forward keeps feeding each
+    track its partial residual — same semantics as training's
+    ``--intra-window-mse``); pass every layer index the teacher was hooked at
+    via ``sync_layer_indices`` to get a block-MSE row per layer.
     """
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
@@ -163,6 +170,7 @@ def fidelity_step(
         input_ids=input_ids,
         attention_mask=attention_mask,
         return_sync_hiddens=True,
+        return_intra_window_hiddens=intra_window_taps,
     )
 
     device = input_ids.device

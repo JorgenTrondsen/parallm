@@ -81,6 +81,79 @@ def test_k2_local_only_forward_is_finite_and_matches_manual_sync():
         assert torch.isfinite(h).all()
 
 
+def test_k2_intra_window_taps_observe_without_perturbing():
+    """Mid-window taps add loss-only reconstructions at every non-boundary layer
+    and must leave the carried state (boundary hiddens, logits) bit-identical."""
+    cfg = _tiny_config()
+    n_tracks = 2
+
+    torch.manual_seed(13)
+    dense = Qwen3_5TextModel(cfg).eval()
+    dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    nn.init.normal_(dense.lm_head.weight, mean=0.0, std=0.02)
+
+    tracks, manifest = slice_model_to_tracks(
+        dense, n_tracks=n_tracks, sync_block_depth=4, text_config_attr="config"
+    )
+    pt = PTWrappedModel(
+        text_config=cfg,
+        n_tracks=n_tracks,
+        local_track_ids=(0, 1),
+        sync_after_layers=manifest.sync_layer_indices,
+        track_group=None,
+    ).eval()
+    pt.load_track_state_dicts({0: tracks[0], 1: tracks[1]}, strict=False)
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 16))
+    attention_mask = torch.ones((1, 16), dtype=torch.long)
+
+    with torch.no_grad():
+        base_logits, base_hiddens = pt(
+            input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=True
+        )
+        tap_logits, tap_hiddens = pt(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_sync_hiddens=True,
+            return_intra_window_hiddens=True,
+        )
+
+    # Every layer is reported: boundaries carry state, the rest are loss-only taps.
+    assert set(tap_hiddens.keys()) == set(range(cfg.num_hidden_layers))
+    for h in tap_hiddens.values():
+        assert h.shape == (1, 16, cfg.hidden_size)
+        assert torch.isfinite(h).all()
+    # Observation must not perturb the forward.
+    assert torch.equal(base_logits, tap_logits)
+    for idx in manifest.sync_layer_indices:
+        assert torch.equal(base_hiddens[idx], tap_hiddens[idx])
+
+
+def test_k2_intra_window_taps_reject_window_checkpointing():
+    """The 'window' checkpoint granule hides per-layer state — taps must refuse."""
+    cfg = _tiny_config()
+    pt = PTWrappedModel(
+        text_config=cfg,
+        n_tracks=4,
+        local_track_ids=(0, 1),
+        sync_after_layers=[3, 7],
+        track_group=None,
+        activation_checkpoint=True,
+        checkpoint_granularity="window",
+    ).train()
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    attention_mask = torch.ones((1, 8), dtype=torch.long)
+    try:
+        pt(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_intra_window_hiddens=True,
+        )
+        assert False, "expected RuntimeError for taps under window checkpointing"
+    except RuntimeError as e:
+        assert "per-layer" in str(e)
+
+
 def test_k2_peer_rank_returns_no_logits():
     """A rank that does NOT own track 0 should have lm_head=None and emit logits=None."""
     cfg = _tiny_config()

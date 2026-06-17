@@ -93,6 +93,13 @@ def main() -> int:
     p.add_argument("--chunk-size", type=int, default=128,
                    help="Seq-chunk size for the vocab-wide fp32 expansion; matches "
                         "--kl-ce-chunk-size in training.")
+    p.add_argument("--intra-window-taps", action="store_true",
+                   help="Also report block_mse/relmse at EVERY layer, not just the sync "
+                        "boundaries. Mid-window rows are loss-only synced reconstructions "
+                        "(the forward keeps feeding each track its PARTIAL residual — same "
+                        "semantics as training's --intra-window-mse), so they localize where "
+                        "inside a window the free-running error grows at D>=2. Hooks the "
+                        "teacher at every layer and adds one all-reduce per mid-window layer.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -130,10 +137,17 @@ def main() -> int:
         if hasattr(teacher_model.model, "language_model")
         else teacher_model.model
     )
+    # Mid-window taps need a teacher hidden at EVERY layer (same pattern as the
+    # train script's --intra-window-mse); otherwise hook only the boundaries.
+    metric_indices = (
+        list(range(manifest.num_layers))
+        if args.intra_window_taps
+        else list(manifest.sync_layer_indices)
+    )
     teacher = HookedTeacher(
         text_model=text_model,
         lm_head=teacher_model.lm_head,
-        sync_layer_indices=manifest.sync_layer_indices,
+        sync_layer_indices=metric_indices,
     )
     teacher_model = teacher_model.to(torch.cuda.current_device())
     wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
@@ -182,7 +196,7 @@ def main() -> int:
     ds = PackedTokenStream(tok, data_cfg)
     loader = DataLoader(ds, batch_size=args.batch_size, num_workers=0)
 
-    sync_indices = tuple(manifest.sync_layer_indices)
+    sync_indices = tuple(metric_indices)
     sums: dict[str, torch.Tensor] = {}
     n_batches = 0
     for batch in loader:
@@ -191,7 +205,8 @@ def main() -> int:
         batch = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in batch.items()}
         if batch["input_ids"].ndim == 1:
             batch = {k: v.unsqueeze(0) for k, v in batch.items()}
-        m = fidelity_step(student, teacher, batch, sync_indices, args.chunk_size)
+        m = fidelity_step(student, teacher, batch, sync_indices, args.chunk_size,
+                          intra_window_taps=args.intra_window_taps)
         for name, val in m.items():
             if name not in sums:
                 sums[name] = torch.zeros((), device=val.device, dtype=torch.float32)
@@ -222,11 +237,18 @@ def main() -> int:
         print(f"  top1_agree   = {sums['top1_agree'].item():.4f}")
         print(f"  top5_agree   = {sums['top5_agree'].item():.4f}  (teacher top-1 ∈ student top-5)")
         print(f"  top5_set_iou = {sums['top5_set_iou'].item():.4f}")
-        print(f"  per-sync-boundary block_mse (raw | rel=Σ(s−t)²/Σt²):")
+        boundary_set = set(manifest.sync_layer_indices)
+        label = "per-layer" if args.intra_window_taps else "per-sync-boundary"
+        print(f"  {label} block_mse (raw | rel=Σ(s−t)²/Σt²):")
         for layer_idx in sync_indices:
             raw = sums[f"block_mse_l{layer_idx}"].item()
             rel = sums[f"block_relmse_l{layer_idx}"].item()
-            print(f"    layer {layer_idx:3d}: raw={raw:.6e}  rel={rel:.6e}")
+            # "(mid)" rows are loss-only reconstructions at non-boundary depths,
+            # not state the forward carries.
+            tag = ""
+            if args.intra_window_taps:
+                tag = "      " if layer_idx in boundary_set else " (mid)"
+            print(f"    layer {layer_idx:3d}{tag}: raw={raw:.6e}  rel={rel:.6e}")
         print()
 
     teacher.remove_hooks()

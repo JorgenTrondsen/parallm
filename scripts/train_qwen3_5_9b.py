@@ -39,6 +39,7 @@ import argparse
 import math
 import os
 import random
+import re
 import shutil
 import time
 from dataclasses import replace
@@ -66,6 +67,7 @@ from pt_converter.train.data import (
 )
 from pt_converter.train.distill import (
     DistillConfig,
+    _block_ranges,
     adaptive_weights_from_relmse,
     distill_step,
     student_forcing_schedule,
@@ -91,6 +93,99 @@ from pt_converter.utils.mem_report import (
 def _log(rank: int, msg: str):
     if rank == 0:
         print(msg, flush=True)
+
+
+PROBE_ALPHAS = (1.0, 0.5, 0.25, 0.0)
+
+
+def run_fr_grad_probe(student, teacher, loader, distill_cfg, manifest, args, rank):
+    """Per-window grad-norm probe of the free-running MSE term (--fr-grad-probe).
+
+    Quantifies the unrolled-gradient amplification behind the fr divergence: the
+    SAME N microbatches run through an fr-ONLY distill_step (lambda_block/kl/ce
+    forced to 0 — the block loop still runs, since it harvests the fr teacher
+    targets, but backwards nothing) at each alpha in PROBE_ALPHAS, and the
+    resulting per-window parameter grad L2 norms are tabulated. At alpha=1.0
+    (legacy full unroll) shallow windows receive deep-tap gradients amplified by
+    the product of downstream window Jacobians; damping flattens the profile
+    geometrically (~alpha^k per crossing). Replicated norm copies are counted
+    once per track on every rank — identically at every alpha, so cross-alpha
+    ratios are exact. The per-alpha mean fr_mse footer must be IDENTICAL across
+    alphas: the damping is value-exact, so this doubles as a forward-equality
+    check in the production dtype.
+    """
+    n_batches = args.fr_grad_probe
+    device = torch.cuda.current_device()
+    data_iter = iter(loader)
+    batches = []
+    for _ in range(n_batches):
+        b = next(data_iter)
+        b = {k: v.to(device, non_blocking=True) for k, v in b.items()}
+        if b["input_ids"].ndim == 1:
+            b = {k: v.unsqueeze(0) for k, v in b.items()}
+        batches.append(b)
+
+    # Param-name → group index: windows by layer id, then embed / lm_head;
+    # whatever remains (per-track final norm) lands in the trailing bucket.
+    windows = _block_ranges(manifest.num_layers, tuple(manifest.sync_layer_indices))
+    win_of_layer = {l: w for w, (s, e) in enumerate(windows) for l in range(s, e + 1)}
+    layer_re = re.compile(r"\.layers\.(\d+)\.")
+    group_names = [f"w{w:<2d} L{s}-{e}" for w, (s, e) in enumerate(windows)]
+    group_names += ["embed", "lm_head", "final_norm"]
+    n_groups = len(group_names)
+
+    def group_of(name: str) -> int:
+        m = layer_re.search(name)
+        if m:
+            return win_of_layer[int(m.group(1))]
+        if "embed" in name:           # embed_tokens / vp_embed
+            return n_groups - 3
+        if "lm_head" in name:
+            return n_groups - 2
+        return n_groups - 1           # per-track final norm (+ any stragglers)
+
+    probe_cfg = replace(
+        distill_cfg,
+        lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0,
+        free_running_mse=True, lambda_free_running=1.0,
+    )
+    norms: dict[float, torch.Tensor] = {}
+    fr_means: dict[float, float] = {}
+    student.train()
+    for alpha in PROBE_ALPHAS:
+        student.zero_grad(set_to_none=True)
+        cfg_a = replace(probe_cfg, fr_grad_alpha=alpha)
+        fr_sum = 0.0
+        for i, b in enumerate(batches):
+            losses = distill_step(
+                student, teacher, b, cfg_a,
+                student_forcing_prob=0.0,
+                forcing_seed=(args.seed, 0, i),
+                loss_scale=1.0 / n_batches,
+                compute_klce_metrics=False,
+            )
+            fr_sum += losses["fr_mse"].item()
+        sq = torch.zeros(n_groups, device=device, dtype=torch.float64)
+        for name, p in student.named_parameters():
+            if p.grad is not None:
+                sq[group_of(name)] += p.grad.detach().double().pow(2).sum()
+        dist.all_reduce(sq, op=dist.ReduceOp.SUM)
+        norms[alpha] = sq.sqrt()
+        fr_means[alpha] = fr_sum / n_batches
+        _log(rank, f"[fr-probe] alpha={alpha:g} done (mean fr_mse={fr_means[alpha]:.6f})")
+    student.zero_grad(set_to_none=True)
+
+    if rank == 0:
+        header = "  ".join(f"a={a:<8g}" for a in PROBE_ALPHAS)
+        print(f"[fr-probe] fr-only grad L2 norm per window over {n_batches} "
+              f"microbatch(es), taps={probe_cfg.free_running_taps}", flush=True)
+        print(f"[fr-probe] {'group':12s} {header}", flush=True)
+        for gi, gname in enumerate(group_names):
+            vals = "  ".join(f"{norms[a][gi].item():10.3e}" for a in PROBE_ALPHAS)
+            print(f"[fr-probe] {gname:12s} {vals}", flush=True)
+        footer = ", ".join(f"a={a:g}: {fr_means[a]:.6f}" for a in PROBE_ALPHAS)
+        print(f"[fr-probe] mean fr_mse per alpha (must be identical — damping is "
+              f"value-exact): {footer}", flush=True)
 
 
 def main() -> int:
@@ -226,6 +321,10 @@ def main() -> int:
                         "~52 GB at n=16). 0 disables it; use --eval-every to drive best/ saves instead.")
     p.add_argument("--save-final", action="store_true",
                    help="Write final/ when training exits (loop done or early-stopped).")
+    p.add_argument("--best-name", default="best",
+                   help="Directory name (under --out-dir) for the best-val_kl checkpoint. "
+                        "Default 'best'. Set e.g. 'best_fr' on a warm-start finishing run "
+                        "so its improvements don't overwrite the checkpoint it resumed from.")
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--profile", action="store_true",
                    help="Per-phase CUDA-synced wall-clock breakdown of each distill "
@@ -284,6 +383,14 @@ def main() -> int:
                         "without the unstable long tail of holding at a high prob. Recommended "
                         "with --student-forcing-prob ~0.9 (--student-forcing-warmup is ignored "
                         "in this shape).")
+    p.add_argument("--student-forcing-power", type=float, default=1.0,
+                   help="Steepness of the 'cosine-full' curriculum (ignored for 'hold'; must be "
+                        "> 0). The gap-to-target 0.5*(1+cos(pi*frac)) is raised to this power and "
+                        "sf_p = prob*(1 - gap**power): 1.0 (default) is the plain cosine ramp "
+                        "(bit-identical to the legacy schedule); >1 closes the gap faster, "
+                        "reaching the high-forcing regime EARLIER (the lever on long runs, where "
+                        "the plain cosine only reaches high forcing near the end — e.g. at 25%% of "
+                        "the run power=3 gives sf_p≈0.34*prob vs 0.15*prob); <1 reaches it later.")
     p.add_argument("--normalize-block-mse", action=argparse.BooleanOptionalAction, default=False,
                    help="Relative (scale-free) block MSE Σ(s−t)²/Σt² per block instead of the "
                         "raw masked mean. The residual-stream norm grows with depth, so the raw "
@@ -336,6 +443,29 @@ def main() -> int:
                    help="Which sync boundaries the free-running MSE supervises. 'deep-half': "
                         "only the deeper half — where the free-running error concentrates — "
                         "halving the retained-teacher-hidden memory.")
+    p.add_argument("--fr-grad-alpha", type=float, default=1.0,
+                   help="Per-boundary gradient damping of the free-running unroll. During "
+                        "the full student forward, the hidden continuing past each sync "
+                        "boundary becomes h.detach() + alpha*(h - h.detach()): forward value "
+                        "EXACTLY unchanged, gradient across the boundary scaled by alpha, so "
+                        "a tap j's gradient into window w shrinks alpha^(j-w). This bounds "
+                        "the through-depth Jacobian-product amplification (and the gain-"
+                        "raising feedback it rewards) that makes the raw full-unroll term "
+                        "diverge (grad-norm creep -> val_kl regression). 1.0 (default) = "
+                        "legacy full unroll; 0.0 = hard truncation (each tap trains only its "
+                        "own window on the true free-running input — exact DAgger-style "
+                        "supervision); ~0.5 keeps short-range cross-window coordination. "
+                        "alpha<1 requires --lambda-kl 0 --lambda-ce 0 (the KL/CE backward "
+                        "shares the damped graph).")
+    p.add_argument("--fr-grad-probe", type=int, default=0, metavar="N",
+                   help=">0: instead of training, run the free-running gradient probe after "
+                        "init — the SAME N microbatches through an fr-only distill_step at "
+                        "each alpha in {1.0, 0.5, 0.25, 0.0}, reporting per-window parameter "
+                        "grad norms (rank-0 table) — then exit. Shows the unrolled-gradient "
+                        "amplification directly: at alpha=1 the shallow windows' fr-grad "
+                        "norms are inflated by the downstream Jacobian products; damping "
+                        "flattens the profile geometrically. The printed per-alpha mean "
+                        "fr_mse must be IDENTICAL across alphas (the damping is value-exact).")
     p.add_argument("--adaptive-layer-weight", action=argparse.BooleanOptionalAction, default=False,
                    help="Adaptively weight each supervised tap's block-MSE by its OWN running "
                         "relative error. A per-tap EMA of the relative MSE Σ(s−t)²/Σt² is "
@@ -381,6 +511,13 @@ def main() -> int:
                         "default produced grad-norm spikes / wasted clipped steps.")
     p.add_argument("--lr-min-ratio", type=float, default=0.1,
                    help="Cosine decay floor as a fraction of --lr (only used with --cosine-decay).")
+    p.add_argument("--lr-decay-power", type=float, default=1.0,
+                   help="Steepness of the LR cosine decay (only used with --cosine-decay; must "
+                        "be > 0). The decaying term 0.5*(1+cos(pi*progress)) is raised to this "
+                        "power: 1.0 (default) is the plain cosine (bit-identical to the legacy "
+                        "schedule); >1 drops the LR faster EARLY then flattens onto the floor "
+                        "sooner (e.g. power=3 reaches the floor by ~70%% of the run); <1 decays "
+                        "more gently. Same min_ratio floor at the end regardless of power.")
     p.add_argument("--seed", type=int, default=42,
                    help="Seed for torch / cuda / python / numpy RNGs. Same on every rank "
                         "(no per-rank randomness in this pipeline). Restored from a "
@@ -389,6 +526,13 @@ def main() -> int:
     # --profile-trace implies the phase timers; the trace is an add-on.
     if args.profile_trace:
         args.profile = True
+    if args.fr_grad_alpha != 1.0:
+        if not (0.0 <= args.fr_grad_alpha <= 1.0):
+            p.error("--fr-grad-alpha must be in [0, 1]")
+        if args.lambda_kl != 0.0 or args.lambda_ce != 0.0:
+            p.error("--fr-grad-alpha < 1.0 damps every gradient through the full student "
+                    "forward; the KL/CE backward shares that graph and would be silently "
+                    "damped too. Run with --lambda-kl 0 --lambda-ce 0.")
 
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
@@ -660,6 +804,7 @@ def main() -> int:
         total = args.max_steps
         min_ratio = args.lr_min_ratio
         cosine = args.cosine_decay
+        power = args.lr_decay_power
 
         def lr_lambda(s: int) -> float:
             if warmup > 0 and s < warmup:
@@ -668,7 +813,10 @@ def main() -> int:
                 return 1.0
             progress = (s - warmup) / max(1, total - warmup)
             progress = min(max(progress, 0.0), 1.0)
-            return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+            if power == 1.0:  # exact legacy expression (bit-identical default)
+                return min_ratio + (1 - min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+            cos_term = 0.5 * (1 + math.cos(math.pi * progress))  # 1 → 0 over the run
+            return min_ratio + (1 - min_ratio) * (cos_term ** power)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
@@ -693,7 +841,16 @@ def main() -> int:
         free_running_mse=args.free_running_mse,
         lambda_free_running=args.lambda_free_running,
         free_running_taps=args.free_running_taps,
+        fr_grad_alpha=args.fr_grad_alpha,
     )
+
+    # ----- Free-running gradient probe (diagnose-then-exit mode) -----
+    if args.fr_grad_probe > 0:
+        run_fr_grad_probe(student, teacher, loader, distill_cfg, manifest, args, rank)
+        teacher.remove_hooks()
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -861,6 +1018,7 @@ def main() -> int:
         sf_p = student_forcing_schedule(
             step, args.student_forcing_prob, args.student_forcing_warmup,
             args.max_steps, args.student_forcing_schedule,
+            power=args.student_forcing_power,
         )
         # Free-running feature-matching scale for this step ('constant' reuses the
         # warmup-0 "hold" shape ⇒ 1.0 every step). Depends only on `step`, so it
@@ -1058,7 +1216,7 @@ def main() -> int:
                     rank,
                     f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f} (new best)",
                 )
-                save_checkpoint("best")
+                save_checkpoint(args.best_name)
             else:
                 windows_since_best += 1
                 _log(

@@ -273,6 +273,8 @@ class PTWrappedModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         return_sync_hiddens: bool = False,
         return_hidden_pre_lm_head: bool = False,
+        return_intra_window_hiddens: bool = False,
+        boundary_grad_alpha: float = 1.0,
     ):
         # Local import: keeps the engine model-family-agnostic at import time.
         from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
@@ -306,10 +308,20 @@ class PTWrappedModel(nn.Module):
         # identical to the legacy per-layer loop (every sync index ends a window).
         block_start = h
         sync_set = set(self.sync_after_layers)
-        sync_hiddens: dict[int, torch.Tensor] = {} if return_sync_hiddens else None
+        sync_hiddens: dict[int, torch.Tensor] = (
+            {} if (return_sync_hiddens or return_intra_window_hiddens) else None
+        )
         per_track_h = [block_start for _ in self.text_models]
         use_ckpt = self._use_checkpoint and torch.is_grad_enabled()
         window_ckpt = use_ckpt and self._ckpt_granularity == "window"
+        # Mid-window taps need per-layer access; the "window" checkpoint granule
+        # hides the layers inside one closure. Eval (no_grad ⇒ use_ckpt False)
+        # always takes the per-layer path, so this only trips a training caller.
+        if return_intra_window_hiddens and window_ckpt:
+            raise RuntimeError(
+                "return_intra_window_hiddens requires the per-layer forward path "
+                "(use checkpoint_granularity='layer' or disable activation checkpointing)"
+            )
         for start, end in self._window_ranges:
             if window_ckpt:
                 per_track_h = [
@@ -354,12 +366,33 @@ class PTWrappedModel(nn.Module):
                             )
                         new_h.append(out)
                     per_track_h = new_h
+                    if return_intra_window_hiddens and layer_idx not in sync_set:
+                        # Loss-only synced reconstruction at a mid-window depth
+                        # (same semantics as training's --intra-window-mse): the
+                        # forward keeps feeding each track its PARTIAL hidden —
+                        # this tap is observational and never carries forward.
+                        sync_hiddens[layer_idx] = self.sync_module(per_track_h, block_start)
             if end in sync_set:
                 h = self.sync_module(per_track_h, block_start)
+                if sync_hiddens is not None:
+                    # Tap stored UNDAMPED: each tap's gradient into its own
+                    # window keeps full strength; only the cross-boundary
+                    # continuation below is attenuated.
+                    sync_hiddens[end] = h
+                if boundary_grad_alpha != 1.0 and torch.is_grad_enabled():
+                    # Boundary gradient damping for the free-running MSE term:
+                    # forward value is EXACTLY h (h - h.detach() == 0), but the
+                    # gradient flowing back across this boundary is scaled by
+                    # alpha — a tap j's gradient into window w shrinks by
+                    # alpha^(j-w), bounding the unrolled-Jacobian amplification
+                    # that makes the full-unroll term diverge. alpha=0 hard-
+                    # truncates: each tap trains only its own window on the
+                    # true free-running input. The KL/CE backward shares this
+                    # graph, so alpha<1 requires lambda_kl == lambda_ce == 0
+                    # (enforced by the train script).
+                    h = h.detach() + boundary_grad_alpha * (h - h.detach())
                 block_start = h
                 per_track_h = [h for _ in self.text_models]
-                if sync_hiddens is not None:
-                    sync_hiddens[end] = h
 
         h = tm0.norm(h)
         # The caller may want the post-norm hidden state instead of logits so

@@ -313,6 +313,33 @@ def test_student_forcing_schedule_cosine_full_curriculum():
             == student_forcing_schedule(400, prob, 999, max_steps, "cosine-full"))
 
 
+def test_student_forcing_schedule_cosine_full_power():
+    """`power` steepens the cosine-full curriculum; power=1 is bit-identical."""
+    import math
+    prob, max_steps = 0.9, 8000
+    interior = list(range(100, max_steps, 100))
+    # power=1.0 exactly reproduces the plain cosine ramp (backward compatible).
+    for s in interior:
+        legacy = prob * 0.5 * (1.0 - math.cos(math.pi * (s / max_steps)))
+        assert student_forcing_schedule(s, prob, 0, max_steps, "cosine-full", power=1.0) == legacy
+    # power>1 reaches the high-forcing regime EARLIER: strictly larger at every
+    # interior step, still monotone and bounded by prob, and still 0 / prob at the ends.
+    steep = [student_forcing_schedule(s, prob, 0, max_steps, "cosine-full", power=3.0)
+             for s in interior]
+    base = [student_forcing_schedule(s, prob, 0, max_steps, "cosine-full", power=1.0)
+            for s in interior]
+    assert all(st > b for st, b in zip(steep, base))
+    assert all(steep[i] < steep[i + 1] for i in range(len(steep) - 1))
+    assert all(0.0 <= v <= prob + 1e-9 for v in steep)
+    assert student_forcing_schedule(0, prob, 0, max_steps, "cosine-full", power=3.0) == 0.0
+    assert abs(student_forcing_schedule(max_steps, prob, 0, max_steps, "cosine-full", power=3.0)
+               - prob) < 1e-9
+    # power<1 reaches it later: strictly smaller at every interior step.
+    gentle = [student_forcing_schedule(s, prob, 0, max_steps, "cosine-full", power=0.5)
+              for s in interior]
+    assert all(g < b for g, b in zip(gentle, base))
+
+
 # ----- B: gradient-accumulation loss_scale -----
 
 def test_loss_scale_halves_grads_not_losses():
