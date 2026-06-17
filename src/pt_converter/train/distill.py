@@ -88,13 +88,15 @@ def _kl_ce_chunked(
     *,
     lambda_kl: float,
     lambda_ce: float,
+    lambda_logit_mse: float = 0.0,
     kl_temperature: float,
     chunk_size: int,
     loss_scale: float = 1.0,
     compute_grads: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Compute lambda_kl * KL + lambda_ce * CE in seq-chunks; return the
-    accumulated gradient w.r.t. ``hidden`` for the caller to backward.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Compute lambda_kl * KL + lambda_ce * CE (+ lambda_logit_mse * centered
+    logit-MSE) in seq-chunks; return the accumulated gradient w.r.t. ``hidden``
+    for the caller to backward.
 
     ``loss_scale`` (gradient-accumulation: 1/grad_accum_steps) multiplies the
     accumulated gradients only — the returned KL/CE scalars stay UNSCALED so
@@ -126,7 +128,7 @@ def _kl_ce_chunked(
         ``retain_graph`` is needed anywhere, and no full-T logits tensor is
         ever materialized.
 
-    Returns ``(kl_detached, ce_detached, grad_h_or_None)``. lm_head's own
+    Returns ``(kl_detached, ce_detached, logit_mse_detached, grad_h_or_None)``. lm_head's own
     ``.grad`` is accumulated in place here. With ``compute_grads=False`` the
     chunk loop runs under ``no_grad`` (metrics only — kl/ce logging without
     building or backwarding any graph) and ``grad_h`` is ``None``.
@@ -162,6 +164,7 @@ def _kl_ce_chunked(
 
     kl_acc = hidden.new_zeros((), dtype=torch.float32)
     ce_acc = hidden.new_zeros((), dtype=torch.float32)
+    lm_acc = hidden.new_zeros((), dtype=torch.float32)
 
     with torch.set_grad_enabled(compute_grads):
         for t0 in range(0, T, chunk_size):
@@ -194,8 +197,25 @@ def _kl_ce_chunked(
                 ce_sum = hidden.new_zeros((), dtype=torch.float32)
             ce_chunk = ce_sum / ce_denom
 
+            # Centered logit-MSE: mean_v((d − d̄)²) per token, masked-mean over
+            # tokens (same kl_denom). Computed only when weighted — the fp32
+            # (B, chunk, V) diff is otherwise pure waste on this legacy path.
+            if lambda_logit_mse != 0.0:
+                d = s_chunk.float() - t_chunk.float()
+                d = d - d.mean(dim=-1, keepdim=True)
+                per_token_lm = d.pow(2).mean(dim=-1)
+                if attention_mask is not None:
+                    per_token_lm = per_token_lm * attention_mask[:, t0:t1]
+                lm_chunk = per_token_lm.sum() / kl_denom
+            else:
+                lm_chunk = hidden.new_zeros((), dtype=torch.float32)
+
             if compute_grads:
-                chunk_loss = lambda_kl * kl_chunk + lambda_ce * ce_chunk
+                chunk_loss = (
+                    lambda_kl * kl_chunk
+                    + lambda_ce * ce_chunk
+                    + lambda_logit_mse * lm_chunk
+                )
                 grads = torch.autograd.grad(
                     chunk_loss, [h_anchor, *lm_head_params], retain_graph=False
                 )
@@ -204,12 +224,13 @@ def _kl_ce_chunked(
                     p.grad.add_(g * loss_scale)
             kl_acc = kl_acc + kl_chunk.detach()
             ce_acc = ce_acc + ce_chunk.detach()
+            lm_acc = lm_acc + lm_chunk.detach()
 
     # The caller backwards grad_h_accum into the (bf16) student forward graph
     # (one traversal, combinable with other graph-rooted losses). lm_head's
     # grads are already populated above and are NOT touched there (hidden's
     # graph ends at the post-norm hidden state, before lm_head).
-    return kl_acc, ce_acc, grad_h_accum
+    return kl_acc, ce_acc, lm_acc, grad_h_accum
 
 
 def _vp_all_reduce(t: torch.Tensor, op, group, world_size: int) -> None:
@@ -237,7 +258,7 @@ class _VocabParallelKLCE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, s_local, t_local, ce_target, ce_valid, kl_mask, cfg):
-        T, lam_kl, lam_ce, kl_denom, ce_denom, group, ws = cfg
+        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V, group, ws = cfg
         s = s_local.float()
         t = t_local.float()
         s_kl = s / T
@@ -272,8 +293,18 @@ class _VocabParallelKLCE(torch.autograd.Function):
         sel_idx = ce_target.clamp(min=0).unsqueeze(-1)
         ce_sel = s.gather(-1, sel_idx).squeeze(-1) * valid_in_shard.to(s.dtype)
 
-        # 3) vocab-summed cross terms (one SUM all-reduce over [B, A, ce_sel]).
-        crosses = torch.stack([B_term, A_term, ce_sel], dim=0)
+        # Centered logit-MSE shard partials (raw logits): d = s − t over the full
+        # vocab. Σ_shard d and Σ_shard d² ride the same SUM all-reduce as the cross
+        # terms, so the per-token mean(d²) and mean(d) form with no extra collective.
+        do_lm = lam_lm != 0.0
+        if do_lm:
+            d = s - t
+            cross_rows = [B_term, A_term, ce_sel, d.sum(-1), (d * d).sum(-1)]
+        else:
+            cross_rows = [B_term, A_term, ce_sel]
+
+        # 3) vocab-summed cross terms (one SUM all-reduce).
+        crosses = torch.stack(cross_rows, dim=0)
         _vp_all_reduce(crosses, dist.ReduceOp.SUM, group, ws)
         B_full, A_full, ce_sel_full = crosses[0], crosses[1], crosses[2]
 
@@ -284,15 +315,31 @@ class _VocabParallelKLCE(torch.autograd.Function):
         per_pos_ce = (glse_s_ce - ce_sel_full) * ce_valid.to(glse_s_ce.dtype)
         ce_val = per_pos_ce.sum() / ce_denom
 
-        loss = lam_kl * kl_val + lam_ce * ce_val
-        ctx.save_for_backward(p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask)
-        ctx.consts = (T, lam_kl, lam_ce, kl_denom, ce_denom)
-        return loss, kl_val.detach(), ce_val.detach()
+        # Centered logit-MSE per token = mean_v(d²) − d̄², masked-mean over tokens
+        # (same kl_denom). softmax shift-invariance ⇒ the per-token mean d̄ is a free
+        # direction, removed here. Backward needs d and d̄ (both shard-local).
+        if do_lm:
+            d_bar = crosses[3] / V                         # (B, c) full-vocab mean of d
+            per_tok_lm = (crosses[4] / V - d_bar * d_bar) * kl_mask
+            lm_val = per_tok_lm.sum() / kl_denom
+            d_save, dbar_save = d, d_bar
+        else:
+            lm_val = kl_val.new_zeros(())
+            d_save = s.new_zeros(0)
+            dbar_save = s.new_zeros(0)
+
+        loss = lam_kl * kl_val + lam_ce * ce_val + lam_lm * lm_val
+        ctx.save_for_backward(
+            p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask, d_save, dbar_save
+        )
+        ctx.consts = (T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V)
+        return loss, kl_val.detach(), ce_val.detach(), lm_val.detach()
 
     @staticmethod
-    def backward(ctx, grad_loss, grad_kl, grad_ce):
-        p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask = ctx.saved_tensors
-        T, lam_kl, lam_ce, kl_denom, ce_denom = ctx.consts
+    def backward(ctx, grad_loss, grad_kl, grad_ce, grad_lm):
+        (p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask,
+         d_save, dbar_save) = ctx.saved_tensors
+        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V = ctx.consts
         # KL grad: ∂kl/∂s = (T/kl_denom)·mask·(p_s − p_t)  (after the ×T² factor).
         g_kl = lam_kl * (T / kl_denom) * kl_mask.unsqueeze(-1) * (p_s_kl - p_t_kl)
         # CE grad: ∂ce/∂s = (1/ce_denom)·valid·(p_s − onehot(label)).
@@ -301,7 +348,15 @@ class _VocabParallelKLCE(torch.autograd.Function):
         onehot.scatter_(-1, ce_target.clamp(min=0).unsqueeze(-1),
                         valid_in_shard.unsqueeze(-1).to(p_s_ce.dtype))
         g_ce = lam_ce / ce_denom * ce_valid.unsqueeze(-1).to(p_s_ce.dtype) * (p_s_ce - onehot)
-        grad_s = (g_kl + g_ce) * grad_loss
+        grad_s = g_kl + g_ce
+        # Centered logit-MSE grad: ∂lm/∂s_v = (2/(V·kl_denom))·mask·(d_v − d̄). Local
+        # (d̄ is the saved per-token scalar) — no collective in backward.
+        if lam_lm != 0.0:
+            g_lm = (lam_lm * (2.0 / (V * kl_denom))) * kl_mask.unsqueeze(-1) * (
+                d_save - dbar_save.unsqueeze(-1)
+            )
+            grad_s = grad_s + g_lm
+        grad_s = grad_s * grad_loss
         return grad_s, None, None, None, None, None
 
 
@@ -316,14 +371,17 @@ def _kl_ce_vocab_parallel(
     *,
     lambda_kl: float,
     lambda_ce: float,
+    lambda_logit_mse: float = 0.0,
+    vocab_size: int | None = None,
     kl_temperature: float,
     chunk_size: int,
     group,
     world_size: int,
     compute_grads: bool = True,
     loss_scale: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Vocab-parallel KL+CE: runs on EVERY rank, each owning vocab rows [v_lo, v_hi).
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Vocab-parallel KL+CE (+ centered logit-MSE): runs on EVERY rank, each owning
+    vocab rows [v_lo, v_hi).
 
     Mirrors ``_kl_ce_chunked`` (seq-chunked lm_head, grad-w.r.t.-hidden returned
     for the caller to backward, lm_head grads accumulated in place) but the
@@ -331,7 +389,7 @@ def _kl_ce_vocab_parallel(
     ``teacher_logits`` is already this rank's ``(B, T, Vs)`` teacher vocab shard
     (the teacher's lm_head is itself vocab-row-sharded), so the teacher's full
     ``(B,c,V)`` fp32 expansion is avoided entirely. Returns
-    ``(kl_detached, ce_detached, grad_h_or_None)`` — the scalars identical on
+    ``(kl_detached, ce_detached, logit_mse_detached, grad_h_or_None)`` — the scalars identical on
     every rank.
 
     With ``compute_grads=False`` (validation / metrics-only logging) the chunk
@@ -339,6 +397,9 @@ def _kl_ce_vocab_parallel(
     """
     B, T, D = hidden.shape
     device = hidden.device
+    if lambda_logit_mse != 0.0 and vocab_size is None:
+        raise ValueError("lambda_logit_mse != 0 requires vocab_size (the full vocab "
+                         "size) for the centered per-token mean.")
 
     if attention_mask is not None:
         kl_denom = attention_mask.sum().clamp(min=1).float()
@@ -358,6 +419,7 @@ def _kl_ce_vocab_parallel(
 
     kl_acc = hidden.new_zeros((), dtype=torch.float32)
     ce_acc = hidden.new_zeros((), dtype=torch.float32)
+    lm_acc = hidden.new_zeros((), dtype=torch.float32)
     Vs = v_hi - v_lo
 
     with torch.set_grad_enabled(compute_grads):
@@ -386,8 +448,9 @@ def _kl_ce_vocab_parallel(
                 else torch.ones(B, c, device=device)
             )
 
-            cfg = (kl_temperature, lambda_kl, lambda_ce, kl_denom, ce_denom, group, world_size)
-            loss, kl_d, ce_d = _VocabParallelKLCE.apply(
+            cfg = (kl_temperature, lambda_kl, lambda_ce, lambda_logit_mse,
+                   kl_denom, ce_denom, vocab_size, group, world_size)
+            loss, kl_d, ce_d, lm_d = _VocabParallelKLCE.apply(
                 s_local.float(), t_local.float(), ce_target, ce_valid, kl_mask, cfg
             )
             if compute_grads:
@@ -396,10 +459,11 @@ def _kl_ce_vocab_parallel(
                 W.grad.add_(grads[1] * loss_scale)
             kl_acc = kl_acc + kl_d
             ce_acc = ce_acc + ce_d
+            lm_acc = lm_acc + lm_d
 
     # The caller backwards grad_h_accum into the student forward graph (one
     # traversal, combinable with other graph-rooted losses).
-    return kl_acc, ce_acc, grad_h_accum
+    return kl_acc, ce_acc, lm_acc, grad_h_accum
 
 
 @dataclass
@@ -408,6 +472,13 @@ class DistillConfig:
     lambda_block: float = 1.0
     lambda_kl: float = 1.0
     lambda_ce: float = 0.5
+    # Centered logit-MSE between student and teacher final logits (output-aware
+    # distillation). Supervises the residual stream in the directions the lm_head
+    # reads, with a non-saturating gradient ∝ (d − d̄) — unlike logit-KL, whose
+    # gradient collapses when the student is close-but-mis-directed. Shares the
+    # single KL/CE logit pass (reuses the already-computed lm_head matmul), so the
+    # marginal cost is ~zero. See losses.logit_mse. 0.0 = off (default).
+    lambda_logit_mse: float = 0.0
     kl_temperature: float = 1.0
     # Relative (scale-free) block MSE: Σ(s−t)²/Σt² per block instead of the raw
     # masked mean. Rescales the block term to O(1)/block so deep, large-norm
@@ -693,7 +764,9 @@ def distill_step(
     # or when the caller wants the metrics logged this step. Both are step-level
     # constants, identical on every rank, so the collectives they gate (teacher
     # logit gathers, vocab-parallel softmax reduces) stay matched.
-    need_klce_grads = cfg.lambda_kl != 0.0 or cfg.lambda_ce != 0.0
+    need_klce_grads = (
+        cfg.lambda_kl != 0.0 or cfg.lambda_ce != 0.0 or cfg.lambda_logit_mse != 0.0
+    )
     need_klce = need_klce_grads or compute_klce_metrics
 
     # ----- Teacher forward (frozen) -----
@@ -940,6 +1013,7 @@ def distill_step(
         cfg.kl_ce_chunk_size if need_klce_grads else min(cfg.kl_ce_chunk_size, 256)
     )
     grad_h = None
+    lm_val = torch.zeros((), device=input_ids.device)
     if not need_klce:
         # Logit losses off AND metrics not wanted this step: the KL/CE pass —
         # student lm_head + softmax reduces — is skipped wholesale. Zeros keep
@@ -951,10 +1025,12 @@ def distill_step(
         # softmax normalizers are all-reduced — no rank-0 serial tail, and the
         # full-vocab fp32 expansion is sharded 1/world_size.
         with _phase("klce", timings, mem):
-            kl_val, ce_val, grad_h = _kl_ce_vocab_parallel(
+            kl_val, ce_val, lm_val, grad_h = _kl_ce_vocab_parallel(
                 hidden, student.lm_head, student.v_lo, student.v_hi,
                 teacher_logits.detach(), labels, attention_mask,
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
+                lambda_logit_mse=cfg.lambda_logit_mse,
+                vocab_size=student.text_config.vocab_size,
                 kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 group=student.vp_group, world_size=student.vp_world_size,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
@@ -963,9 +1039,10 @@ def distill_step(
         # Legacy: only the track-0 owner has lm_head; peers run the forward for
         # collective ordering, contribute zero KL/CE, and never backward through it.
         with _phase("klce", timings, mem):
-            kl_val, ce_val, grad_h = _kl_ce_chunked(
+            kl_val, ce_val, lm_val, grad_h = _kl_ce_chunked(
                 hidden, student.lm_head, teacher_logits.detach(), labels, attention_mask,
                 lambda_kl=cfg.lambda_kl, lambda_ce=cfg.lambda_ce,
+                lambda_logit_mse=cfg.lambda_logit_mse,
                 kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
             )
@@ -995,6 +1072,7 @@ def distill_step(
         cfg.lambda_block * block_loss_val
         + cfg.lambda_kl * kl_val
         + cfg.lambda_ce * ce_val
+        + cfg.lambda_logit_mse * lm_val
         + eff_lambda_fr * fr_val
     )
     return {
@@ -1002,6 +1080,8 @@ def distill_step(
         "block_mse": block_loss_val,
         "kl": kl_val,
         "ce": ce_val,
+        # Centered logit-MSE (output-aware); zeros when off / not computed.
+        "logit_mse": lm_val,
         # Free-running feature-matching relMSE (mean over taps; zeros when off).
         "fr_mse": fr_val,
         # Per-tap relative MSE (detached; empty unless track_layer_relmse). NOT a
@@ -1048,7 +1128,7 @@ def validate_step(
             return_sync_hiddens=False, return_hidden_pre_lm_head=True,
         )
         teacher_logits, _ = teacher.forward(input_ids, attention_mask=attention_mask)
-        kl, ce, _ = _kl_ce_vocab_parallel(
+        kl, ce, _lm, _ = _kl_ce_vocab_parallel(
             hidden, student.lm_head, student.v_lo, student.v_hi,
             teacher_logits.detach(), labels, attention_mask,
             lambda_kl=1.0, lambda_ce=1.0, kl_temperature=kl_temperature,

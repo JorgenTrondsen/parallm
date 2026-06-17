@@ -33,7 +33,7 @@ from pt_converter.train.distill import (
     student_forcing_schedule,
 )
 from pt_converter.eval.fidelity import fidelity_step
-from pt_converter.train.losses import block_mse
+from pt_converter.train.losses import block_mse, logit_mse
 from pt_converter.train.teacher import HookedTeacher
 
 
@@ -108,6 +108,52 @@ def test_block_mse_default_is_unchanged_masked_mean():
     diff = (s - t).pow(2)
     m = mask.unsqueeze(-1).float()
     expected = (diff * m).sum() / (mask.sum() * 8)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+# ----- centered logit-MSE (output-aware distillation) -----
+
+def test_logit_mse_centered_is_shift_invariant():
+    """Adding a per-token constant to either logit set is a no-op for the centered
+    form (softmax shift-invariance — the property the output-aware objective relies
+    on); the uncentered form is NOT invariant (so the check is non-trivial)."""
+    torch.manual_seed(0)
+    s = torch.randn(2, 5, 9)
+    t = torch.randn(2, 5, 9)
+    shift_s = torch.randn(2, 5, 1)   # per-token constant, broadcast over the vocab
+    shift_t = torch.randn(2, 5, 1)
+    base = logit_mse(s, t, center=True)
+    shifted = logit_mse(s + shift_s, t + shift_t, center=True)
+    assert torch.allclose(base, shifted, atol=1e-5), (base, shifted)
+    assert not torch.allclose(
+        logit_mse(s, t, center=False), logit_mse(s + shift_s, t, center=False)
+    )
+
+
+def test_logit_mse_matches_manual_centered():
+    """Centered value == mean_v((d−d̄)²) == the mean_v(d²)−d̄² identity the
+    vocab-parallel path computes from shard sums."""
+    torch.manual_seed(1)
+    s = torch.randn(2, 4, 8)
+    t = torch.randn(2, 4, 8)
+    d = s - t
+    dc = d - d.mean(dim=-1, keepdim=True)
+    expected = dc.pow(2).mean(dim=-1).mean()                  # mean over vocab, then tokens
+    assert torch.allclose(logit_mse(s, t, center=True), expected, atol=1e-6)
+    alt = (d.pow(2).mean(-1) - d.mean(-1).pow(2)).mean()      # mean_v(d²) − d̄²
+    assert torch.allclose(logit_mse(s, t, center=True), alt, atol=1e-6)
+
+
+def test_logit_mse_respects_mask():
+    torch.manual_seed(2)
+    s = torch.randn(1, 4, 8)
+    t = torch.randn(1, 4, 8)
+    mask = torch.tensor([[1, 1, 0, 0]])
+    got = logit_mse(s, t, attention_mask=mask, center=True)
+    d = s - t
+    d = d - d.mean(dim=-1, keepdim=True)
+    per_token = d.pow(2).mean(dim=-1)                         # (1, 4)
+    expected = (per_token * mask).sum() / mask.sum()
     assert torch.allclose(got, expected, atol=1e-6)
 
 
@@ -217,6 +263,70 @@ def test_distill_step_forcing_prob_zero_matches_legacy_default():
     )
     for key in ("total", "block_mse", "kl", "ce"):
         assert torch.allclose(out_a[key], out_b[key], atol=1e-5), key
+
+
+# ----- centered logit-MSE in the distill step (output-aware) -----
+
+def test_distill_step_logit_mse_runs_and_flows_grads():
+    """lambda_logit_mse>0 on the K=2 path (legacy chunked lm_head): the step runs,
+    reports a finite >0 logit_mse, and propagates finite grads — it rides the single
+    KL/CE logit pass even with the KL/CE lambdas themselves at 0."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        lambda_block=1.0, lambda_kl=0.0, lambda_ce=0.0, lambda_logit_mse=0.5,
+        normalize_block_mse=True,
+    )
+    s.zero_grad(set_to_none=True)
+    out = distill_step(s, t, _batch(cfg), dcfg, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    assert torch.isfinite(out["logit_mse"]).all() and out["logit_mse"].item() > 0.0
+    for key in ("total", "block_mse", "kl", "ce", "logit_mse"):
+        assert torch.isfinite(out[key]).all(), key
+    assert any(p.grad is not None and torch.isfinite(p.grad).all() for p in s.parameters())
+
+
+def test_distill_step_logit_mse_off_is_inert():
+    """lambda_logit_mse=0.0 (explicit) is bit-identical to the default config that
+    never sets it, and logit_mse is reported as 0 — backward compatibility."""
+    cfg = _tiny_config()
+    batch = _batch(cfg)
+    base = lambda man: DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                                     lambda_kl=1.0, lambda_ce=0.5, normalize_block_mse=True)
+    s_a, t_a, man = _build_teacher_student(cfg, sync_block_depth=4)
+    s_a.zero_grad(set_to_none=True)
+    out_a = distill_step(s_a, t_a, batch, base(man), student_forcing_prob=0.0, forcing_seed=(42, 0))
+    ga = _grads(s_a)
+
+    s_b, t_b, _ = _build_teacher_student(cfg, sync_block_depth=4)
+    cfg_b = DistillConfig(sync_layer_indices=tuple(man.sync_layer_indices),
+                          lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=0.0,
+                          normalize_block_mse=True)
+    s_b.zero_grad(set_to_none=True)
+    out_b = distill_step(s_b, t_b, batch, cfg_b, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    gb = _grads(s_b)
+
+    assert out_a["logit_mse"].item() == 0.0 and out_b["logit_mse"].item() == 0.0
+    for key in ("total", "block_mse", "kl", "ce"):
+        assert torch.allclose(out_a[key], out_b[key], atol=1e-6), key
+    assert ga and ga.keys() == gb.keys()
+    for n in ga:
+        assert torch.allclose(ga[n], gb[n], atol=1e-7), n
+
+
+def test_total_includes_logit_mse_term():
+    """total = λ_block·block + λ_kl·kl + λ_ce·ce + λ_logit_mse·logit_mse (+ fr)."""
+    cfg = _tiny_config()
+    s, t, man = _build_teacher_student(cfg, sync_block_depth=4)
+    dcfg = DistillConfig(
+        sync_layer_indices=tuple(man.sync_layer_indices),
+        lambda_block=1.0, lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=0.3,
+        normalize_block_mse=True,
+    )
+    out = distill_step(s, t, _batch(cfg), dcfg, student_forcing_prob=0.0, forcing_seed=(42, 0))
+    expected = (1.0 * out["block_mse"] + 1.0 * out["kl"] + 0.5 * out["ce"]
+                + 0.3 * out["logit_mse"])
+    assert torch.allclose(out["total"], expected, atol=1e-6)
 
 
 # ----- intra-window per-layer MSE (lever c) -----

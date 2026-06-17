@@ -104,6 +104,37 @@ def logit_kl(
     return masked.sum() / attention_mask.sum().clamp(min=1) * (temperature * temperature)
 
 
+def logit_mse(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    center: bool = True,
+) -> torch.Tensor:
+    """Mean-squared error between student and teacher final logits, over non-pad positions.
+
+    Output-aware alternative to ``logit_kl``: it supervises the residual stream in the
+    directions the ``lm_head`` actually reads, with a gradient ``∝ (d − d̄)`` that does
+    NOT saturate when the student is close-but-mis-directed (KL's gradient does). The
+    per-token error is the mean over the vocab of the squared logit difference.
+
+    ``center=True`` (default) removes the per-token mean over the vocab from the
+    difference before squaring. The softmax is invariant to a per-token additive shift
+    of the logits, so that mean component is a free direction the student should not
+    spend capacity matching. Using ``d = s − t`` and ``d̄ = mean_v(d)`` the centered
+    form ``mean_v((d − d̄)²) = mean_v(d²) − d̄²`` (the identity the vocab-parallel path
+    relies on). ``center=False`` is the plain (uncentered) logit MSE.
+    """
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            f"logit_mse shape mismatch: student {student_logits.shape} vs teacher {teacher_logits.shape}"
+        )
+    d = student_logits.float() - teacher_logits.float()
+    if center:
+        d = d - d.mean(dim=-1, keepdim=True)
+    per_token = d.pow(2).mean(dim=-1)  # (B, T)
+    return _masked_mean(per_token, attention_mask)
+
+
 def lm_cross_entropy(
     logits: torch.Tensor,
     labels: torch.Tensor,

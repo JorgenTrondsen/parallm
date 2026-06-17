@@ -146,7 +146,7 @@ def run_fr_grad_probe(student, teacher, loader, distill_cfg, manifest, args, ran
 
     probe_cfg = replace(
         distill_cfg,
-        lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0,
+        lambda_block=0.0, lambda_kl=0.0, lambda_ce=0.0, lambda_logit_mse=0.0,
         free_running_mse=True, lambda_free_running=1.0,
     )
     norms: dict[float, torch.Tensor] = {}
@@ -357,6 +357,12 @@ def main() -> int:
     p.add_argument("--lambda-block", type=float, default=1.0)
     p.add_argument("--lambda-kl", type=float, default=1.0)
     p.add_argument("--lambda-ce", type=float, default=0.5)
+    p.add_argument("--lambda-logit-mse", type=float, default=0.0,
+                   help="Weight on centered logit-MSE between student and teacher final "
+                        "logits (output-aware distillation). Reuses the single KL/CE logit "
+                        "pass, so marginal cost is ~zero. Non-saturating gradient targets "
+                        "the logit-relevant residual directions isotropic block-MSE misses. "
+                        "0 = off (default).")
     p.add_argument("--kl-temperature", type=float, default=1.0)
     p.add_argument("--student-forcing-prob", type=float, default=0.0,
                    help="Scheduled-sampling probability of feeding a block the student's "
@@ -529,10 +535,11 @@ def main() -> int:
     if args.fr_grad_alpha != 1.0:
         if not (0.0 <= args.fr_grad_alpha <= 1.0):
             p.error("--fr-grad-alpha must be in [0, 1]")
-        if args.lambda_kl != 0.0 or args.lambda_ce != 0.0:
+        if args.lambda_kl != 0.0 or args.lambda_ce != 0.0 or args.lambda_logit_mse != 0.0:
             p.error("--fr-grad-alpha < 1.0 damps every gradient through the full student "
-                    "forward; the KL/CE backward shares that graph and would be silently "
-                    "damped too. Run with --lambda-kl 0 --lambda-ce 0.")
+                    "forward; the KL/CE/logit-MSE backward shares that graph and would be "
+                    "silently damped too. Run with --lambda-kl 0 --lambda-ce 0 "
+                    "--lambda-logit-mse 0.")
 
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
@@ -833,6 +840,7 @@ def main() -> int:
         lambda_block=args.lambda_block,
         lambda_kl=args.lambda_kl,
         lambda_ce=args.lambda_ce,
+        lambda_logit_mse=args.lambda_logit_mse,
         kl_temperature=args.kl_temperature,
         kl_ce_chunk_size=args.kl_ce_chunk_size,
         normalize_block_mse=args.normalize_block_mse,
@@ -1041,6 +1049,7 @@ def main() -> int:
         klce_metrics = (
             args.lambda_kl != 0.0
             or args.lambda_ce != 0.0
+            or args.lambda_logit_mse != 0.0
             or step % args.log_every == 0
         )
 
@@ -1052,7 +1061,8 @@ def main() -> int:
         G = max(1, args.grad_accum_steps)
         loss_scale = 1.0 / G
         optim.zero_grad(set_to_none=True)
-        loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0, "fr_mse": 0.0}
+        loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0,
+                     "logit_mse": 0.0, "fr_mse": 0.0}
         relmse_sums: dict[int, torch.Tensor] = {}
         data_wait = 0.0
         micro_count = 0
@@ -1191,6 +1201,7 @@ def main() -> int:
                 f"block_mse={mean_losses['block_mse'].item():.4f} "
                 f"fr_mse={mean_losses['fr_mse'].item():.4f} "
                 f"kl={mean_losses['kl'].item():.4f} ce={mean_losses['ce'].item():.4f} "
+                f"logit_mse={mean_losses['logit_mse'].item():.4f} "
                 f"grad_norm={total_norm.item():.3e} "
                 f"lr={lr_now:.2e} elapsed={elapsed:.1f}s",
             )

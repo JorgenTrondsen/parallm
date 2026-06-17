@@ -92,19 +92,21 @@ def _fixture(seed=0, B=2, T=12, D=16, V=40):
     return hidden, lm_w, teacher_logits, labels, attn
 
 
+@pytest.mark.parametrize("lambda_logit_mse", [0.0, 0.3])
 @pytest.mark.parametrize("kl_temperature", [1.0, 2.0])
 @pytest.mark.parametrize("chunk_size", [64, 5])
-def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size):
+def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size, lambda_logit_mse):
     hidden0, lm_w, teacher_logits, labels, attn = _fixture()
     V, D = lm_w.shape
-    kw = dict(lambda_kl=1.0, lambda_ce=0.5, kl_temperature=kl_temperature, chunk_size=chunk_size)
+    kw = dict(lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=lambda_logit_mse,
+              kl_temperature=kl_temperature, chunk_size=chunk_size)
 
     # Dense reference. The helper now RETURNS the grad w.r.t. hidden; the caller
     # drives the backward (one traversal, combinable with other graph-rooted losses).
     h_dense = hidden0.clone().requires_grad_(True)
     lm_dense = nn.Linear(D, V, bias=False)
     lm_dense.weight.data.copy_(lm_w)
-    kl_d, ce_d, grad_h_d = _kl_ce_chunked(
+    kl_d, ce_d, lm_d, grad_h_d = _kl_ce_chunked(
         h_dense, lm_dense, teacher_logits, labels, attn, **kw
     )
     h_dense.backward(grad_h_d)
@@ -113,16 +115,26 @@ def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size):
     h_vp = hidden0.clone().requires_grad_(True)
     lm_vp = nn.Linear(D, V, bias=False)
     lm_vp.weight.data.copy_(lm_w)
-    kl_v, ce_v, grad_h_v = _kl_ce_vocab_parallel(
+    kl_v, ce_v, lm_v, grad_h_v = _kl_ce_vocab_parallel(
         h_vp, lm_vp, 0, V, teacher_logits, labels, attn,
-        group=None, world_size=1, **kw,
+        group=None, world_size=1, vocab_size=V, **kw,
     )
     h_vp.backward(grad_h_v)
 
     assert torch.allclose(kl_d, kl_v, atol=1e-5, rtol=1e-4), (kl_d, kl_v)
     assert torch.allclose(ce_d, ce_v, atol=1e-5, rtol=1e-4), (ce_d, ce_v)
+    assert torch.allclose(lm_d, lm_v, atol=1e-5, rtol=1e-4), (lm_d, lm_v)
     assert torch.allclose(h_dense.grad, h_vp.grad, atol=1e-5, rtol=1e-4)
     assert torch.allclose(lm_dense.weight.grad, lm_vp.weight.grad, atol=1e-5, rtol=1e-4)
+
+    # logit-MSE value parity against the standalone dense losses.logit_mse formula.
+    from pt_converter.train.losses import logit_mse
+    student_logits = hidden0 @ lm_w.t()
+    expected_lm = logit_mse(student_logits, teacher_logits, attn, center=True)
+    if lambda_logit_mse == 0.0:
+        assert lm_v.detach().item() == 0.0
+    else:
+        assert torch.allclose(lm_v, expected_lm, atol=1e-5, rtol=1e-4), (lm_v, expected_lm)
 
 
 def test_vp_embedding_partials_sum_to_dense():
@@ -158,10 +170,13 @@ def _worker(rank, world_size, port, payload, results):
     h = hidden0.clone().requires_grad_(True)
     lm = nn.Linear(D, hi - lo, bias=False)
     lm.weight.data.copy_(lm_w[lo:hi])
-    # teacher_logits is now passed as this rank's vocab shard (B,T,Vs).
-    kl, ce, grad_h = _kl_ce_vocab_parallel(
+    # teacher_logits is now passed as this rank's vocab shard (B,T,Vs). The
+    # centered logit-MSE's per-token mean is over the FULL vocab, so this also
+    # exercises the cross-shard all-reduce of Σ_v d and Σ_v d².
+    kl, ce, lmse, grad_h = _kl_ce_vocab_parallel(
         h, lm, lo, hi, teacher_logits[:, :, lo:hi], labels, attn,
-        lambda_kl=1.0, lambda_ce=0.5, kl_temperature=2.0, chunk_size=7,
+        lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=0.3, vocab_size=V,
+        kl_temperature=2.0, chunk_size=7,
         group=dist.group.WORLD, world_size=world_size,
     )
     h.backward(grad_h)
@@ -171,6 +186,7 @@ def _worker(rank, world_size, port, payload, results):
     results[rank] = {
         "kl": kl.item(),
         "ce": ce.item(),
+        "lmse": lmse.item(),
         "lm_grad": lm.weight.grad.clone(),
         "h_grad_summed": h_grad,
         "lo": lo, "hi": hi,
@@ -184,13 +200,14 @@ def test_vp_klce_two_rank_matches_dense():
     payload = _fixture(seed=2, V=40)
     hidden0, lm_w, teacher_logits, labels, attn = payload
     V, D = lm_w.shape
-    kw = dict(lambda_kl=1.0, lambda_ce=0.5, kl_temperature=2.0, chunk_size=7)
+    kw = dict(lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=0.3,
+              kl_temperature=2.0, chunk_size=7)
 
     # Dense reference.
     h_dense = hidden0.clone().requires_grad_(True)
     lm_dense = nn.Linear(D, V, bias=False)
     lm_dense.weight.data.copy_(lm_w)
-    kl_d, ce_d, grad_h_d = _kl_ce_chunked(h_dense, lm_dense, teacher_logits, labels, attn, **kw)
+    kl_d, ce_d, lm_d, grad_h_d = _kl_ce_chunked(h_dense, lm_dense, teacher_logits, labels, attn, **kw)
     h_dense.backward(grad_h_d)
 
     world_size = 2
@@ -208,6 +225,8 @@ def test_vp_klce_two_rank_matches_dense():
         res = results[r]
         assert abs(res["kl"] - kl_d.item()) < 1e-4, (res["kl"], kl_d.item())
         assert abs(res["ce"] - ce_d.item()) < 1e-4, (res["ce"], ce_d.item())
+        # cross-shard centered logit-MSE == dense (full-vocab) logit-MSE
+        assert abs(res["lmse"] - lm_d.item()) < 1e-4, (res["lmse"], lm_d.item())
         # per-shard lm_head grad == dense grad rows for this shard
         assert torch.allclose(
             res["lm_grad"], lm_dense.weight.grad[res["lo"]:res["hi"]], atol=1e-5, rtol=1e-4
