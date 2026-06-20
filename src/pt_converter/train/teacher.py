@@ -78,6 +78,18 @@ class HookedTeacher:
             h.remove()
         self._handles.clear()
 
+    def set_hook_indices(self, sync_layer_indices: Iterable[int]) -> None:
+        """Re-point the capture hooks at a new set of layer indices.
+
+        The train script hooks every layer for the startup sensitivity probe
+        (which needs a teacher hidden at each depth), then narrows the hooks to
+        the chosen sync boundaries before the loop (capturing every layer would
+        pin one extra ``(B,T,H)`` tensor per layer for the whole step).
+        """
+        self.remove_hooks()
+        self.sync_indices = list(sync_layer_indices)
+        self._install_hooks()
+
     @torch.no_grad()
     def forward(
         self,

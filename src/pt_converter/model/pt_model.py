@@ -204,6 +204,28 @@ class PTWrappedModel(nn.Module):
             else:
                 self.lm_head = None
 
+    def set_sync_schedule(self, sync_after_layers: Sequence[int]) -> None:
+        """Re-point the sync boundaries after construction.
+
+        Used by the train script, which builds the student with a placeholder
+        schedule, runs the sensitivity probe, then installs the dynamically
+        chosen boundaries. All sync decisions live in this wrapper's `forward`
+        (the per-track `text_models` never sync on their own), so only the
+        wrapper's `sync_after_layers` and the derived `_window_ranges` need to
+        change — the weights and module structure are schedule-independent.
+        """
+        indices = tuple(sorted(set(int(i) for i in sync_after_layers)))
+        num_layers = len(self.text_models[0].layers)
+        if indices and (indices[0] < 0 or indices[-1] >= num_layers):
+            raise ValueError(
+                f"sync indices {indices} out of range for {num_layers} layers"
+            )
+        self.sync_after_layers = indices
+        self._window_ranges = _window_ranges(num_layers, indices)
+        # Keep the per-track configs' copy consistent for any introspection.
+        for tm in self.text_models:
+            tm.pt_cfg.sync_after_layers = indices
+
     @staticmethod
     def _run_track_window(
         tm,

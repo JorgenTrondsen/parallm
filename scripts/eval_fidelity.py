@@ -93,6 +93,12 @@ def main() -> int:
     p.add_argument("--chunk-size", type=int, default=128,
                    help="Seq-chunk size for the vocab-wide fp32 expansion; matches "
                         "--kl-ce-chunk-size in training.")
+    p.add_argument("--sync-indices", default=None,
+                   help="Override the manifest's sync_layer_indices with a custom comma-separated "
+                        "sorted list (e.g. '2,6,10,14,15,16,...,31'). Per-track weights are "
+                        "schedule-independent, so this evaluates an arbitrary (non-uniform / "
+                        "depth-tapered) sync schedule on the SAME slice with NO re-slice. Both the "
+                        "student SyncBoundary placement and the teacher block_mse hooks follow it.")
     p.add_argument("--intra-window-taps", action="store_true",
                    help="Also report block_mse/relmse at EVERY layer, not just the sync "
                         "boundaries. Mid-window rows are loss-only synced reconstructions "
@@ -116,11 +122,25 @@ def main() -> int:
     # ----- Manifest + uniform layout (forward output is layout-independent). -----
     manifest = load_manifest(args.checkpoint_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
+    # Optional custom (non-uniform) sync schedule — weights are schedule-independent,
+    # so this re-evaluates the SAME slice under a redistributed sync budget.
+    if args.sync_indices is not None:
+        sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
+    elif manifest.sync_layer_indices is not None:
+        sync_layers = list(manifest.sync_layer_indices)
+    else:
+        raise SystemExit(
+            "[error] checkpoint manifest has no sync_layer_indices (a raw convert "
+            "output carries none — the schedule is placed at train time). Pass "
+            "--sync-indices, or point --checkpoint-dir at a trained checkpoint."
+        )
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
-        f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
+        f"K={layout.tracks_per_rank} num_layers={manifest.num_layers}",
     )
+    _log(rank, f"[init] sync schedule: {len(sync_layers)} syncs at {sync_layers}"
+               + ("  (OVERRIDE)" if args.sync_indices is not None else ""))
     _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
 
     # ----- Teacher (frozen, FSDP-sharded across the world). -----
@@ -142,7 +162,7 @@ def main() -> int:
     metric_indices = (
         list(range(manifest.num_layers))
         if args.intra_window_taps
-        else list(manifest.sync_layer_indices)
+        else list(sync_layers)
     )
     teacher = HookedTeacher(
         text_model=text_model,
@@ -159,7 +179,7 @@ def main() -> int:
         text_config=cfg.text_config,
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
-        sync_after_layers=manifest.sync_layer_indices,
+        sync_after_layers=sync_layers,
         track_group=layout.track_group,
     )
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
@@ -237,7 +257,7 @@ def main() -> int:
         print(f"  top1_agree   = {sums['top1_agree'].item():.4f}")
         print(f"  top5_agree   = {sums['top5_agree'].item():.4f}  (teacher top-1 ∈ student top-5)")
         print(f"  top5_set_iou = {sums['top5_set_iou'].item():.4f}")
-        boundary_set = set(manifest.sync_layer_indices)
+        boundary_set = set(sync_layers)
         label = "per-layer" if args.intra_window_taps else "per-sync-boundary"
         print(f"  {label} block_mse (raw | rel=Σ(s−t)²/Σt²):")
         for layer_idx in sync_indices:

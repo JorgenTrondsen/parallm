@@ -1,6 +1,6 @@
 # pt_converter
 
-`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks". The world layout is one rank per visible GPU, with each rank hosting `K = N / world_size` tracks locally. `embed_tokens`, `lm_head`, and the KL/CE softmax are **vocab-parallel** — sharded over the vocabulary dimension across all ranks — so no rank specially carries them and the layout is uniform. At configurable sync boundaries (every `D` layers), every rank locally sums its `K` partial residual deltas, then a single NCCL all-reduce across the world combines the per-rank sums — the combined forward stays mathematically equivalent to the original dense model. `N=1` short-circuits to a no-op, giving a bit-equal dense-parity gate.
+`pt_converter` is a model-agnostic conversion and fine-tuning toolkit that turns a pretrained dense transformer into a **parallel-track (PT) transformer**. The dense model's weights are sliced across `N` parallel "tracks". The world layout is one rank per visible GPU, with each rank hosting `K = N / world_size` tracks locally. `embed_tokens`, `lm_head`, and the KL/CE softmax are **vocab-parallel** — sharded over the vocabulary dimension across all ranks — so no rank specially carries them and the layout is uniform. At each sync boundary, every rank locally sums its `K` partial residual deltas, then a single NCCL all-reduce across the world combines the per-rank sums — the combined forward stays mathematically equivalent to the original dense model. The per-track weights are **schedule-independent**, so the sync boundaries are no longer fixed at conversion time: the train script takes a communication budget (`--num-sync-boundaries`) and places that many boundaries **dynamically on the most sensitive layers** (a short startup probe ranks each layer by how wrong its un-synced partial residual is). `N=1` short-circuits to a no-op, giving a bit-equal dense-parity gate.
 
 The residual-stream RMSNorm scales (input/post layernorms, the final norm, and the linear-attention gated norm) are held identically across tracks and **kept bit-identical** under training: `sync_replicated_grads` averages each group's gradients between `loss.backward()` and `optimizer.step()`, so a deterministic optimizer step keeps the copies bit-equal forever. The **full-attention head params** — the GQA K/V projections and their per-head `q_norm`/`k_norm` — instead **diverge per track by default**: each track starts from a copy of its kv-group's head and then trains independently, so the 8 full-attention layers go from GQA (`16q/4kv`) to per-track MHA (`16q/16kv`). This is a strict capacity superset (the synced GQA model is the special case where the copies stay equal), it is free on memory (each track already stores its own copy — only the gradient averaging is dropped), it removes the per-step kv-group all-reduces, and it leaves each track fully self-contained in the attention block (aligning with per-node inference). Pass `--sync-attention-heads` to restore the legacy bit-identical / dense-GQA-equivalent path (e.g. for an A/B). New model families are added by registering a `ModelAdapter` — the slicer engine, sync logic, and training loop themselves stay model-agnostic. A short distillation stage (frozen dense teacher → sliced student) using block-wise teacher-forced MSE + end-to-end logit-KL + LM CE recovers any perplexity lost during the static weight conversion.
 
@@ -33,7 +33,7 @@ mismatch), install it with `pip install --no-build-isolation causal-conv1d` (nee
 pt_converter/
 ├── pyproject.toml                          # Build metadata, deps; [eval] extra pulls lm-eval.
 ├── scripts/
-│   ├── convert_qwen3_5_9b.py               # CLI: slice a pretrained Qwen3.5-9B into N per-track checkpoints + manifest.
+│   ├── convert_qwen3_5_9b.py               # CLI: slice a pretrained Qwen3.5-9B into N per-track shards + a structural manifest (no sync schedule — that's placed at train time).
 │   ├── train_qwen3_5_9b.py                 # torchrun entry point: distributed distillation.
 │   ├── eval_fidelity.py                    # torchrun entry point: KL / top-k / hidden-MSE / ppl-gap, student vs teacher.
 │   ├── eval_lm_harness.py                  # torchrun entry point: lm-evaluation-harness over student and/or teacher.
@@ -102,31 +102,28 @@ pt_converter/
 
 ## Convert
 
-`scripts/convert_qwen3_5_9b.py` slices a dense Qwen3.5 checkpoint into N per-track safetensors plus a `manifest.json`.
+`scripts/convert_qwen3_5_9b.py` slices a dense Qwen3.5 checkpoint into N per-track safetensors plus a **structural** `manifest.json` (model type, n_tracks, layer types, per-track shapes). It no longer chooses a sync schedule — the per-track weights are schedule-independent, so the boundaries are placed later by the train script.
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--hf-model` | required | Path or HF id of the dense source model. |
 | `--out-dir` | required | Output dir for per-track safetensors + manifest. |
 | `--n-tracks` | `max_tracks_for_config(...)` | Number of tracks (defaults to the max valid N for the model). |
-| `--sync-block-depth` | `4` | Sync every D layers (the cadence / communication budget). |
-| `--sync-schedule` | `full-attn-aligned` | Where sync boundaries fall. `full-attn-aligned` (default): a sync immediately **before every full-attention layer** so it reads a synced (exactly decomposable) residual, plus a final sync before the norm (`D=4` → 2,6,…,30,31). Full attention is the global mixer — feeding it the partial residual the `uniform` schedule leaves it with breaks the per-track decomposition, so aligning is the high-leverage fix at `D≥2` (it drove `val_kl` ~1.4 → 0.77 on n16/d2). `uniform` (legacy): every D layers (`D=4` → after 3,7,…,31). Per-track **weights are identical** either way (only `sync_layer_indices` differ), so a manifest trains/evaluates against existing track shards regardless of schedule. For `D ≥ full_attention_interval` the aligned schedule collapses to one sync per interval. |
 | `--device` | `cpu` | Device for slicing. |
 | `--dtype` | `bfloat16` | One of `bfloat16` / `float16` / `float32`. |
 
 ```bash
 python scripts/convert_qwen3_5_9b.py \
     --hf-model Qwen/Qwen3.5-9B \
-    --out-dir convert_out/qwen3_5_9b_n16_d4 \
-    --n-tracks 16 --sync-block-depth 4
+    --out-dir convert_out/qwen3_5_9b_n16 \
+    --n-tracks 16
 ```
 
-This defaults to `--sync-schedule full-attn-aligned` — a sync right *before* every
-full-attention layer so the global mixers read a synced (exactly decomposable)
-residual instead of the partial one the legacy `uniform` schedule leaves them with.
-Pass `--sync-schedule uniform` for the every-D-layers schedule. Per-track weights are
-identical either way (only the manifest's `sync_layer_indices` change), so a manifest
-trains/evaluates against existing track shards regardless of schedule.
+The sync schedule used to be baked in here (`--sync-block-depth` / `--sync-schedule`),
+but those flags are gone: the slice is identical regardless of where the syncs fall,
+so the convert output carries `sync_layer_indices = null`. The train script decides the
+schedule — see `--num-sync-boundaries` below — and writes the chosen boundaries into
+each checkpoint's manifest so eval reproduces them exactly.
 
 ## Train
 
@@ -137,7 +134,12 @@ trains/evaluates against existing track shards regardless of schedule.
 | `--hf-model` | required | Dense teacher path. |
 | `--tracks-dir` | required | Output of the convert script. |
 | `--out-dir` | `./pt_train_out` | Checkpoint dir (also writes `best/` when eval improves). |
-| `--resume-from` | `None` | Resume model + optimizer state from a prior checkpoint dir. |
+| `--resume-from` | `None` | Resume model + optimizer state from a prior checkpoint dir. The schedule the prior run was trained with (stored in its manifest) is **reused** unless you re-specify `--num-sync-boundaries` / `--sync-indices`. |
+| `--num-sync-boundaries` | `None` | **Communication budget: how many sync boundaries (all-reduces) to place.** They are placed **dynamically on the most sensitive layers** — a short startup probe ranks each layer by `rel_err_partial` (how wrong its un-synced partial residual is) and the boundaries go to the highest-ranked layers. A sync after the **last** layer is always included (the post-stack norm must read a synced hidden — a correctness requirement, not a sensitivity choice); the other `N-1` are the top-sensitivity layers. Required unless `--sync-indices` is given or you resume a checkpoint that already carries a schedule. The probe all-reduces its metrics, so every rank derives the **same** schedule. |
+| `--sync-indices` | `None` | Explicit comma-separated sync layer indices, **bypassing the probe** (reproducibility / a fixed-schedule A-B). Overrides `--num-sync-boundaries`. |
+| `--sensitivity-probe-depth` | `2` | Reference uniform sync depth for the startup sensitivity probe (must divide `num_layers`). A fine depth makes `rel_err_partial` a **local** per-layer sync-need rather than cumulative depth-drift. |
+| `--sensitivity-calib-batches` | `8` | Number of calibration batches the startup probe averages the per-layer sensitivity over (drawn from the front of the training stream; read-only). |
+| `--sensitivity-norm-floor-quantile` | `0.5` | **De-bias the per-layer sensitivity score.** The plain relative metric `abs_err / ‖teacher_L‖` over-ranks the first few layers: the residual-stream norm is tiny early and grows ~40× with depth, so a track missing 15/16 of a layer's (relatively large) update reads as >100% relative error early — a small-denominator artifact, not real end-to-end need (the *deep* residual gap is the structural one). This divides instead by `max(‖teacher_L‖, floor)` where `floor` = this quantile of the per-layer teacher norms. `0` → pure relative (legacy, early-biased — clusters syncs in layers 0–7); `1` → raw error (deep-biased, can collapse syncs into the deepest layers); **`0.5` (default)** → median floor demotes only the small-norm early layers while mid/deep keep their natural ranking. (An even-spread static schedule beat the `q=0` placement on KL *and* downstream retention; `0.5` removes that early-layer bias.) |
 | `--vocab-parallel` / `--no-vocab-parallel` | on | Vocab/tensor-parallel `embed_tokens` + `lm_head` + KL/CE across all ranks (balanced memory, parallel KL/CE, uniform layout). `--no-vocab-parallel` selects the legacy track-0-owner path (memory-heavy at `n_tracks=16` on 40 GB). |
 | `--sync-attention-heads` / `--no-sync-attention-heads` | off | Keep the full-attention head params (`k_proj`, `v_proj`, `q_norm`, `k_norm`) bit-identical within each kv-group (legacy dense-GQA-equivalent path). Default **off**: those copies **diverge** per track (each track gets its own KV head — GQA → per-track MHA), a capacity superset that is free on memory and drops the per-step kv-group all-reduces. Residual-stream norms stay synced regardless. |
 | `--compile-teacher` / `--no-compile-teacher` | on | `torch.compile` each frozen-teacher decoder layer (inference-only); disable alone if it conflicts with FSDP2 / the sync-boundary hooks. |
@@ -180,8 +182,9 @@ trains/evaluates against existing track shards regardless of schedule.
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
-    --out-dir train_out/qwen3_5_9b_n16_d4 \
+    --tracks-dir convert_out/qwen3_5_9b_n16 \
+    --out-dir train_out/qwen3_5_9b_n16 \
+    --num-sync-boundaries 15 \
     --max-steps 4000 --seq-len 4096 --batch-size 5 \
     --activation-checkpoint \
     --eval-every 200 --save-every 500
@@ -197,8 +200,9 @@ committing to a long run:
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-    --tracks-dir convert_out/qwen3_5_9b_n16_d4 \
-    --out-dir train_out/qwen3_5_9b_n16_d4 \
+    --tracks-dir convert_out/qwen3_5_9b_n16 \
+    --out-dir train_out/qwen3_5_9b_n16 \
+    --num-sync-boundaries 15 \
     --max-steps 4000 --seq-len 4096 --batch-size 4 \
     --activation-checkpoint --kl-ce-chunk-size 512 \
     --eval-every 200 --save-every 500
@@ -227,9 +231,12 @@ relative error dropping onto the `D=1` floor):
   gradient before each step.
 - An **LR schedule** (`--warmup-steps` + `--cosine-decay`, vs the spiky constant-LR default).
 
-At `D≥2` also convert with `--sync-schedule full-attn-aligned` (above): it makes each
-full-attention layer's per-track split *structurally* exact, complementary to the curriculum's
-exposure-bias fix.
+With a modest `--num-sync-boundaries` budget, the startup sensitivity probe tends to place
+boundaries right **before the full-attention layers** on its own — those layers are the global
+mixer, so feeding them a partial residual breaks the per-track decomposition and the probe
+scores them most sync-sensitive (the structural fix that historically drove `val_kl` ~1.4 →
+0.77, complementary to the curriculum's exposure-bias fix). To pin that placement exactly
+rather than rely on the probe, pass an explicit `--sync-indices`.
 
 **Free-running feature matching** (`--free-running-mse`) is the strongest *finishing* lever —
 it supervises exactly the multi-window error compounding the (boundary-detached) block loop
@@ -254,8 +261,9 @@ overwritten.
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
     --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-    --tracks-dir convert_out/qwen3_5_9b_n16_d2 \
-    --out-dir train_out/qwen3_5_9b_n16_d2 \
+    --tracks-dir convert_out/qwen3_5_9b_n16 \
+    --out-dir train_out/qwen3_5_9b_n16 \
+    --num-sync-boundaries 17 \
     --max-steps 2001 --seq-len 4096 --batch-size 5 --grad-accum-steps 2 --activation-checkpoint \
     --intra-window-mse --adaptive-layer-weight \
     --student-forcing-prob 0.9 --student-forcing-schedule cosine-full \
@@ -269,19 +277,19 @@ torchrun --standalone --nproc-per-node=8 scripts/train_qwen3_5_9b.py \
 
 Three torchrun entry points. They use the uniform per-rank track layout; forward output is layout-independent (the SyncBoundary all-reduce combines all tracks regardless of which rank hosts them). Eval loads checkpoints via the legacy full-logits student path (full `lm_head` on the owner rank), which reads a vocab-parallel-trained checkpoint unchanged.
 
-- **Logit fidelity vs teacher** — `scripts/eval_fidelity.py`. KL (forward + reverse), top-1 / top-5 agreement and top-5 IoU, per-sync-boundary hidden MSE, student / teacher perplexity and gap. Pass `--intra-window-taps` to also report block_mse/relmse at **every** layer (mid-window rows are loss-only synced reconstructions on the free-running forward — same semantics as training's `--intra-window-mse`), localizing where inside a window the free-running error grows at `D≥2`.
+- **Logit fidelity vs teacher** — `scripts/eval_fidelity.py`. KL (forward + reverse), top-1 / top-5 agreement and top-5 IoU, per-sync-boundary hidden MSE, student / teacher perplexity and gap. It reads the trained schedule from the checkpoint's manifest (the boundaries the run was trained against); pass `--sync-indices` to re-evaluate the same weights under a different schedule. Pass `--intra-window-taps` to also report block_mse/relmse at **every** layer (mid-window rows are loss-only synced reconstructions on the free-running forward — same semantics as training's `--intra-window-mse`), localizing where inside a window the free-running error grows.
   ```bash
   torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
       --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-      --checkpoint-dir train_out/qwen3_5_9b_n16_d4/best \
+      --checkpoint-dir train_out/qwen3_5_9b_n16/best \
       --num-batches 200
   ```
 - **lm-evaluation-harness** — `scripts/eval_lm_harness.py`. Runs the harness on the student and/or teacher (`--target {student,teacher,both}`) with the same seeds, so request streams align across ranks. Default tasks: `hellaswag,arc_easy,arc_challenge,winogrande,piqa`; pass `--include-mmlu` to add MMLU.
   ```bash
   torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
       --hf-model ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
-      --checkpoint-dir train_out/qwen3_5_9b_n16_d4/best \
-      --output-json train_out/qwen3_5_9b_n16_d4/lm_eval.json
+      --checkpoint-dir train_out/qwen3_5_9b_n16/best \
+      --output-json train_out/qwen3_5_9b_n16/lm_eval.json
   ```
 - **Partial-residual sensitivity probe** — `scripts/probe_sensitivity.py`. Per-layer
   diagnostic for the uniform-`D≥2` recovery work: for each requested uniform sync depth

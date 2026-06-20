@@ -12,6 +12,25 @@ from safetensors.torch import load_file as load_safetensors
 from pt_converter.slicer.convert import PTManifest
 
 
+def save_manifest(out_dir: str | Path, manifest: PTManifest) -> Path:
+    """Write `manifest.json` into `out_dir`. Returns the manifest path.
+
+    Used both by `save_tracks` (conversion) and by the train script when it
+    saves a checkpoint — the latter writes the dynamically-chosen
+    `sync_layer_indices` alongside the structural fields so eval reproduces the
+    exact schedule the model was trained with.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    manifest_dict = asdict(manifest)
+    manifest_dict["per_track_param_shapes"] = {
+        k: list(v) for k, v in manifest.per_track_param_shapes.items()
+    }
+    path = out / "manifest.json"
+    path.write_text(json.dumps(manifest_dict, indent=2))
+    return path
+
+
 def save_tracks(
     out_dir: str | Path,
     tracks: list[dict[str, torch.Tensor]],
@@ -25,11 +44,7 @@ def save_tracks(
         # materialize clones so any views from .narrow() get their own buffers.
         materialized = {k: v.detach().contiguous().clone() for k, v in state.items()}
         save_safetensors(materialized, str(out / f"track_{i}.safetensors"))
-    manifest_dict = asdict(manifest)
-    manifest_dict["per_track_param_shapes"] = {
-        k: list(v) for k, v in manifest.per_track_param_shapes.items()
-    }
-    (out / "manifest.json").write_text(json.dumps(manifest_dict, indent=2))
+    save_manifest(out, manifest)
     return out
 
 
@@ -60,7 +75,12 @@ def load_track_keys(
 
 def load_manifest(checkpoint_dir: str | Path) -> PTManifest:
     data = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
-    shapes = {k: tuple(v) for k, v in data.pop("per_track_param_shapes").items()}
+    # The cadence descriptors `sync_block_depth` / `sync_schedule` were dropped
+    # when schedule selection moved from conversion to the train script; pop them
+    # so manifests written by the old converter still load.
+    data.pop("sync_block_depth", None)
+    data.pop("sync_schedule", None)
+    shapes = {k: tuple(v) for k, v in data.pop("per_track_param_shapes", {}).items()}
     # `top_level_owners` was added later; old manifests omit it.
     top_level_owners = data.pop("top_level_owners", {})
     return PTManifest(

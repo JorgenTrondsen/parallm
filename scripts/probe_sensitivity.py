@@ -59,6 +59,11 @@ def main() -> int:
     p.add_argument("--num-batches", type=int, default=20)
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--svd-energy", action="store_true",
+                   help="Also report the SVD cumulative-energy spectrum of the cross-track delta "
+                        "entering each partial-read layer (low-rank cross-track-exchange viability "
+                        "gate): the fraction of energy a rank-r projection recovers. Adds one SVD "
+                        "per partial-read layer per batch.")
     args = p.parse_args()
 
     depths = [int(d) for d in args.probe_depths.split(",") if d.strip()]
@@ -114,7 +119,10 @@ def main() -> int:
         text_config=cfg.text_config,
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
-        sync_after_layers=manifest.sync_layer_indices,
+        # The probe builds its own windows from --probe-depths, so the student's
+        # own schedule is irrelevant; fall back to a final-layer placeholder when
+        # the manifest carries none (a raw convert output).
+        sync_after_layers=(manifest.sync_layer_indices or [num_layers - 1]),
         track_group=layout.track_group,
     )
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
@@ -126,10 +134,16 @@ def main() -> int:
     tok = AutoTokenizer.from_pretrained(args.hf_model)
 
     # Accumulate per-depth, per-layer metric sums across batches.
-    metric_keys = ("rel_err_partial", "rel_err_synced", "delta_imbalance", "gain_cos", "delta_norm_mean")
+    metric_keys = ("rel_err_partial", "rel_err_synced", "delta_imbalance", "gain_cos",
+                   "delta_norm_mean", "delta_staleness_ratio")
     sums: dict[int, dict[int, dict[str, float]]] = {
         d: {L: {k: 0.0 for k in metric_keys} for L in range(num_layers)} for d in depths
     }
+    SVD_R_GRID = (8, 16, 32, 64, 128, 256)
+    svd_sums = (
+        {d: {L: {r: 0.0 for r in SVD_R_GRID} for L in range(num_layers)} for d in depths}
+        if args.svd_energy else None
+    )
     n_batches = 0
 
     # One data pass; probe every depth on the same batch so the comparison is paired.
@@ -148,10 +162,16 @@ def main() -> int:
         if batch["input_ids"].ndim == 1:
             batch = {k: v.unsqueeze(0) for k, v in batch.items()}
         for d in depths:
-            res = partial_residual_probe(student, teacher, batch, test_schedules[d])
+            res = partial_residual_probe(
+                student, teacher, batch, test_schedules[d],
+                svd_energy=args.svd_energy, svd_r_grid=SVD_R_GRID,
+            )
             for L, m in res.items():
                 for k in metric_keys:
                     sums[d][L][k] += m[k]
+                if args.svd_energy:
+                    for r in SVD_R_GRID:
+                        svd_sums[d][L][r] += m[f"svd_r{r}"]
         n_batches += 1
 
     if rank == 0:
@@ -163,7 +183,8 @@ def main() -> int:
                   f"({n_batches} batches, {args.dataset_name}/{args.split}, "
                   f"weights={args.checkpoint_dir}) =====")
             print(f"{'layer':>5} {'ty':>2} {'pos':>3} {'rel_err_partial':>16} "
-                  f"{'rel_err_synced':>15} {'delta_imbalance':>16} {'gain_cos':>9}")
+                  f"{'rel_err_synced':>15} {'delta_imbalance':>16} {'gain_cos':>9} "
+                  f"{'stale_ratio':>11}")
             for L in range(num_layers):
                 ty = "F" if layer_types[L] == "full_attention" else "L"
                 m = sums[d][L]
@@ -171,7 +192,19 @@ def main() -> int:
                       f"{m['rel_err_partial'] / denom:>16.4e} "
                       f"{m['rel_err_synced'] / denom:>15.4e} "
                       f"{m['delta_imbalance'] / denom:>16.4f} "
-                      f"{m['gain_cos'] / denom:>9.4f}")
+                      f"{m['gain_cos'] / denom:>9.4f} "
+                      f"{m['delta_staleness_ratio'] / denom:>11.4f}")
+            if args.svd_energy:
+                print()
+                print(f"===== Cross-track-delta SVD cumulative energy @ uniform D={d} "
+                      f"(fraction of the missing cross-track content a rank-r exchange "
+                      f"recovers; partial-read layers) =====")
+                print(f"{'layer':>5} {'ty':>2} {'pos':>3}"
+                      + "".join(f"{'r' + str(r):>9}" for r in SVD_R_GRID))
+                for L in range(num_layers):
+                    ty = "F" if layer_types[L] == "full_attention" else "L"
+                    print(f"{L:>5} {ty:>2} {ranges[L]:>3}"
+                          + "".join(f"{svd_sums[d][L][r] / denom:>9.4f}" for r in SVD_R_GRID))
         print()
 
     teacher.remove_hooks()

@@ -40,7 +40,6 @@ import math
 import os
 import random
 import re
-import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -79,8 +78,15 @@ from pt_converter.train.sync_grads import (
     compute_global_grad_norm,
     sync_replicated_grads,
 )
+from pt_converter.eval.sensitivity import debias_partial_error, partial_residual_probe
+from pt_converter.slicer.convert import _resolve_sync_schedule, place_sync_boundaries
 from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_manifest, load_track, load_track_keys
+from pt_converter.utils.checkpoint import (
+    load_manifest,
+    load_track,
+    load_track_keys,
+    save_manifest,
+)
 from pt_converter.utils.mem_report import (
     component_breakdown,
     device_mem,
@@ -96,6 +102,58 @@ def _log(rank: int, msg: str):
 
 
 PROBE_ALPHAS = (1.0, 0.5, 0.25, 0.0)
+
+
+def run_sensitivity_probe(student, teacher, loader, num_layers, args, rank):
+    """Per-layer sync-need score for dynamic sync placement (de-biased).
+
+    Runs ``partial_residual_probe`` over ``--sensitivity-calib-batches`` calibration
+    batches under a uniform reference schedule (``--sensitivity-probe-depth``), which
+    measures, per layer, how wrong the un-synced partial residual leaving it is. The
+    plain ``rel_err_partial`` over-ranks the first few layers (their residual norm is
+    tiny, so the relative error is inflated), so we de-bias via ``debias_partial_error``:
+    the absolute partial error divided by a *floored* teacher norm
+    (``--sensitivity-norm-floor-quantile``; q=0 → pure relative, q=1 → raw, q=0.5 →
+    median floor demotes only the small-norm early layers). The probe all-reduces its
+    metrics, so every rank computes IDENTICAL scores ⇒ the SAME schedule (no broadcast;
+    required for matched collective ordering). The teacher MUST be hooked at every layer
+    (the caller ensures this before narrowing). Returns ``{layer: debiased_score}``.
+    """
+    device = torch.cuda.current_device()
+    ref_sched = tuple(_resolve_sync_schedule(num_layers, args.sensitivity_probe_depth))
+    abs_sum = {L: 0.0 for L in range(num_layers)}
+    rel_sum = {L: 0.0 for L in range(num_layers)}
+    tnorm_sum = {L: 0.0 for L in range(num_layers)}
+    n = 0
+    data_iter = iter(loader)
+    for _ in range(args.sensitivity_calib_batches):
+        try:
+            b = next(data_iter)
+        except StopIteration:
+            break
+        b = {k: v.to(device, non_blocking=True) for k, v in b.items()}
+        if b["input_ids"].ndim == 1:
+            b = {k: v.unsqueeze(0) for k, v in b.items()}
+        res = partial_residual_probe(student, teacher, b, ref_sched)
+        for L, m in res.items():
+            abs_sum[L] += m["abs_err_partial"]
+            rel_sum[L] += m["rel_err_partial"]
+            tnorm_sum[L] += m["teacher_norm"]
+        n += 1
+    n = max(1, n)
+    mean_abs = {L: abs_sum[L] / n for L in range(num_layers)}
+    mean_rel = {L: rel_sum[L] / n for L in range(num_layers)}
+    mean_tnorm = {L: tnorm_sum[L] / n for L in range(num_layers)}
+    q = args.sensitivity_norm_floor_quantile
+    score = debias_partial_error(mean_abs, mean_tnorm, quantile=q)
+    if rank == 0:
+        rel_rank = sorted(range(num_layers), key=lambda L: -mean_rel[L])
+        floor = float(np.quantile(sorted(mean_tnorm.values()), q))
+        _log(rank, "[sched] raw relative top layers: "
+                   + ", ".join(f"L{L}={mean_rel[L]:.3f}" for L in rel_rank[:12]))
+        _log(rank, f"[sched] de-bias norm-floor q={q:g} -> floor={floor:.4g} "
+                   f"(q=0 relative, q=1 raw)")
+    return score
 
 
 def run_fr_grad_probe(student, teacher, loader, distill_cfg, manifest, args, rank):
@@ -127,7 +185,7 @@ def run_fr_grad_probe(student, teacher, loader, distill_cfg, manifest, args, ran
 
     # Param-name → group index: windows by layer id, then embed / lm_head;
     # whatever remains (per-track final norm) lands in the trailing bucket.
-    windows = _block_ranges(manifest.num_layers, tuple(manifest.sync_layer_indices))
+    windows = _block_ranges(manifest.num_layers, tuple(distill_cfg.sync_layer_indices))
     win_of_layer = {l: w for w, (s, e) in enumerate(windows) for l in range(s, e + 1)}
     layer_re = re.compile(r"\.layers\.(\d+)\.")
     group_names = [f"w{w:<2d} L{s}-{e}" for w, (s, e) in enumerate(windows)]
@@ -195,6 +253,30 @@ def main() -> int:
     p.add_argument("--resume-from", default=None,
                    help="Optional checkpoint dir (e.g. an earlier run's best/). Loads track_<id>.safetensors from here instead of --tracks-dir.")
     p.add_argument("--out-dir", default="./pt_train_out")
+    # ----- Sync-boundary placement (chosen here, not at conversion time) -----
+    p.add_argument("--num-sync-boundaries", type=int, default=None,
+                   help="Communication budget: how many sync boundaries (all-reduces) to place. "
+                        "They are placed DYNAMICALLY on the most sensitive layers, measured by a "
+                        "short sensitivity probe at startup (see --sensitivity-*). A sync after the "
+                        "last layer is always included (the final norm needs a synced hidden); the "
+                        "other N-1 go to the highest-sensitivity layers. Required unless "
+                        "--sync-indices is given or resuming a checkpoint that already has a schedule.")
+    p.add_argument("--sync-indices", default=None,
+                   help="Explicit comma-separated sync layer indices, bypassing the probe "
+                        "(reproducibility / fixed-schedule A-B). Overrides --num-sync-boundaries.")
+    p.add_argument("--sensitivity-probe-depth", type=int, default=2,
+                   help="Reference uniform sync depth for the startup sensitivity probe (must "
+                        "divide num_layers). A fine depth makes rel_err_partial a LOCAL per-layer "
+                        "sync-need rather than cumulative depth-drift.")
+    p.add_argument("--sensitivity-calib-batches", type=int, default=8,
+                   help="Number of calibration batches the startup sensitivity probe averages over.")
+    p.add_argument("--sensitivity-norm-floor-quantile", type=float, default=0.5,
+                   help="De-bias the per-layer sensitivity score. The plain relative metric "
+                        "(abs_err / teacher_norm) over-ranks the first few layers because their "
+                        "residual norm is tiny; this divides instead by max(teacher_norm, floor) "
+                        "where floor = this quantile of the per-layer teacher norms. q=0 → pure "
+                        "relative (legacy, early-biased); q=1 → raw error (deep-biased); 0.5 "
+                        "(default) → median floor demotes only the small-norm early layers.")
     p.add_argument("--max-steps", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
@@ -611,9 +693,17 @@ def main() -> int:
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
-        f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
+        f"K={layout.tracks_per_rank} num_layers={manifest.num_layers}",
     )
     _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
+    # When resuming, the prior checkpoint's manifest holds the schedule it was
+    # trained with — reuse it unless the user re-specifies the placement.
+    resume_sched = None
+    if args.resume_from:
+        try:
+            resume_sched = load_manifest(args.resume_from).sync_layer_indices
+        except (FileNotFoundError, ValueError):
+            resume_sched = None
 
     # ----- Load teacher (dense) -----
     cfg = AutoConfig.from_pretrained(args.hf_model)
@@ -650,14 +740,11 @@ def main() -> int:
         teacher_lm_head = teacher_model.lm_head
         fsdp_lm_head = teacher_model.lm_head
 
-    # Intra-window per-layer MSE needs a teacher hidden at EVERY layer (not just
-    # the sync boundaries); otherwise hook only the boundaries (the targets the
-    # block loop consumes). Extra captures cost ~one (B,T,H) bf16 tensor per layer.
-    teacher_hook_indices = (
-        list(range(manifest.num_layers))
-        if args.intra_window_mse
-        else manifest.sync_layer_indices
-    )
+    # Hook EVERY layer initially: the startup sensitivity probe needs a teacher
+    # hidden at each depth. After the schedule is chosen the hooks are narrowed to
+    # the boundaries (unless --intra-window-mse, which also needs every layer), so
+    # training doesn't pin one extra (B,T,H) bf16 tensor per non-boundary layer.
+    teacher_hook_indices = list(range(manifest.num_layers))
     # Batch-sharded teacher (default): each rank forwards ceil(B/world) rows and
     # the captured hiddens are all-gathered back to the full batch on every rank
     # — identical results, ~world_size-fold less teacher compute per rank.
@@ -682,7 +769,10 @@ def main() -> int:
         text_config=cfg.text_config,
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
-        sync_after_layers=manifest.sync_layer_indices,
+        # Placeholder schedule; the real boundaries are installed via
+        # student.set_sync_schedule(...) after the startup sensitivity probe.
+        # (The probe builds its own windows, so it doesn't depend on this.)
+        sync_after_layers=[manifest.num_layers - 1],
         track_group=layout.track_group,
         activation_checkpoint=args.activation_checkpoint,
         checkpoint_granularity=args.checkpoint_granularity,
@@ -835,8 +925,42 @@ def main() -> int:
         torch.set_rng_state(resume_state["torch_rng"].cpu())
         torch.cuda.set_rng_state(resume_state["cuda_rng"].cpu())
 
+    # ----- Resolve the sync schedule (dynamic, sensitivity-driven placement) -----
+    # Precedence: explicit --sync-indices > resumed schedule (unless re-specified)
+    # > probe-and-place from --num-sync-boundaries. The probe all-reduces its
+    # metrics so every rank derives the same schedule deterministically.
+    num_layers = manifest.num_layers
+    if args.sync_indices:
+        chosen = sorted({int(x) for x in args.sync_indices.split(",") if x.strip() != ""})
+        _log(rank, f"[sched] explicit --sync-indices {chosen}")
+    elif resume_sched is not None and args.num_sync_boundaries is None:
+        chosen = sorted(resume_sched)
+        _log(rank, f"[sched] reusing resumed schedule {chosen}")
+    else:
+        if args.num_sync_boundaries is None:
+            raise SystemExit(
+                "[error] pass --num-sync-boundaries N (or --sync-indices, or resume a "
+                "checkpoint that already carries a schedule)"
+            )
+        _log(rank, f"[sched] probing layer sensitivity "
+                   f"({args.sensitivity_calib_batches} batches, ref D={args.sensitivity_probe_depth}) "
+                   f"to place {args.num_sync_boundaries} boundaries…")
+        sensitivity = run_sensitivity_probe(student, teacher, loader, num_layers, args, rank)
+        chosen = place_sync_boundaries(num_layers, args.num_sync_boundaries, sensitivity)
+        if rank == 0:
+            ranked = sorted(range(num_layers), key=lambda L: -sensitivity[L])
+            _log(rank, "[sched] de-biased top layers (placement order): "
+                       + ", ".join(f"L{L}={sensitivity[L]:.3f}" for L in ranked[:12]))
+    _log(rank, f"[sched] sync_layer_indices={chosen} ({len(chosen)} boundaries)")
+    student.set_sync_schedule(chosen)
+    manifest.sync_layer_indices = list(chosen)
+    # Narrow the teacher hooks to the boundaries unless intra-window MSE needs
+    # every layer (the probe is done, so the extra captures are no longer needed).
+    if not args.intra_window_mse:
+        teacher.set_hook_indices(chosen)
+
     distill_cfg = DistillConfig(
-        sync_layer_indices=tuple(manifest.sync_layer_indices),
+        sync_layer_indices=tuple(chosen),
         lambda_block=args.lambda_block,
         lambda_kl=args.lambda_kl,
         lambda_ce=args.lambda_ce,
@@ -875,10 +999,9 @@ def main() -> int:
         ck_dir = Path(args.out_dir) / name
         if rank == 0:
             ck_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(
-                Path(args.tracks_dir) / "manifest.json",
-                ck_dir / "manifest.json",
-            )
+            # Write the structural manifest WITH the dynamically-chosen schedule
+            # (set above), so eval reproduces the exact boundaries trained against.
+            save_manifest(ck_dir, manifest)
         dist.barrier()
         # Collective: all-gather the vocab shards → full embed/lm_head on rank 0
         # (None on peers). Must run on every rank before the per-track loop.

@@ -49,6 +49,7 @@ from pt_converter.train.sync_grads import (
     compute_global_grad_norm,
     sync_replicated_grads,
 )
+from pt_converter.slicer.convert import _resolve_sync_schedule
 from pt_converter.train.teacher import HookedTeacher
 from pt_converter.utils.checkpoint import load_manifest, load_track
 
@@ -70,6 +71,10 @@ def main() -> int:
     p.add_argument("--hf-model", required=True)
     p.add_argument("--tracks-dir", required=True)
     p.add_argument("--steps", type=int, default=2)
+    p.add_argument("--sync-block-depth", type=int, default=4,
+                   help="Uniform sync depth used to build a schedule when the tracks-dir "
+                        "manifest has none (a raw convert output; the real schedule is placed "
+                        "at train time). This check is schedule-agnostic.")
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--sync-attention-heads", action="store_true",
@@ -85,10 +90,15 @@ def main() -> int:
 
     manifest = load_manifest(args.tracks_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
+    sync_layers = (
+        list(manifest.sync_layer_indices)
+        if manifest.sync_layer_indices is not None
+        else _resolve_sync_schedule(manifest.num_layers, args.sync_block_depth)
+    )
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
-        f"K={layout.tracks_per_rank} D={manifest.sync_block_depth}",
+        f"K={layout.tracks_per_rank} syncs={sync_layers}",
     )
 
     cfg = AutoConfig.from_pretrained(args.hf_model)
@@ -112,7 +122,7 @@ def main() -> int:
     teacher = HookedTeacher(
         text_model=text_model,
         lm_head=teacher_model.lm_head,
-        sync_layer_indices=manifest.sync_layer_indices,
+        sync_layer_indices=sync_layers,
     )
     teacher_model = teacher_model.to(torch.cuda.current_device())
     wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
@@ -122,7 +132,7 @@ def main() -> int:
         text_config=text_cfg,
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
-        sync_after_layers=manifest.sync_layer_indices,
+        sync_after_layers=sync_layers,
         track_group=layout.track_group,
     )
     track_states = {tid: load_track(args.tracks_dir, tid) for tid in layout.local_track_ids}
@@ -184,7 +194,7 @@ def main() -> int:
         foreach=False,
     )
     distill_cfg = DistillConfig(
-        sync_layer_indices=tuple(manifest.sync_layer_indices),
+        sync_layer_indices=tuple(sync_layers),
         lambda_block=1.0,
         lambda_kl=1.0,
         lambda_ce=0.5,

@@ -154,6 +154,13 @@ def main() -> int:
 
     manifest = load_manifest(args.checkpoint_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
+    if manifest.sync_layer_indices is None:
+        raise SystemExit(
+            "[error] checkpoint manifest has no sync_layer_indices — point "
+            "--checkpoint-dir at a trained checkpoint (the schedule is placed at "
+            "train time, so a raw convert output carries none)."
+        )
+    sync_layers = list(manifest.sync_layer_indices)
     _log(
         rank,
         f"[init] target={args.target} world={layout.world_size} "
@@ -176,7 +183,7 @@ def main() -> int:
             text_config=cfg.text_config,
             n_tracks=manifest.n_tracks,
             local_track_ids=layout.local_track_ids,
-            sync_after_layers=manifest.sync_layer_indices,
+            sync_after_layers=sync_layers,
             track_group=layout.track_group,
         )
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
@@ -202,7 +209,7 @@ def main() -> int:
         teacher = HookedTeacher(
             text_model=text_model,
             lm_head=teacher_model.lm_head,
-            sync_layer_indices=manifest.sync_layer_indices,
+            sync_layer_indices=sync_layers,
         )
         teacher_model = teacher_model.to(torch.cuda.current_device())
         wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)

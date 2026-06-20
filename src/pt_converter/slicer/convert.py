@@ -24,20 +24,19 @@ from pt_converter.slicer.base import LayerSpec, OwnerOnly, SlicerSpec
 class PTManifest:
     model_type: str
     n_tracks: int
-    sync_block_depth: int  # D — number of layers between sync points
     num_layers: int
     layer_types: list[str]  # one of "full_attention" | "linear_attention"
-    sync_layer_indices: list[int]  # indices *after which* an all-reduce fires
     per_track_param_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # Maps top-level param name -> owner track id for params that live on a
     # single track only (e.g. embed_tokens, lm_head). Absence means "every
     # track holds this param" (replicated or sliced).
     top_level_owners: dict[str, int] = field(default_factory=dict)
-    # How sync_layer_indices was derived: "uniform" (every D layers) or
-    # "full_attn_aligned" (a sync immediately before each full-attention layer
-    # so it reads a synced — exactly decomposable — residual). Self-documenting;
-    # defaulted so old manifests (which omit it) still load.
-    sync_schedule: str = "uniform"
+    # Sync layer indices (after which an all-reduce fires). The schedule is no
+    # longer chosen at conversion time — the train script places it dynamically
+    # on the most sensitive layers (see `place_sync_boundaries`) and writes the
+    # chosen indices here when it saves a checkpoint. `None` in a fresh convert
+    # output (weights are schedule-independent, so the slicer needn't pick one).
+    sync_layer_indices: list[int] | None = None
 
 
 def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
@@ -111,6 +110,43 @@ def _resolve_sync_schedule(
     return [i for i in range(block_depth - 1, num_layers, block_depth)]
 
 
+def place_sync_boundaries(
+    num_layers: int,
+    num_boundaries: int,
+    sensitivity: "dict[int, float] | list[float]",
+) -> list[int]:
+    """Place ``num_boundaries`` sync points on the most sensitive layers.
+
+    The sync schedule is chosen dynamically at train time from a per-layer
+    sensitivity score (higher = the un-synced *partial* residual leaving that
+    layer is more wrong, so a sync there helps more — typically
+    ``rel_err_partial`` from ``partial_residual_probe``). Given a communication
+    budget of ``num_boundaries`` all-reduces, this spends them where they matter.
+
+    A sync after the **last** layer (``num_layers-1``) is always included: the
+    forward only refreshes the residual fed to the post-stack norm at a sync
+    boundary (see ``PTWrappedModel.forward``), so without it the norm / lm_head
+    would read a stale hidden missing the final layers — a correctness
+    requirement, not a sensitivity choice. The remaining ``num_boundaries-1``
+    boundaries are the highest-sensitivity layers among ``0..num_layers-2``.
+    Ties break by (lower) layer index for determinism, so every rank that feeds
+    in the same (all-reduced, identical) sensitivity returns the same schedule.
+
+    Returns sorted 0-based indices "after which an all-reduce fires".
+    """
+    if num_boundaries < 1:
+        raise ValueError(f"num_boundaries must be >= 1, got {num_boundaries}")
+    if num_boundaries > num_layers:
+        raise ValueError(
+            f"num_boundaries {num_boundaries} exceeds num_layers {num_layers}"
+        )
+    forced = num_layers - 1
+    candidates = list(range(num_layers - 1))
+    ranked = sorted(candidates, key=lambda L: (-float(sensitivity[L]), L))
+    chosen = {forced} | set(ranked[: num_boundaries - 1])
+    return sorted(chosen)
+
+
 def _apply_layer_specs(
     source_state: dict[str, torch.Tensor],
     prefix: str,
@@ -138,7 +174,7 @@ def slice_model_to_tracks(
     model: torch.nn.Module,
     *,
     n_tracks: int,
-    sync_block_depth: int,
+    sync_block_depth: int | None = None,
     text_config_attr: str = "config.text_config",
     align_full_attention: bool = False,
 ) -> tuple[list[dict[str, torch.Tensor]], PTManifest]:
@@ -152,10 +188,13 @@ def slice_model_to_tracks(
     `num_attention_heads` / `num_key_value_heads` / etc. For Qwen3.5 this
     is `config.text_config`; for plain text models it can be `config`.
 
-    `align_full_attention` selects the full-attention-aligned sync schedule
-    (a sync immediately before every full-attention layer) instead of the
-    uniform every-D-layers schedule. The per-track weights are identical either
-    way — only `manifest.sync_layer_indices` differs.
+    The sync schedule is **not** chosen here by default: the per-track weights
+    are schedule-independent, so conversion leaves `manifest.sync_layer_indices`
+    as `None` and the train script places the boundaries dynamically (on the most
+    sensitive layers) at startup. `sync_block_depth` (optionally with
+    `align_full_attention`) is retained only as a convenience for tests / ad-hoc
+    callers that want a fixed uniform (or full-attn-aligned) schedule baked in —
+    when given, it pre-populates `sync_layer_indices`.
     """
     # resolve nested attr
     obj: Any = model
@@ -179,18 +218,20 @@ def slice_model_to_tracks(
             f"but config produced unknown types {sorted(unknown)}"
         )
 
-    sync_indices = _resolve_sync_schedule(
-        num_layers, sync_block_depth,
-        layer_types=layer_types, align_full_attention=align_full_attention,
+    sync_indices = (
+        None
+        if sync_block_depth is None
+        else _resolve_sync_schedule(
+            num_layers, sync_block_depth,
+            layer_types=layer_types, align_full_attention=align_full_attention,
+        )
     )
     manifest = PTManifest(
         model_type=model_type,
         n_tracks=n_tracks,
-        sync_block_depth=sync_block_depth,
         num_layers=num_layers,
         layer_types=layer_types,
         sync_layer_indices=sync_indices,
-        sync_schedule="full_attn_aligned" if align_full_attention else "uniform",
     )
 
     source_state = dict(model.state_dict())

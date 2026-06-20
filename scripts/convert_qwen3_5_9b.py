@@ -4,8 +4,11 @@ Usage:
     python scripts/convert_qwen3_5_9b.py \
         --hf-model /home2/jtr020/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha> \
         --out-dir /path/to/pt_tracks \
-        --n-tracks 4 \
-        --sync-block-depth 4
+        --n-tracks 4
+
+The sync schedule is no longer chosen here — the slicer only produces the
+per-track weights (which are schedule-independent). The train script places the
+sync boundaries dynamically on the most sensitive layers.
 
 Runs on CPU (or a single GPU if --device cuda) — the slicer doesn't need
 distributed setup. ~9B bf16 weights = ~18GB host RAM; fine on this node.
@@ -28,15 +31,6 @@ def main() -> int:
     p.add_argument("--hf-model", required=True, help="Path or HF id of the dense source model")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--n-tracks", type=int, default=None, help="Defaults to max-tracks for the model")
-    p.add_argument("--sync-block-depth", type=int, default=4)
-    p.add_argument("--sync-schedule", default="full-attn-aligned", choices=["uniform", "full-attn-aligned"],
-                   help="Where sync boundaries fall. 'full-attn-aligned' (default): a sync "
-                        "immediately BEFORE every full-attention layer (so it reads a synced, "
-                        "exactly decomposable residual) plus a final sync before the norm; gaps "
-                        "longer than --sync-block-depth are subdivided. 'uniform' (legacy): every "
-                        "--sync-block-depth layers. Per-track weights are identical either way — "
-                        "only the manifest's sync_layer_indices differ, so a manifest can be "
-                        "trained/evaluated against existing track shards regardless of schedule.")
     p.add_argument("--device", default="cpu")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     args = p.parse_args()
@@ -59,16 +53,13 @@ def main() -> int:
     ).to(args.device)
     model.eval()
 
-    print(f"[info] slicing into n_tracks={n_tracks}, sync_block_depth={args.sync_block_depth}, "
-          f"sync_schedule={args.sync_schedule}", flush=True)
+    print(f"[info] slicing into n_tracks={n_tracks} "
+          f"(sync schedule is placed at train time, not baked in here)", flush=True)
     tracks, manifest = slice_model_to_tracks(
         model,
         n_tracks=n_tracks,
-        sync_block_depth=args.sync_block_depth,
         text_config_attr="config",
-        align_full_attention=(args.sync_schedule == "full-attn-aligned"),
     )
-    print(f"[info] sync_layer_indices={manifest.sync_layer_indices}", flush=True)
 
     print(f"[info] writing {len(tracks)} track shards to {args.out_dir}", flush=True)
     save_tracks(args.out_dir, tracks, manifest)
