@@ -277,6 +277,15 @@ def main() -> int:
                         "where floor = this quantile of the per-layer teacher norms. q=0 → pure "
                         "relative (legacy, early-biased); q=1 → raw error (deep-biased); 0.5 "
                         "(default) → median floor demotes only the small-norm early layers.")
+    p.add_argument("--resync-probe-every", type=int, default=0,
+                   help="0 (default) = the sync schedule is placed ONCE at startup (on the "
+                        "untrained probe) and frozen. >0 = re-run the sensitivity probe on the "
+                        "CURRENT (training) weights every N steps and re-place the same number of "
+                        "boundaries, so the schedule adapts as the model learns instead of being "
+                        "pinned by the untrained probe. The weights are schedule-independent, so "
+                        "this needs no remap; the probe all-reduces its metrics so every rank "
+                        "re-places identically. Ignored when --sync-indices is explicit (the user "
+                        "pinned the schedule).")
     p.add_argument("--max-steps", type=int, default=1000)
     p.add_argument("--seq-len", type=int, default=4096)
     p.add_argument("--batch-size", type=int, default=1)
@@ -403,6 +412,11 @@ def main() -> int:
                         "~52 GB at n=16). 0 disables it; use --eval-every to drive best/ saves instead.")
     p.add_argument("--save-final", action="store_true",
                    help="Write final/ when training exits (loop done or early-stopped).")
+    p.add_argument("--save-weights-only", action="store_true",
+                   help="Skip the per-rank optimizer/RNG train_state when saving checkpoints "
+                        "(~35 GB at n=16) — write only the track weights. Halves "
+                        "checkpoint size for quota-tight runs whose checkpoints are only needed "
+                        "for eval / a weight-warm-start finisher (NOT optimizer-resumable).")
     p.add_argument("--best-name", default="best",
                    help="Directory name (under --out-dir) for the best-val_kl checkpoint. "
                         "Default 'best'. Set e.g. 'best_fr' on a warm-start finishing run "
@@ -585,9 +599,45 @@ def main() -> int:
                         "every N steps.")
     p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--early-stop-patience", type=int, default=0,
-                   help="0 disables early stop. Otherwise stop after N eval windows with no val_kl improvement.")
+                   help="0 disables early stop. Otherwise stop after N eval windows of the "
+                        "SELECTION metric (--selection-metric) with no improvement.")
     p.add_argument("--min-improvement", type=float, default=0.01,
-                   help="Min val_kl drop to count as an improvement.")
+                   help="Min improvement of the selection metric to count as a new best — a "
+                        "val_kl DROP when --selection-metric val_kl, a downstream accuracy GAIN "
+                        "when --selection-metric downstream.")
+    # ----- Downstream-aligned selection (in-loop lm-eval; see eval/downstream.py) -----
+    p.add_argument("--selection-metric", choices=["val_kl", "downstream"], default="val_kl",
+                   help="Which metric drives best/ saves + early stop. 'val_kl' (default, "
+                        "legacy): KL(teacher||student) on the held-out val set (LOWER better). "
+                        "'downstream': in-loop lm-eval accuracy on --downstream-tasks (HIGHER "
+                        "better) — the metric the project's findings say to trust, since KL/ppl "
+                        "can read recovered while hard-reasoning retention collapses. Requires "
+                        "--downstream-eval-every > 0.")
+    p.add_argument("--downstream-eval-every", type=int, default=0,
+                   help="0 disables the in-loop downstream eval. >0 runs a small lm-eval pass "
+                        "(--downstream-tasks, capped by --downstream-limit) every N steps; logged "
+                        "always, and drives best/ + early stop when --selection-metric downstream. "
+                        "Heavier than the val_kl eval, so use a coarser cadence.")
+    p.add_argument("--downstream-tasks", default="arc_challenge,winogrande",
+                   help="Comma-separated lm-eval task names for the in-loop downstream eval "
+                        "(multiple-choice / loglikelihood tasks only). Default arc_challenge + "
+                        "winogrande — the hard-reasoning tasks the proxy was found to mask.")
+    p.add_argument("--downstream-limit", type=int, default=200,
+                   help="Cap requests per task for the in-loop downstream eval (relative-signal "
+                        "subset, not the full benchmark). The standalone scripts/eval_lm_harness.py "
+                        "is the final unlimited judge.")
+    p.add_argument("--downstream-batch-size", type=int, default=4,
+                   help="Requests per forward for the in-loop downstream eval. Lower than the "
+                        "training batch — under vocab-parallel each rank gathers full (B,T,V) "
+                        "logits for scoring.")
+    p.add_argument("--downstream-max-length", type=int, default=2048,
+                   help="Context truncation length for the in-loop downstream eval (cap; the "
+                        "multiple-choice tasks are far shorter than this).")
+    p.add_argument("--downstream-num-fewshot", type=int, default=0,
+                   help="Fewshot count for the in-loop downstream eval. Default 0 (zero-shot) "
+                        "keeps contexts short and the eval fast — a fine RELATIVE signal across "
+                        "checkpoints. The standalone scripts/eval_lm_harness.py uses each task's "
+                        "standard shot count for the final absolute numbers.")
     p.add_argument("--warmup-steps", type=int, default=0,
                    help="Linear LR warmup steps. 0 = no warmup phase. A schedule is built "
                         "when this is >0 OR --cosine-decay is set.")
@@ -622,6 +672,9 @@ def main() -> int:
                     "forward; the KL/CE/logit-MSE backward shares that graph and would be "
                     "silently damped too. Run with --lambda-kl 0 --lambda-ce 0 "
                     "--lambda-logit-mse 0.")
+    if args.selection_metric == "downstream" and args.downstream_eval_every <= 0:
+        p.error("--selection-metric downstream requires --downstream-eval-every > 0 (the "
+                "downstream eval is what produces the selection metric).")
 
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
@@ -701,7 +754,8 @@ def main() -> int:
     resume_sched = None
     if args.resume_from:
         try:
-            resume_sched = load_manifest(args.resume_from).sync_layer_indices
+            rm = load_manifest(args.resume_from)
+            resume_sched = rm.sync_layer_indices
         except (FileNotFoundError, ValueError):
             resume_sched = None
 
@@ -764,15 +818,16 @@ def main() -> int:
     mem_stage("teacher loaded (FSDP-sharded)")
 
     # ----- Build per-rank student and load its K track shards -----
+    # Placeholder schedule; the real boundaries are installed via
+    # student.set_sync_schedule(...) after the startup sensitivity probe (or from
+    # --sync-indices / a resumed manifest).
+    init_sync_after = [manifest.num_layers - 1]
     _log(rank, f"[init] building PT student for tracks {layout.local_track_ids}…")
     student = PTWrappedModel(
         text_config=cfg.text_config,
         n_tracks=manifest.n_tracks,
         local_track_ids=layout.local_track_ids,
-        # Placeholder schedule; the real boundaries are installed via
-        # student.set_sync_schedule(...) after the startup sensitivity probe.
-        # (The probe builds its own windows, so it doesn't depend on this.)
-        sync_after_layers=[manifest.num_layers - 1],
+        sync_after_layers=init_sync_after,
         track_group=layout.track_group,
         activation_checkpoint=args.activation_checkpoint,
         checkpoint_granularity=args.checkpoint_granularity,
@@ -883,8 +938,9 @@ def main() -> int:
     # student_fwd peak under vocab-parallel — it does NOT raise the step peak. The
     # old foreach=False was to avoid OOM on the LEGACY rank-0-heavy layout (rank 0
     # carried embed+lm_head+K tracks at ~36 GB); vocab-parallel balanced that away.
+    param_groups = [{"params": [p for p in student.parameters() if p.requires_grad], "lr": args.lr}]
     optim = torch.optim.AdamW(
-        [p for p in student.parameters() if p.requires_grad],
+        param_groups,
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=0.0,
@@ -954,8 +1010,15 @@ def main() -> int:
     _log(rank, f"[sched] sync_layer_indices={chosen} ({len(chosen)} boundaries)")
     student.set_sync_schedule(chosen)
     manifest.sync_layer_indices = list(chosen)
+    # Communication budget held fixed for any mid-run re-placement (--resync-probe-every):
+    # re-place the SAME number of boundaries on the current weights.
+    num_boundaries = len(chosen)
+    # Re-placement is only meaningful when the schedule was probe-driven (an
+    # explicit --sync-indices is a user pin and must stay put).
+    can_resync = args.resync_probe_every > 0 and not args.sync_indices
     # Narrow the teacher hooks to the boundaries unless intra-window MSE needs
     # every layer (the probe is done, so the extra captures are no longer needed).
+    # Re-placement re-hooks every layer transiently, then narrows back.
     if not args.intra_window_mse:
         teacher.set_hook_indices(chosen)
 
@@ -1028,18 +1091,23 @@ def main() -> int:
         # Per-rank training state: optimizer (per-rank because each rank holds
         # different params), plus the shared step / scheduler / best-val / RNG
         # (saved redundantly across ranks, simpler than coordinating one writer).
-        train_state = {
-            "optimizer": optim.state_dict(),
-            "step": step,
-            "best_val_kl": best_val_kl,
-            "windows_since_best": windows_since_best,
-            "relmse_ema": relmse_ema,
-            "torch_rng": torch.get_rng_state(),
-            "cuda_rng": torch.cuda.get_rng_state(),
-        }
-        if scheduler is not None:
-            train_state["scheduler"] = scheduler.state_dict()
-        torch.save(train_state, str(ck_dir / f"train_state_rank{rank}.pt"))
+        # Skipped under --save-weights-only (the ~35 GB optimizer is not needed for
+        # eval / a weight-warm-start finisher) — the checkpoint is then not
+        # optimizer-resumable.
+        if not args.save_weights_only:
+            train_state = {
+                "optimizer": optim.state_dict(),
+                "step": step,
+                "best_val_kl": best_val_kl,
+                "best_downstream": best_downstream,
+                "windows_since_best": windows_since_best,
+                "relmse_ema": relmse_ema,
+                "torch_rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state(),
+            }
+            if scheduler is not None:
+                train_state["scheduler"] = scheduler.state_dict()
+            torch.save(train_state, str(ck_dir / f"train_state_rank{rank}.pt"))
         dist.barrier()
 
     def run_eval() -> tuple[float, float]:
@@ -1075,19 +1143,70 @@ def main() -> int:
         sums = sums / max(1, n)
         return sums[0].item(), sums[1].item()
 
+    def run_downstream() -> dict:
+        """Small in-loop lm-eval pass; returns a broadcast {score, per_task}.
+
+        Reuses the PTLM adapter (see eval/downstream.py). Every rank runs identical
+        lm-eval code so the in-forward SyncBoundary collectives line up; the
+        aggregate score is broadcast from rank 0 so the (collective) best/ save and
+        early-stop decisions are taken identically on every rank.
+        """
+        from pt_converter.eval.downstream import run_downstream_eval
+
+        student.eval()
+        res = run_downstream_eval(
+            student, tok,
+            tasks=[t.strip() for t in args.downstream_tasks.split(",") if t.strip()],
+            limit=args.downstream_limit,
+            batch_size=args.downstream_batch_size,
+            max_length=args.downstream_max_length,
+            num_fewshot=args.downstream_num_fewshot,
+            seed=args.seed,
+            rank=rank,
+        )
+        student.train()
+        return res
+
+    def _do_selection(improved: bool, label: str) -> None:
+        """Save best/ and advance the early-stop window on the SELECTION metric.
+
+        Called from exactly one of the two eval blocks (whichever matches
+        --selection-metric), so windows_since_best counts windows of that single
+        metric. save_checkpoint and stop_now are collective / loop-controlling, so
+        ``improved`` must be identical on every rank — val_kl is global under
+        vocab-parallel and the downstream score is broadcast from rank 0.
+        """
+        nonlocal windows_since_best, stop_now
+        if improved:
+            windows_since_best = 0
+            _log(rank, f"  -> new best ({label}); saving {args.best_name}/")
+            save_checkpoint(args.best_name)
+        else:
+            windows_since_best += 1
+            _log(rank, f"  -> no improvement ({label}; "
+                       f"{windows_since_best}/{args.early_stop_patience})")
+        if args.early_stop_patience > 0 and windows_since_best >= args.early_stop_patience:
+            _log(rank, f"[early-stop] {label} stalled "
+                       f"(best_val_kl={best_val_kl:.4f} best_downstream={best_downstream:.4f})")
+            stop_now = True
+
     if resume_state is not None:
         step = int(resume_state["step"])
         # .get for back-compat with pre-val_kl checkpoints: the old metric
         # (best_val_ce) is in different units and not comparable, so we just
         # start val_kl tracking fresh on resume from such a checkpoint.
         best_val_kl = float(resume_state.get("best_val_kl", float("inf")))
+        best_downstream = float(resume_state.get("best_downstream", float("-inf")))
         windows_since_best = int(resume_state.get("windows_since_best", 0))
         relmse_ema = resume_state.get("relmse_ema", None)
         _log(rank, f"[init] resumed at step={step} best_val_kl={best_val_kl:.4f} "
+                   f"best_downstream={best_downstream:.4f} "
                    f"windows_since_best={windows_since_best}")
     else:
         step = 0
         best_val_kl = float("inf")
+        # Best downstream accuracy so far (higher = better; -inf until first eval).
+        best_downstream = float("-inf")
         windows_since_best = 0
         # Per-tap relative-MSE EMA for --adaptive-layer-weight (None until the
         # first step measures it). Identical on every rank (built from synced relMSE).
@@ -1340,27 +1459,47 @@ def main() -> int:
             # untouched and protects model quality.
             save_checkpoint("latest")
 
+        if can_resync and step > 0 and step % args.resync_probe_every == 0:
+            # Re-place the sync boundaries on the CURRENT (trained) weights — the
+            # startup probe ran on the untrained slice. Re-hook every teacher layer
+            # for the probe, re-place the SAME budget, then narrow the hooks back.
+            # All gating is on `step`, and the probe all-reduces its metrics, so
+            # every rank re-places identically (collectives stay aligned).
+            teacher.set_hook_indices(list(range(num_layers)))
+            sensitivity = run_sensitivity_probe(student, teacher, loader, num_layers, args, rank)
+            new_sched = place_sync_boundaries(num_layers, num_boundaries, sensitivity)
+            if tuple(new_sched) != tuple(student.sync_after_layers):
+                _log(rank, f"[resync step={step}] {list(student.sync_after_layers)} -> {new_sched}")
+                student.set_sync_schedule(new_sched)
+                distill_cfg = replace(distill_cfg, sync_layer_indices=tuple(new_sched))
+                manifest.sync_layer_indices = list(new_sched)
+            else:
+                _log(rank, f"[resync step={step}] schedule unchanged ({new_sched})")
+            teacher.set_hook_indices(
+                list(range(num_layers)) if args.intra_window_mse
+                else list(student.sync_after_layers)
+            )
+
         if val_loader is not None and step > 0 and step % args.eval_every == 0:
             val_kl, val_ce = run_eval()
-            improved = val_kl < (best_val_kl - args.min_improvement)
-            if improved:
+            kl_improved = val_kl < (best_val_kl - args.min_improvement)
+            if kl_improved:
                 best_val_kl = val_kl
-                windows_since_best = 0
-                _log(
-                    rank,
-                    f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f} (new best)",
-                )
-                save_checkpoint(args.best_name)
-            else:
-                windows_since_best += 1
-                _log(
-                    rank,
-                    f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f} "
-                    f"(no improvement; {windows_since_best}/{args.early_stop_patience})",
-                )
-            if args.early_stop_patience > 0 and windows_since_best >= args.early_stop_patience:
-                _log(rank, f"[early-stop] val_kl hasn't improved in {args.early_stop_patience} windows (best={best_val_kl:.4f})")
-                stop_now = True
+            tag = "" if args.selection_metric == "val_kl" else " (logging only)"
+            _log(rank, f"[eval step={step}] val_kl={val_kl:.4f} val_ce={val_ce:.4f}{tag}")
+            if args.selection_metric == "val_kl":
+                _do_selection(kl_improved, "val_kl")
+
+        if args.downstream_eval_every > 0 and step > 0 and step % args.downstream_eval_every == 0:
+            ds = run_downstream()
+            ds_improved = ds["score"] > (best_downstream + args.min_improvement)
+            if ds_improved:
+                best_downstream = ds["score"]
+            per_task = " ".join(f"{t}={a:.4f}" for t, a in sorted(ds["per_task"].items()))
+            tag = "" if args.selection_metric == "downstream" else " (logging only)"
+            _log(rank, f"[downstream step={step}] score={ds['score']:.4f} {per_task}{tag}")
+            if args.selection_metric == "downstream":
+                _do_selection(ds_improved, "downstream")
 
         # Close the trace window (symmetric across ranks) once it has run its
         # TRACE_ACTIVE steps. Remaining steps run un-traced.
