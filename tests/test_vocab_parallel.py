@@ -92,14 +92,19 @@ def _fixture(seed=0, B=2, T=12, D=16, V=40):
     return hidden, lm_w, teacher_logits, labels, attn
 
 
+@pytest.mark.parametrize("divergence", ["forward_kl", "reverse_kl", "jsd"])
 @pytest.mark.parametrize("lambda_logit_mse", [0.0, 0.3])
 @pytest.mark.parametrize("kl_temperature", [1.0, 2.0])
 @pytest.mark.parametrize("chunk_size", [64, 5])
-def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size, lambda_logit_mse):
+def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size, lambda_logit_mse, divergence):
+    # The VP path's divergence backward is HAND-DERIVED (collective-free); the
+    # dense path goes through autograd. Their agreement on values AND grads is
+    # the gradcheck for all three divergence modes.
     hidden0, lm_w, teacher_logits, labels, attn = _fixture()
     V, D = lm_w.shape
     kw = dict(lambda_kl=1.0, lambda_ce=0.5, lambda_logit_mse=lambda_logit_mse,
-              kl_temperature=kl_temperature, chunk_size=chunk_size)
+              kl_temperature=kl_temperature, chunk_size=chunk_size,
+              divergence=divergence)
 
     # Dense reference. The helper now RETURNS the grad w.r.t. hidden; the caller
     # drives the backward (one traversal, combinable with other graph-rooted losses).
@@ -135,6 +140,45 @@ def test_vp_klce_world1_matches_dense(kl_temperature, chunk_size, lambda_logit_m
         assert lm_v.detach().item() == 0.0
     else:
         assert torch.allclose(lm_v, expected_lm, atol=1e-5, rtol=1e-4), (lm_v, expected_lm)
+
+
+def test_divergence_values_match_reference_formulas():
+    # Independent value anchor: each divergence computed from first principles on
+    # the full softmax distributions must equal _kl_ce_chunked's output. Also pins
+    # forward_kl as the default (bit-identical legacy behaviour).
+    hidden0, lm_w, teacher_logits, labels, attn = _fixture(seed=5)
+    V, D = lm_w.shape
+    lm = nn.Linear(D, V, bias=False)
+    lm.weight.data.copy_(lm_w)
+    T = 2.0
+    s = (hidden0 @ lm_w.t()).float() / T
+    t = teacher_logits.float() / T
+    p_s, p_t = torch.softmax(s, -1), torch.softmax(t, -1)
+    ls, lt = torch.log_softmax(s, -1), torch.log_softmax(t, -1)
+    m = 0.5 * (p_s + p_t)
+    denom = attn.sum()
+    refs = {
+        "forward_kl": ((p_t * (lt - ls)).sum(-1) * attn).sum() / denom * T * T,
+        "reverse_kl": ((p_s * (ls - lt)).sum(-1) * attn).sum() / denom * T * T,
+        "jsd": (0.5 * ((p_s * (ls - m.log())).sum(-1) + (p_t * (lt - m.log())).sum(-1))
+                * attn).sum() / denom * T * T,
+    }
+    for div, expected in refs.items():
+        kl, _ce, _lm, _g = _kl_ce_chunked(
+            hidden0.clone(), lm, teacher_logits, labels, attn,
+            lambda_kl=1.0, lambda_ce=0.0, kl_temperature=T, chunk_size=7,
+            compute_grads=False, divergence=div,
+        )
+        assert torch.allclose(kl, expected, atol=1e-5, rtol=1e-4), (div, kl, expected)
+    # Default (no divergence arg) == forward_kl.
+    kl_default, _, _, _ = _kl_ce_chunked(
+        hidden0.clone(), lm, teacher_logits, labels, attn,
+        lambda_kl=1.0, lambda_ce=0.0, kl_temperature=T, chunk_size=7,
+        compute_grads=False,
+    )
+    assert torch.equal(kl_default, refs["forward_kl"].to(kl_default.dtype)) or torch.allclose(
+        kl_default, refs["forward_kl"], atol=1e-6
+    )
 
 
 def test_vp_embedding_partials_sum_to_dense():

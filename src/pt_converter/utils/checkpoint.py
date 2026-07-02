@@ -73,6 +73,35 @@ def load_track_keys(
     return out
 
 
+def save_cross_head(out_dir: str | Path, estimator) -> None:
+    """Write the cross-head estimator sidecar (``cross_head.safetensors`` +
+    ``cross_head.json``).
+
+    Kept OUT of the per-track shards (so ``load_track_state_dicts`` is untouched).
+    The module is replicated bit-identically across ranks, so only rank 0 needs to
+    call this.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    sd = {k: v.detach().contiguous().clone().cpu() for k, v in estimator.state_dict().items()}
+    save_safetensors(sd, str(out / "cross_head.safetensors"))
+    (out / "cross_head.json").write_text(json.dumps(estimator.config_dict(), indent=2))
+
+
+def load_cross_head(checkpoint_dir: str | Path):
+    """Rebuild the cross-head estimator from a checkpoint's sidecar, or ``None`` if
+    the checkpoint has none. Returns an eval-ready ``CrossHeadEstimator`` on CPU."""
+    cfg_path = Path(checkpoint_dir) / "cross_head.json"
+    if not cfg_path.exists():
+        return None
+    from pt_converter.model.cross_head_estimator import CrossHeadEstimator
+
+    cfg = json.loads(cfg_path.read_text())
+    est = CrossHeadEstimator(**cfg)
+    est.load_state_dict(load_safetensors(str(Path(checkpoint_dir) / "cross_head.safetensors")))
+    return est
+
+
 def load_manifest(checkpoint_dir: str | Path) -> PTManifest:
     data = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
     # The cadence descriptors `sync_block_depth` / `sync_schedule` were dropped

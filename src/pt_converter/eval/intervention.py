@@ -52,6 +52,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from pt_converter.eval.sensitivity import _svd_cumulative_energy
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.train.distill import _block_ranges
 
@@ -386,3 +387,546 @@ def intervention_forward(
                 per_track_h = [y + s for y, s in zip(new_h, subs)]
 
     return tm0.norm(block_start)
+
+
+# --------------------------------------------------------------------------- #
+# Intra-block (post-attention) seam intervention — for the D=1 cross-head study.
+#
+# The whole-layer ``intervention_forward`` above substitutes at the layer
+# *output* (the input to the next layer), so it can model the D≥2 gap (a layer
+# reading a partial residual). At D=1 the residual is synced before EVERY layer,
+# so that harness has nothing to substitute — D=1's *only* remaining gap is
+# INSIDE the block: the post-attention RMSNorm + MLP see ``X + Y_self`` (this
+# track's partial token-mixer output) instead of ``X + ΣY``.
+#
+# This seam version splits the HF ``Qwen3_5DecoderLayer`` at that point and
+# injects a reconstruction of the missing ``Σ_{others} Y`` into the MLP input,
+# while carrying only the TRUE per-track residual delta (``Y_self + mlp_partial``
+# — the substitute is NOT carried, so the boundary SyncBoundary never re-sums it
+# K×; see ``project_cross_track_estimator`` trunk note). Anchors:
+#   * ``zero``   → MLP reads ``X + Y_self``   = the current D=1 forward.
+#   * ``oracle`` → MLP reads ``X + ΣY``       = the dense teacher (exact at D=1).
+# The same ``Channel`` classes apply, now on ``other_k = ΣY − Y_self_k`` (the
+# missing token-mixer output) instead of the missing residual delta.
+# --------------------------------------------------------------------------- #
+def _seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids):
+    """First half of ``Qwen3_5DecoderLayer``: ``input_layernorm`` → token mixer →
+    residual-add. Returns ``(h_attn = x + Y, Y)`` where ``Y`` is the per-track
+    token-mixer (self-attn or gated-delta) output before the residual add."""
+    residual = x
+    h = layer.input_layernorm(x)
+    if layer.layer_type == "linear_attention":
+        y = layer.linear_attn(
+            hidden_states=h, cache_params=None, attention_mask=attention_mask
+        )
+    else:
+        y, _ = layer.self_attn(
+            hidden_states=h,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=None,
+            position_embeddings=position_embeddings,
+        )
+    return residual + y, y
+
+
+def _seam_mlp(layer, h_attn, s):
+    """Second half: ``post_attention_layernorm(h_attn + s)`` → ``mlp`` → residual-add
+    onto ``h_attn``. The substitute ``s`` augments the MLP INPUT only; the carried
+    residual is ``h_attn + mlp_partial`` (``s`` excluded)."""
+    mlp_in = h_attn if s is None else h_attn + s
+    return h_attn + layer.mlp(layer.post_attention_layernorm(mlp_in))
+
+
+@torch.no_grad()
+def seam_intervention_forward(
+    student: PTWrappedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    sync_indices: Sequence[int],
+    channel: Channel,
+) -> torch.Tensor:
+    """Free-running student forward with a cross-HEAD substitution at the
+    post-attention seam of every layer. Returns the post-final-norm hidden
+    ``(B, T, H)`` (pre-``lm_head``), identical on every rank.
+
+    Designed for D=1 (``sync_indices`` = every layer): each layer starts from the
+    synced residual, the token mixer is exact, and ``channel`` reconstructs the
+    missing ``Σ_{others} Y`` fed to the MLP. ``OracleChannel`` reproduces the dense
+    teacher; ``ZeroChannel`` reproduces the current D=1 forward. (For D≥2 windows it
+    fixes only the post-attn gap, not the token-mixer-on-partial gap.)
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
+    inputs_embeds = student.embed(input_ids)
+    tm0 = student.text_models[0]
+    position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
+    causal_mask = create_causal_mask(
+        config=tm0.config, inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+        past_key_values=None, position_ids=text_position_ids,
+    )
+    linear_attn_mask = (
+        None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
+    )
+    position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
+    num_layers = len(tm0.layers)
+    group = student.sync_module.track_group
+
+    block_start = inputs_embeds
+    for start, end in _block_ranges(num_layers, sync_indices):
+        base = block_start
+        per_track_h = [block_start for _ in student.text_models]
+        for layer_idx in range(start, end + 1):
+            # First half: token mixer per track on the carried (partial) residual.
+            h_attn: list[torch.Tensor] = []
+            y_list: list[torch.Tensor] = []
+            for k, tm in enumerate(student.text_models):
+                layer = tm.layers[layer_idx]
+                layer_mask = (
+                    linear_attn_mask
+                    if tm.config.layer_types[layer_idx] == "linear_attention"
+                    else causal_mask
+                )
+                ha, y = _seam_token_mixer(
+                    layer, per_track_h[k], position_embeddings, layer_mask, text_position_ids
+                )
+                h_attn.append(ha)
+                y_list.append(y)
+            # ΣY across all tracks (the would-be attention-output all-reduce), then
+            # the missing cross-head content for each track and the channel's stand-in.
+            sumY = _sum_track_deltas(y_list, group)
+            others = [sumY - y for y in y_list]
+            subs = channel(others, layer_idx)
+            # Second half: MLP on the augmented input; carry only the true delta.
+            new_h = [_seam_mlp(tm.layers[layer_idx], h_attn[k], subs[k])
+                     for k, tm in enumerate(student.text_models)]
+            deltas = [o - x for o, x in zip(new_h, per_track_h)]
+            full = base + _sum_track_deltas(deltas, group)
+            base = full
+            if layer_idx == end:
+                block_start = full
+            else:
+                per_track_h = new_h  # carry the TRUE partial residual (substitute excluded)
+
+    return tm0.norm(block_start)
+
+
+# --------------------------------------------------------------------------- #
+# Phased (post-attn, D≥1) intervention — the WRITE-SIDE memory-correction gate.
+#
+# In the phased forward (``PTWrappedModel._run_post_attn_stack``: post-attn sync
+# at every boundary except the last layer, post-MLP sync at the last, all
+# non-boundary layers fully partial) every token mixer computes on a residual
+# missing 1–3 sublayers of Σ_others. That corrupts TWO distinct things:
+#   (i)  the current token's READ  — q (and the gated-delta output gate z);
+#   (ii) the MEMORY it WRITES     — the KV-cache entry (full-attn k/v) and the
+#        gated-delta recurrent state update (k/v slices + write gate b + decay a).
+# (ii) is retroactively correctable at decode with ZERO new sync events: the true
+# residual at layer i's input is known 1–2 layers later at the EXISTING boundary
+# all-reduce (ship per-sublayer sums instead of one lumped delta — volume, not
+# frequency), so each track can recompute token T's write-side quantities and
+# overwrite its cache entry / redo one recurrence step before token T+1 reads
+# them. Past-token memory becomes EXACT — no prediction, no staleness (unlike
+# every refuted channel, nothing substitutes the CURRENT token's missing content).
+#
+# ``phased_intervention_forward`` measures how much of the phased-D2 gap that
+# write-side corruption owns. Modes (``PhasedMode``):
+#   * ``zero``   — no substitution ⇒ the deployed phased forward (floor anchor).
+#   * ``oracle`` — per-track carry replaced by the exact full residual after every
+#                  sublayer ⇒ perfect-delivery ceiling for these weights.
+#   * ``kv``     — the gate: write-side projection inputs swapped to
+#                  ``ln_full = input_layernorm(full residual)``; q/z, the MLP and
+#                  the carried residual stay partial. All-positions swap (incl.
+#                  the diagonal) ⇒ a slightly optimistic upper bound on the
+#                  strictly-past deployable form (~1/T of reads at MC lengths).
+#   * ``q``      — the read-side complement (q + z from ``ln_full``, write side
+#                  partial). NOT deploy-realizable; interprets the split.
+# The exact full residual is the same telescoping running sum the whole-layer
+# harness uses (``_sum_track_deltas`` after each sublayer), so ``zero`` matches
+# the deployed forward up to fp summation order — the established anchor standard.
+# --------------------------------------------------------------------------- #
+_PHASED_MODES = ("zero", "oracle", "kv", "q")
+
+
+class PhasedMode:
+    """Mode marker for ``phased_intervention_forward`` (duck-types ``Channel.name``
+    so the probe's anchor/%head bookkeeping applies unchanged)."""
+
+    def __init__(self, name: str):
+        if name not in _PHASED_MODES:
+            raise ValueError(
+                f"unknown phased mode {name!r} (choose from {', '.join(_PHASED_MODES)})"
+            )
+        self.name = name
+
+
+def _apply_padding_mask(h: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
+    """Mirror HF's ``apply_mask_to_padding_states`` (GatedDeltaNet zeroes padded
+    positions of its input before projecting — the swap source must match)."""
+    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        return (h * attention_mask[:, :, None]).to(h.dtype)
+    return h
+
+
+class _MixerWriteSwap:
+    """Within ONE token-mixer call, source the WRITE-side projection inputs
+    (mode ``kv``: full-attn ``k_proj``/``v_proj``; gated-delta k/v output slices +
+    ``in_proj_b`` write gate + ``in_proj_a`` decay) — or the READ-side (mode ``q``:
+    full-attn ``q_proj``; gated-delta q slice + ``in_proj_z`` output gate) — from
+    ``alt`` (the exact full-residual layernorm) instead of the track's partial
+    input. Hook-based so the HF layer forward stays untouched; the fused
+    ``in_proj_qkv`` is split at its OUTPUT (the causal conv is depthwise —
+    ``groups=conv_dim`` — so a pre-conv slice swap stays clean). Modes ``zero`` /
+    ``oracle`` install nothing."""
+
+    def __init__(self, layer, mode: str, alt: torch.Tensor,
+                 lin_mask: torch.Tensor | None = None):
+        self.layer, self.mode = layer, mode
+        self.handles: list = []
+        if layer.layer_type == "linear_attention":
+            alt = _apply_padding_mask(alt, lin_mask)
+        self.alt = alt
+
+    def __enter__(self):
+        if self.mode not in ("kv", "q"):
+            return self
+        alt = self.alt
+
+        def pre(module, args):
+            return (alt,) + tuple(args[1:])
+
+        if self.layer.layer_type == "linear_attention":
+            gdn = self.layer.linear_attn
+            kd = gdn.key_dim  # in_proj_qkv output layout: [q (kd) | k (kd) | v]
+            alt_from_kd = self.mode == "kv"
+
+            def qkv_hook(module, args, out):
+                alt_out = F.linear(alt, module.weight)
+                if alt_from_kd:
+                    return torch.cat([out[..., :kd], alt_out[..., kd:]], dim=-1)
+                return torch.cat([alt_out[..., :kd], out[..., kd:]], dim=-1)
+
+            self.handles.append(gdn.in_proj_qkv.register_forward_hook(qkv_hook))
+            side = (gdn.in_proj_b, gdn.in_proj_a) if self.mode == "kv" else (gdn.in_proj_z,)
+        else:
+            attn = self.layer.self_attn
+            side = (attn.k_proj, attn.v_proj) if self.mode == "kv" else (attn.q_proj,)
+        for m in side:
+            self.handles.append(m.register_forward_pre_hook(pre))
+        return self
+
+    def __exit__(self, *exc):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+        return False
+
+
+@torch.no_grad()
+def phased_intervention_forward(
+    student: PTWrappedModel,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    sync_indices: Sequence[int],
+    channel: "PhasedMode",
+) -> torch.Tensor:
+    """Free-running PHASED (post-attn) student forward with a per-mixer role-
+    targeted substitution (see the section comment above). Returns the
+    post-final-norm hidden ``(B, T, H)`` (pre-``lm_head``), identical on every
+    rank. Mirrors ``PTWrappedModel._run_post_attn_stack`` semantics: post-attn
+    sync at every boundary in ``sync_indices`` except the final layer, post-MLP
+    sync at the final layer, non-boundary layers fully partial. Every rank must
+    call it in lockstep (per-sublayer all-reduces maintain the exact full
+    residual). A checkpoint ``cross_head`` is intentionally ignored — the gate
+    targets the plain phased frontier."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
+    mode = channel.name
+    inputs_embeds = student.embed(input_ids)
+    tm0 = student.text_models[0]
+    position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
+    causal_mask = create_causal_mask(
+        config=tm0.config, inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+        past_key_values=None, position_ids=text_position_ids,
+    )
+    linear_attn_mask = (
+        None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
+    )
+    position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
+    num_layers = len(tm0.layers)
+    group = student.sync_module.track_group
+
+    last = num_layers - 1
+    sync_attn_set = set(sync_indices) - {last}
+    base = inputs_embeds  # exact full residual at the current point (telescoping sum)
+    per_track_h = [inputs_embeds for _ in student.text_models]
+    for i in range(num_layers):
+        # Norm weights are synced across tracks, so track 0's module serves all.
+        ln_full = tm0.layers[i].input_layernorm(base)
+        h_attn: list[torch.Tensor] = []
+        y_list: list[torch.Tensor] = []
+        for k, tm in enumerate(student.text_models):
+            layer = tm.layers[i]
+            layer_mask = (
+                linear_attn_mask
+                if tm.config.layer_types[i] == "linear_attention"
+                else causal_mask
+            )
+            with _MixerWriteSwap(layer, mode, ln_full, linear_attn_mask):
+                ha, y = _seam_token_mixer(
+                    layer, per_track_h[k], position_embeddings, layer_mask, text_position_ids
+                )
+            h_attn.append(ha)
+            y_list.append(y)
+        base = base + _sum_track_deltas(list(y_list), group)  # true post-attn residual
+        if mode == "oracle":
+            h_attn = [base for _ in h_attn]
+        if i in sync_attn_set:
+            # Boundary: the post-attn sync delivers the true residual to every
+            # track's MLP (== sync_module's reconstruction up to fp order).
+            new_h = [_seam_mlp(tm.layers[i], base, None) for tm in student.text_models]
+            mlp_deltas = [nh - base for nh in new_h]
+        else:
+            # Fully-partial layer, or the final layer (whose post-MLP "sync" is the
+            # ``base`` accumulation itself — the returned hidden is fully synced).
+            new_h = [_seam_mlp(tm.layers[i], h_attn[k], None)
+                     for k, tm in enumerate(student.text_models)]
+            mlp_deltas = [nh - ha for nh, ha in zip(new_h, h_attn)]
+        base = base + _sum_track_deltas(mlp_deltas, group)  # true post-MLP residual
+        per_track_h = [base for _ in new_h] if mode == "oracle" else new_h
+
+    return tm0.norm(base)
+
+
+# --------------------------------------------------------------------------- #
+# Predictability decomposition of the missing Σ_others Y (training-free).
+#
+# stale_corr (the hybrid: 1-tok-stale ΣY skip + comm-free drift correction) ties
+# the plain stale/fresh frontier (downstream ~0.67) and never reaches the oracle
+# (0.70). To know whether a BETTER comm-free predictor is even possible — vs the
+# orthogonality wall — we decompose, per layer, how predictable the current full
+# cross-track output ΣY (the chp target; the "fresh correct data") is from the
+# comm-free signals: the 1-token-stale ΣY ("stale predicted data"), multi-token
+# history, and the synced block input h_ln. All numbers are training-free CEILINGS
+# (the best any predictor of that class could reach), so they bound what a co-
+# trained predictor could ever do. The decisive question is COMPLEMENTARITY: does
+# h_ln explain the part of ΣY that stale misses (⇒ a hybrid can beat both ⇒ build),
+# or is the staleness drift orthogonal to every comm-free signal (⇒ wall ⇒ D>1)?
+# --------------------------------------------------------------------------- #
+def _ridge_relmse(A: torch.Tensor, C: torch.Tensor, tot: torch.Tensor, lam: float) -> float:
+    """IN-SAMPLE relMSE of the best ridge map ``F→O`` from the sufficient stats
+    ``A=FᵀF``, ``C=FᵀO``, ``tot=‖O‖²``: ``1 − tr(Cᵀ(A+λI)⁻¹C)/tot``. ``λ`` is
+    relative to the mean diagonal of ``A`` so it is scale-free across layers.
+    Optimistic when ``#tokens`` is not ``≫`` the feature dim — use
+    ``_ridge_oos_relmse`` for the honest generalization ceiling."""
+    H = A.shape[0]
+    ridge = lam * (A.diagonal().mean().clamp_min(1e-12))
+    Areg = A + ridge * torch.eye(H, device=A.device, dtype=A.dtype)
+    X = torch.linalg.solve(Areg, C)              # (A+λI)⁻¹ C
+    explained = (C * X).sum()                     # tr(Cᵀ (A+λI)⁻¹ C)
+    return (1.0 - explained / tot.clamp_min(1e-12)).item()
+
+
+def _ridge_oos_relmse(
+    A_fit: torch.Tensor, C_fit: torch.Tensor,
+    A_eval: torch.Tensor, C_eval: torch.Tensor, tot_eval: torch.Tensor, lam: float,
+) -> float:
+    """OUT-OF-SAMPLE relMSE: fit ``W=(A_fit+λI)⁻¹C_fit`` on the FIT tokens, then score
+    on HELD-OUT tokens via their sufficient stats:
+    ``(‖O_e‖² − 2 tr(WᵀC_e) + tr(Wᵀ A_e W)) / ‖O_e‖²``. This is the honest
+    generalization ceiling (a full-rank ``H×H`` linear map overfits badly in-sample
+    when ``#tokens`` is not ``≫ H``; the held-out score removes that inflation)."""
+    H = A_fit.shape[0]
+    ridge = lam * (A_fit.diagonal().mean().clamp_min(1e-12))
+    W = torch.linalg.solve(A_fit + ridge * torch.eye(H, device=A_fit.device, dtype=A_fit.dtype), C_fit)
+    num = tot_eval - 2.0 * (W * C_eval).sum() + (W * (A_eval @ W)).sum()
+    return (num / tot_eval.clamp_min(1e-12)).item()
+
+
+@torch.no_grad()
+def seam_predictability_analysis(
+    student: PTWrappedModel,
+    batches: "Sequence[dict]",
+    sync_indices: Sequence[int],
+    *,
+    svd_r_grid: "tuple[int, ...]" = (16, 64, 256, 512),
+    ridge_lambda: float = 1e-2,
+    avg_windows: "tuple[int, ...]" = (4, 16),
+    use_trained_seam: bool = True,
+    eval_stride: int = 3,
+    svd_max_batches: int = 3,
+) -> "dict[int, dict]":
+    """Per-layer predictability decomposition of the current ΣY at the D=1 seam.
+
+    Runs the D=1 forward (using the student's own trained ``cross_head`` injection
+    when present and ``use_trained_seam``, so the analysed residual stream matches
+    deployment). At every layer it forms the full cross-track output
+    ``ΣY = Σ_k Y_k`` (the chp target), the 1-token-stale ``stale = roll(ΣY,1)`` and
+    its multi-token-avg generalizations, and the synced block input
+    ``h_ln = input_layernorm(X)`` (shared across tracks at D=1). It accumulates the
+    closed-form ridge sufficient stats over a calibration set and reports, per layer
+    (all relMSE; ``1.0`` = predicting zero):
+
+    * ``stale``       — relMSE(stale, ΣY) = energy of the 1-token drift / ‖ΣY‖² (the
+                        skip's ceiling; ``avg:W`` are the multi-token-cache ceilings).
+    * ``hln``         — best linear ``h_ln → ΣY`` (the "fresh" comm-free ceiling),
+                        scored OUT-OF-SAMPLE (fit on the fit tokens, measured on the
+                        held-out eval tokens; ``eval_stride``-th batches are held out).
+    * ``drift_by_hln``— OOS fraction of the drift ``ΣY−stale`` h_ln explains (the
+                        COMPLEMENTARITY signal: high ⇒ h_ln recovers what stale misses).
+    * ``hybrid``      — ``stale + best-linear-h_ln-correction`` ceiling
+                        ``= (1−drift_by_hln)·stale``; the linear ceiling of stale_corr.
+                        ``hybrid ≪ min(stale, hln)`` ⇒ complementary ⇒ a better
+                        predictor is worth building; ``hybrid ≈ stale`` ⇒ redundant ⇒ wall.
+    * ``svd_sumy`` / ``svd_drift`` — cumulative SVD energy of ΣY and of the drift over
+                        ``svd_r_grid`` (drift full-rank ⇒ the unpredicted part is
+                        high-rank/isotropic ⇒ wall).
+
+    The linear ceilings are scored OUT-OF-SAMPLE because a full-rank ``H×H`` map
+    overfits in-sample when the token count is not ``≫ H`` (the held-out score is the
+    honest generalization ceiling). All quantities are SHARED across tracks/ranks (ΣY
+    via the existing all-reduce, h_ln replicated), so every rank computes identical
+    stats; the caller prints on rank 0. Pure measurement — no grad, no training.
+    """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
+    device = student.embed.weight.device if hasattr(student.embed, "weight") else next(student.parameters()).device
+    tm0 = student.text_models[0]
+    num_layers = len(tm0.layers)
+    group = student.sync_module.track_group
+    ch = getattr(student, "cross_head", None) if use_trained_seam else None
+
+    # Per-layer fp32 accumulators (built lazily on the first batch once H is known).
+    # Ridge stats are split FIT vs EVAL (held-out tokens) so the linear ceilings are
+    # scored out-of-sample. ``tot``/``sse`` ceilings are measured on the EVAL tokens
+    # (the parameter-free baselines share the eval denominator with the regression).
+    A_fit: dict[int, torch.Tensor] = {}
+    A_eval: dict[int, torch.Tensor] = {}
+    C_sumy_fit: dict[int, torch.Tensor] = {}
+    C_sumy_eval: dict[int, torch.Tensor] = {}
+    C_drift_fit: dict[int, torch.Tensor] = {}
+    C_drift_eval: dict[int, torch.Tensor] = {}
+    tot_sumy = torch.zeros(num_layers, device=device, dtype=torch.float64)   # eval tokens
+    tot_drift = torch.zeros(num_layers, device=device, dtype=torch.float64)  # eval tokens
+    sse_avg = {w: torch.zeros(num_layers, device=device, dtype=torch.float64) for w in avg_windows}
+    svd_sumy = {L: {r: 0.0 for r in svd_r_grid} for L in range(num_layers)}
+    svd_drift = {L: {r: 0.0 for r in svd_r_grid} for L in range(num_layers)}
+    svd_count = 0
+
+    for b_idx, batch in enumerate(batches):
+        is_eval = (b_idx % eval_stride) == (eval_stride - 1)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(device)
+        inputs_embeds = student.embed(input_ids)
+        position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
+        causal_mask = create_causal_mask(
+            config=tm0.config, inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+            past_key_values=None, position_ids=text_position_ids,
+        )
+        linear_attn_mask = (
+            None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
+        )
+        position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
+
+        # (B, T) validity mask, position 0 excluded (no stale history there).
+        B, T = input_ids.shape
+        vmask = torch.ones((B, T), device=device, dtype=torch.float32)
+        vmask[:, 0] = 0.0
+        if attention_mask is not None:
+            vmask = vmask * attention_mask.to(vmask.dtype)
+        flat_keep = vmask.reshape(-1) > 0
+
+        block_start = inputs_embeds
+        for start, end in _block_ranges(num_layers, sync_indices):
+            base = block_start
+            per_track_h = [block_start for _ in student.text_models]
+            for layer_idx in range(start, end + 1):
+                h_attn, y_list = [], []
+                for k, tm in enumerate(student.text_models):
+                    layer = tm.layers[layer_idx]
+                    layer_mask = (
+                        linear_attn_mask
+                        if tm.config.layer_types[layer_idx] == "linear_attention"
+                        else causal_mask
+                    )
+                    ha, y = _seam_token_mixer(
+                        layer, per_track_h[k], position_embeddings, layer_mask, text_position_ids
+                    )
+                    h_attn.append(ha)
+                    y_list.append(y)
+                sumY = _sum_track_deltas(y_list, group)            # ΣY (all tracks), shared
+                # h_ln is shared across tracks at D=1 (all read the same synced residual).
+                h_ln = tm0.layers[layer_idx].input_layernorm(per_track_h[0])
+
+                # ---- accumulate predictability stats for this layer ----
+                sumf = sumY.float()
+                stale = _causal_avg(sumY, 1).float()
+                driftf = sumf - stale
+                hlnf = h_ln.float().reshape(-1, h_ln.shape[-1])[flat_keep]
+                of = sumf.reshape(-1, sumf.shape[-1])[flat_keep]
+                df = driftf.reshape(-1, driftf.shape[-1])[flat_keep]
+                if layer_idx not in A_fit:
+                    Hd = hlnf.shape[-1]
+                    z2 = lambda a, b: torch.zeros(a, b, device=device, dtype=torch.float32)
+                    A_fit[layer_idx], A_eval[layer_idx] = z2(Hd, Hd), z2(Hd, Hd)
+                    C_sumy_fit[layer_idx], C_sumy_eval[layer_idx] = z2(Hd, of.shape[-1]), z2(Hd, of.shape[-1])
+                    C_drift_fit[layer_idx], C_drift_eval[layer_idx] = z2(Hd, df.shape[-1]), z2(Hd, df.shape[-1])
+                A_, Csy, Cdr = (A_eval, C_sumy_eval, C_drift_eval) if is_eval else (A_fit, C_sumy_fit, C_drift_fit)
+                A_[layer_idx] += hlnf.T @ hlnf
+                Csy[layer_idx] += hlnf.T @ of
+                Cdr[layer_idx] += hlnf.T @ df
+                if is_eval:
+                    tot_sumy[layer_idx] += of.pow(2).sum().double()
+                    tot_drift[layer_idx] += df.pow(2).sum().double()
+                    for w in avg_windows:
+                        aw = _causal_avg(sumY, w).float()
+                        sse_avg[w][layer_idx] += (sumf - aw).reshape(-1, sumf.shape[-1])[flat_keep].pow(2).sum().double()
+                if b_idx < svd_max_batches:  # SVD is the cost bottleneck; the spectrum
+                    # is descriptive + stable, so a few batches suffice (ridge uses all).
+                    e_sumy = _svd_cumulative_energy(sumf, svd_r_grid, vmask)
+                    e_drift = _svd_cumulative_energy(driftf, svd_r_grid, vmask)
+                    for r in svd_r_grid:
+                        svd_sumy[layer_idx][r] += e_sumy[r]
+                        svd_drift[layer_idx][r] += e_drift[r]
+
+                # ---- advance the residual stream (trained seam injection if present) ----
+                if ch is not None:
+                    subs, _ghat = ch.subs(layer_idx, y_list, sumY, h_ln)
+                else:
+                    subs = [None] * len(student.text_models)
+                new_h = [_seam_mlp(tm.layers[layer_idx], h_attn[k], subs[k])
+                         for k, tm in enumerate(student.text_models)]
+                deltas = [o - x for o, x in zip(new_h, per_track_h)]
+                full = base + _sum_track_deltas(deltas, group)
+                base = full
+                if layer_idx == end:
+                    block_start = full
+                else:
+                    per_track_h = new_h
+        if b_idx < svd_max_batches:
+            svd_count += 1
+
+    # ---- per-layer solve (linear ceilings scored out-of-sample) ----
+    out: dict[int, dict] = {}
+    for L in range(num_layers):
+        if L not in A_fit:
+            continue
+        stale_c = (tot_drift[L] / tot_sumy[L].clamp_min(1e-12)).item()
+        hln_c = _ridge_oos_relmse(
+            A_fit[L], C_sumy_fit[L], A_eval[L], C_sumy_eval[L], tot_sumy[L].float(), ridge_lambda
+        )
+        drift_resid = _ridge_oos_relmse(
+            A_fit[L], C_drift_fit[L], A_eval[L], C_drift_eval[L], tot_drift[L].float(), ridge_lambda
+        )
+        out[L] = {
+            "stale": stale_c,
+            "hln": hln_c,
+            "drift_by_hln": 1.0 - drift_resid,            # OOS fraction of drift h_ln explains
+            "hybrid": drift_resid * stale_c,              # stale + best linear h_ln correction
+            "avg": {w: (sse_avg[w][L] / tot_sumy[L].clamp_min(1e-12)).item() for w in avg_windows},
+            "svd_sumy": {r: svd_sumy[L][r] / max(1, svd_count) for r in svd_r_grid},
+            "svd_drift": {r: svd_drift[L][r] / max(1, svd_count) for r in svd_r_grid},
+        }
+    return out

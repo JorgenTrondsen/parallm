@@ -48,7 +48,7 @@ from pt_converter.eval.lm_eval_adapter import (
 )
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_manifest, load_track
+from pt_converter.utils.checkpoint import load_cross_head, load_manifest, load_track
 
 
 def _log(rank: int, msg: str) -> None:
@@ -141,6 +141,10 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0,
                    help="lm-eval random/numpy/torch seed. Identical on every rank so request "
                         "ordering and fewshot sampling line up across ranks.")
+    p.add_argument("--sync-phase", choices=["boundary", "post-attn"], default="boundary",
+                   help="Lever B: evaluate a post-attn-trained checkpoint in its DEPLOYED regime "
+                        "(the single per-block sync after attention). MUST match how the checkpoint "
+                        "was trained, else the weights run in the wrong regime. Default 'boundary'.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -189,6 +193,15 @@ def main() -> int:
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)
         student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
+        # Cross-head estimator sidecar (if the checkpoint trained one): rebuild +
+        # attach so the seam forward is used in eval (else the trained gains vanish).
+        _ch = load_cross_head(args.checkpoint_dir)
+        if _ch is not None:
+            student.cross_head = _ch.to(torch.cuda.current_device()).to(torch.bfloat16)
+        # Lever B: evaluate post-attn-trained weights in their deployed regime.
+        if args.sync_phase != "boundary":
+            student.set_sync_phase(args.sync_phase)
+            _log(rank, f"[init] sync_phase={args.sync_phase} (lever B deployed regime)")
         wrap_student_with_fsdp(student, layout)
         student.eval()
 

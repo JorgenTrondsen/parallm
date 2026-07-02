@@ -141,6 +141,28 @@ class PTWrappedModel(nn.Module):
             self.v_lo, self.v_hi = 0, text_config.vocab_size
 
         self.sync_module = SyncBoundary(track_group=track_group, n_tracks=n_tracks)
+        # Sync placement within a block (lever B). "boundary" (default) = the single
+        # per-layer all-reduce lands AFTER the MLP (bit-identical to legacy). "post-attn"
+        # = it lands AFTER attention, so the MLP reads the exact Σ_others Y (real, no
+        # predictor) while the NEXT layer's attention reads the partial residual; the
+        # sync COUNT is unchanged. See ``_run_post_attn_stack``. D=1 only.
+        self.sync_phase = "boundary"
+        # Optional cross-head attention-output estimator (D=1 post-attention seam).
+        # None ⇒ the stock forward (bit-identical). Set by the train/eval scripts.
+        self.cross_head = None
+        # Eval-only: when True, the seam forward accumulates per-layer predict relMSE
+        # (chp = relMSE(ghat, ΣY)) into ``_chp_sums`` (caller inits + counts batches).
+        self._collect_chp = False
+        self._chp_sums = None
+        # Eval-only seam-fidelity diagnostic: when ``_collect_seam`` is True and
+        # ``_seam_teacher`` holds the dense teacher's per-layer ``(X_teacher,
+        # Y_teacher)``, the seam forward accumulates the per-layer decomposition of
+        # how far the actual injected MLP input lands from the teacher's true input
+        # ``X_teacher + Y_teacher`` into ``_seam_sums`` (a {metric: tensor[num_layers]}
+        # dict the caller inits + counts batches). Works for BOTH backends.
+        self._collect_seam = False
+        self._seam_teacher = None
+        self._seam_sums = None
         self.text_models = nn.ModuleList(
             [
                 adapter.track_text_model_cls(
@@ -226,6 +248,22 @@ class PTWrappedModel(nn.Module):
         for tm in self.text_models:
             tm.pt_cfg.sync_after_layers = indices
 
+    def set_sync_phase(self, phase: str) -> None:
+        """Select where the single per-block sync lands (lever B). ``"boundary"``
+        (default) is bit-identical to the legacy forward; ``"post-attn"`` shifts it
+        to the post-attention point (real Σ_others Y at the MLP input, same sync
+        count). Incompatible with a cross-head seam (B delivers the real content)."""
+        if phase not in ("boundary", "post-attn"):
+            raise ValueError(f"sync_phase must be 'boundary' or 'post-attn', got {phase!r}")
+        if phase == "post-attn" and self.cross_head is not None \
+                and getattr(self.cross_head, "backend", None) != "window_stale":
+            raise ValueError(
+                "sync_phase='post-attn' (lever B) is incompatible with a cross_head seam "
+                "(it delivers the real Σ_others Y); only the 'window_stale' backend — which "
+                "fills the partial non-boundary layers with the cached boundary ΣY — is allowed"
+            )
+        self.sync_phase = phase
+
     @staticmethod
     def _run_track_window(
         tm,
@@ -258,6 +296,296 @@ class PTWrappedModel(nn.Module):
                 use_cache=False,
             )
         return h
+
+    def compile_seam_submodules(self, mode: str = "default") -> None:
+        """Compile the per-track decoder SUBMODULES in place — for the cross-head
+        seam path, which calls submodules directly (``input_layernorm`` /
+        ``post_attention_layernorm`` / ``mlp``) and so bypasses the whole-layer
+        ``layer.compile()`` done at init. Recovers inductor fusion on the heavy MLP
+        matmuls. One-time warmup; call after the estimator is attached.
+
+        The token mixer (``self_attn`` / ``linear_attn``) is DELIBERATELY left eager:
+        inductor compiles attention into a ``cutlassF`` template that has "no kernel to
+        launch" at the downstream-eval padding-mask shapes (crashes run_downstream;
+        the eager ``enable_mem_efficient_sdp(False)`` flag does NOT govern inductor's
+        codegen). Eager attention dispatches to flash/math, which have kernels for
+        every train + eval config (proven: the un-compiled seam completes the
+        4-task@1000 downstream eval). MLP is the dominant FLOPs, so most of the
+        speedup is retained."""
+        for tm in self.text_models:
+            for layer in tm.layers:
+                for name in ("input_layernorm", "post_attention_layernorm", "mlp"):
+                    sub = getattr(layer, name, None)
+                    if sub is not None:
+                        sub.compile(mode=mode, dynamic=False)
+
+    def _sum_all_tracks(self, tensors: list[torch.Tensor]) -> torch.Tensor:
+        """ΣY over ALL tracks: local sum across the K hosted tracks + a detached
+        all-reduce across ranks. Used as the cross-head predict target / stale
+        cache, i.e. as DATA — the collective is detached (no grad flows through it,
+        consistent with SyncBoundary being autograd-invisible)."""
+        import torch.distributed as dist
+        total = tensors[0]
+        for t in tensors[1:]:
+            total = total + t
+        total = total.detach()
+        if self.sync_module.track_group is not None and dist.is_initialized():
+            total = total.contiguous()
+            dist.all_reduce(total, op=dist.ReduceOp.SUM, group=self.sync_module.track_group)
+        return total
+
+    def run_seam_layer(
+        self,
+        layer_idx: int,
+        per_track_h: list[torch.Tensor],
+        position_embeddings,
+        text_position_ids,
+        causal_mask,
+        linear_attn_mask,
+        collect_predict: bool = False,
+    ):
+        """Run ONE decoder layer across the K local tracks with the cross-head seam.
+
+        Splits each track's block at the post-attention point and injects the
+        estimator's reconstruction of the missing ``Σ_others Y`` into the MLP input
+        (the substitute is excluded from the carried residual — see
+        ``cross_head_estimator``). Returns the K post-block tensors; with
+        ``collect_predict`` also returns ``(sum_y, ghat)`` for the fresh predict loss.
+
+        Assumes the D=1 setting where every track enters the layer from the SAME
+        synced residual, so ``h_ln`` (and the fresh predictor's estimate) is shared.
+        """
+        from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+
+        h_attn: list[torch.Tensor] = []
+        y_list: list[torch.Tensor] = []
+        h_ln_shared = None
+        for k, tm in enumerate(self.text_models):
+            layer = tm.layers[layer_idx]
+            mask = (
+                linear_attn_mask
+                if tm.config.layer_types[layer_idx] == "linear_attention"
+                else causal_mask
+            )
+            ha, y, h_ln = seam_token_mixer(
+                layer, per_track_h[k], position_embeddings, mask, text_position_ids
+            )
+            h_attn.append(ha)
+            y_list.append(y)
+            h_ln_shared = h_ln
+        sum_y = self._sum_all_tracks(y_list)
+        # Calibration (oracle backend): degrade the delivered ΣY to a target relMSE
+        # so co-training measures the accuracy→quality curve. The additive noise is
+        # seeded by (cross_head._noise_base, layer_idx) — identical on every rank, so
+        # the corrupted ΣY stays consistent across tracks.
+        if getattr(self.cross_head, "oracle_noise", 0.0) > 0.0:
+            r = float(self.cross_head.oracle_noise)
+            seed = int(self.cross_head._noise_base) * 64 + layer_idx
+            gen = torch.Generator(device=sum_y.device).manual_seed(seed)
+            n = torch.randn(sum_y.shape, generator=gen, device=sum_y.device, dtype=torch.float32)
+            sy = sum_y.float()
+            scale = (r * sy.pow(2).sum() / n.pow(2).sum().clamp_min(1e-12)).sqrt()
+            sum_y = (sy + scale * n).to(sum_y.dtype)
+        subs, ghat = self.cross_head.subs(layer_idx, y_list, sum_y, h_ln_shared)
+        # Eval-only seam-fidelity diagnostic (both backends): compare the actual
+        # injected MLP input to the dense teacher's true input. Driven by the probe
+        # state, independent of ``collect_predict``.
+        if self._collect_seam and self._seam_sums is not None \
+                and self._seam_teacher is not None and layer_idx in self._seam_teacher:
+            self._accumulate_seam(layer_idx, per_track_h, h_attn, y_list, sum_y, subs)
+        new_h = [
+            seam_mlp(self.text_models[k].layers[layer_idx], h_attn[k], subs[k])
+            for k in range(len(self.text_models))
+        ]
+        if collect_predict:
+            return new_h, sum_y, ghat
+        return new_h
+
+    @torch.no_grad()
+    def _accumulate_seam(
+        self,
+        layer_idx: int,
+        per_track_h: list[torch.Tensor],
+        h_attn: list[torch.Tensor],
+        y_list: list[torch.Tensor],
+        sum_y: torch.Tensor,
+        subs: list[torch.Tensor],
+    ) -> None:
+        """Accumulate the per-layer seam-fidelity decomposition (eval diagnostic).
+
+        Compares the actual injected per-track MLP input ``mlp_in_k = X + Y_self_k +
+        S_k`` (``= h_attn[k] + subs[k]``, the input ``seam_mlp`` feeds the post-attn
+        norm) to the dense teacher's true MLP input ``X_teacher + Y_teacher``
+        (``self._seam_teacher[layer_idx]``). Five per-layer relMSE metrics into
+        ``self._seam_sums``:
+
+          residual_drift = relMSE(X_student, X_teacher)              [global]
+          oracle_seam    = relMSE(X_student + ΣY, X_t + Y_t)         [global; perfect-substitute ceiling]
+          seam_total     = mean_k relMSE(mlp_in_k, X_t + Y_t)        [per-track; the headline]
+          substitute_err = mean_k relMSE(mlp_in_k, X_student + ΣY)   [per-track; staleness/predictor cost]
+          stale_ratio    = mean_k ‖Δ_t Σ_others Y_k‖ / ‖Σ_others Y_k‖  [per-track; intrinsic stale error]
+
+        At D=1 ``per_track_h`` entering the layer is the synced residual (identical
+        across tracks), so ``X_student = per_track_h[0]``. The global terms use only
+        rank-identical tensors (synced X, all-reduced ΣY, teacher) so they need no
+        reduction; the per-track terms are summed over this rank's local tracks,
+        SUM-reduced over the track group, and divided by ``n_tracks``.
+        """
+        import torch.distributed as dist
+
+        x_t, y_t = self._seam_teacher[layer_idx]
+        x_t = x_t.float()
+        y_t = y_t.float()
+        t_in = x_t + y_t
+        t_in_sq = t_in.pow(2).sum().clamp_min(1e-12)
+        x_student = per_track_h[0].float()
+        sum_yf = sum_y.float()
+        base = x_student + sum_yf                     # X + ΣY (exact-substitute input)
+        base_sq = base.pow(2).sum().clamp_min(1e-12)
+
+        self._seam_sums["residual_drift"][layer_idx] += (
+            (x_student - x_t).pow(2).sum() / x_t.pow(2).sum().clamp_min(1e-12)
+        )
+        self._seam_sums["oracle_seam"][layer_idx] += (base - t_in).pow(2).sum() / t_in_sq
+
+        seam_tot = base.new_zeros(())
+        sub_err = base.new_zeros(())
+        stale = base.new_zeros(())
+        for k in range(len(y_list)):
+            mlp_in = h_attn[k].float() + subs[k].float()
+            seam_tot = seam_tot + (mlp_in - t_in).pow(2).sum() / t_in_sq
+            sub_err = sub_err + (mlp_in - base).pow(2).sum() / base_sq
+            other = sum_yf - y_list[k].float()        # Σ_others Y_k
+            o, op = other[:, 1:], other[:, :-1]       # exclude position 0 (no history)
+            den = o.pow(2).sum().clamp_min(1e-12).sqrt()
+            num = (o - op).pow(2).sum().sqrt()
+            stale = stale + num / den
+        packed = torch.stack([seam_tot, sub_err, stale])
+        if self.sync_module.track_group is not None and dist.is_initialized():
+            dist.all_reduce(packed, op=dist.ReduceOp.SUM, group=self.sync_module.track_group)
+        packed = packed / self.n_tracks
+        self._seam_sums["seam_total"][layer_idx] += packed[0]
+        self._seam_sums["substitute_err"][layer_idx] += packed[1]
+        self._seam_sums["stale_ratio"][layer_idx] += packed[2]
+
+    def _run_post_attn_stack(
+        self,
+        h: torch.Tensor,
+        position_embeddings,
+        text_position_ids,
+        causal_mask,
+        linear_attn_mask,
+        sync_hiddens: "dict[int, torch.Tensor] | None" = None,
+        boundary_grad_alpha: float = 1.0,
+    ):
+        """Phase-shifted per-WINDOW sync (lever B), eval forward — D=1 and D>1.
+
+        The one fresh all-reduce per sync window is PHASE-SHIFTED to land POST-ATTENTION
+        instead of at the post-MLP boundary, so the boundary layer's MLP reads the FULL
+        synced residual (the exact Σ_others Y delivered for free) while everything after
+        it reads the PARTIAL one. Concretely: sync after ATTENTION at every boundary in
+        ``self.sync_after_layers`` except the final layer, sync after MLP at the final
+        layer (so the output is fully synced for the norm), and run all NON-boundary
+        layers fully partial (attn+MLP, no sync). The all-reduce sums every per-track
+        delta accrued since the previous sync, so each delta is summed exactly once.
+        Sync COUNT == the boundary schedule's (e.g. D=2 → 16). Reduces to the D=1 case
+        (sync after every layer's attention) when every layer is a boundary."""
+        from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+
+        L = len(self.text_models[0].layers)
+        last = L - 1
+        sync_attn_set = set(self.sync_after_layers) - {last}
+        # window_stale: fill the fully-partial non-boundary layers with the real ΣY
+        # cached from the previous boundary (depth-stale, frequency-free). gate-only.
+        ch = (
+            self.cross_head
+            if getattr(self, "cross_head", None) is not None
+            and getattr(self.cross_head, "backend", None) == "window_stale"
+            else None
+        )
+        # Activation checkpointing for the grad-carrying full forward (an on-policy
+        # output objective — λ_kl/λ_ce/λ_logit_mse with sync_phase=post-attn —
+        # backwards through this whole stack; without recompute the L-layer ×
+        # K-track activation set OOMs at training shapes). Per-sublayer granularity:
+        # each track's token mixer / MLP is a closure, collectives stay OUTSIDE.
+        # The window_stale seam needs per-layer y_list, so it keeps the plain path
+        # (mirrors the boundary forward's cross_head exclusion). Eval (no_grad)
+        # always takes the plain path.
+        use_ckpt = self._use_checkpoint and torch.is_grad_enabled() and ch is None
+
+        def _mixer_ha(layer, x, mask):
+            # position_embeddings / text_position_ids are captured (no-grad
+            # scaffolding); only the residual input carries gradient.
+            return seam_token_mixer(layer, x, position_embeddings, mask, text_position_ids)[0]
+
+        def _mlp(layer, x, s=None):
+            if use_ckpt and s is None:
+                return checkpoint(seam_mlp, layer, x, None, use_reentrant=False)
+            return seam_mlp(layer, x, s)
+
+        prev_sum_y = None  # most recent boundary's ΣY (the depth-stale fill source)
+        block_start = h
+        per_track_h = [h for _ in self.text_models]
+        for i in range(L):
+            h_attn: list[torch.Tensor] = []
+            y_list: list[torch.Tensor] = []
+            for k, tm in enumerate(self.text_models):
+                layer = tm.layers[i]
+                mask = (
+                    linear_attn_mask
+                    if tm.config.layer_types[i] == "linear_attention"
+                    else causal_mask
+                )
+                if use_ckpt:
+                    ha = checkpoint(_mixer_ha, layer, per_track_h[k], mask, use_reentrant=False)
+                    y = None  # y_list is only consumed on the (non-ckpt) seam path
+                else:
+                    ha, y, _h_ln = seam_token_mixer(
+                        layer, per_track_h[k], position_embeddings, mask, text_position_ids
+                    )
+                h_attn.append(ha)
+                y_list.append(y)
+            if i in sync_attn_set:
+                # Boundary: post-attention sync delivers the real ΣY to this layer's
+                # MLP; the per-track MLP delta is carried un-summed (the next attention's
+                # partial seam) until the next sync.
+                R = self.sync_module(h_attn, block_start)
+                if sync_hiddens is not None:
+                    # Tap stored UNDAMPED (same contract as the boundary forward):
+                    # only the cross-window continuation below is attenuated.
+                    sync_hiddens[i] = R
+                if boundary_grad_alpha != 1.0 and torch.is_grad_enabled():
+                    # Per-window gradient damping of the free-running unroll
+                    # (mirrors the boundary forward): forward value is EXACTLY R,
+                    # but gradient flowing back across this sync window shrinks by
+                    # alpha per boundary crossed — bounds the unrolled-Jacobian
+                    # amplification that makes full-unroll output objectives
+                    # diverge. Everything downstream (this boundary's MLP + all
+                    # later windows + the final logits) is damped together.
+                    R = R.detach() + boundary_grad_alpha * (R - R.detach())
+                block_start = R
+                if ch is not None:
+                    prev_sum_y = self._sum_all_tracks(y_list)  # cache real ΣY for the next partial layer
+                per_track_h = [_mlp(tm.layers[i], R) for tm in self.text_models]
+            else:
+                # Non-boundary (fully partial, no sync) OR the final layer (post-MLP sync
+                # that produces the fully-synced output for the norm). window_stale fills
+                # the partial MLP with the cached previous-boundary ΣY (no-op at zero gate).
+                if ch is not None and i != last and prev_sum_y is not None:
+                    subs = ch.subs_window_stale(i, y_list, prev_sum_y)
+                else:
+                    subs = [None] * len(self.text_models)
+                new_h = [
+                    _mlp(self.text_models[k].layers[i], h_attn[k], subs[k])
+                    for k in range(len(self.text_models))
+                ]
+                if i == last:
+                    h = self.sync_module(new_h, block_start)
+                    if sync_hiddens is not None:
+                        sync_hiddens[i] = h
+                else:
+                    per_track_h = new_h
+        return h, sync_hiddens
 
     def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Full input embedding (B, S, H), grad-connected, identical on every rank.
@@ -323,6 +651,21 @@ class PTWrappedModel(nn.Module):
         )
         position_embeddings = tm0.rotary_emb(h, position_ids_resolved)
 
+        # Lever B: the single per-block sync is phase-shifted to post-attention.
+        # Self-contained per-layer split path (the window/checkpoint machinery below
+        # assumes the boundary sync), D=1 only.
+        if self.sync_phase == "post-attn":
+            sh = {} if (return_sync_hiddens or return_intra_window_hiddens) else None
+            h, sh = self._run_post_attn_stack(
+                h, position_embeddings, text_position_ids, causal_mask, linear_attn_mask, sh,
+                boundary_grad_alpha=boundary_grad_alpha,
+            )
+            h = tm0.norm(h)
+            if return_hidden_pre_lm_head:
+                return h, sh
+            logits = self.lm_head(h) if self.lm_head is not None else None
+            return logits, sh
+
         # 3. Lockstep window iteration with per-block syncs. Iterating windows
         # (not layers) is what lets "window" checkpointing wrap each track's
         # whole window in ONE checkpoint — saving only the shared synced window
@@ -335,7 +678,10 @@ class PTWrappedModel(nn.Module):
         )
         per_track_h = [block_start for _ in self.text_models]
         use_ckpt = self._use_checkpoint and torch.is_grad_enabled()
-        window_ckpt = use_ckpt and self._ckpt_granularity == "window"
+        # The cross-head seam needs per-layer access (split attn/MLP + a per-layer
+        # ΣY all-reduce), so it forces the per-layer path (window checkpointing
+        # hides the layers inside one closure).
+        window_ckpt = use_ckpt and self._ckpt_granularity == "window" and self.cross_head is None
         # Mid-window taps need per-layer access; the "window" checkpoint granule
         # hides the layers inside one closure. Eval (no_grad ⇒ use_ckpt False)
         # always takes the per-layer path, so this only trips a training caller.
@@ -358,6 +704,35 @@ class PTWrappedModel(nn.Module):
                 ]
             else:
                 for layer_idx in range(start, end + 1):
+                    if self.cross_head is not None:
+                        # Cross-head seam: inject the missing Σ_others Y at each
+                        # layer's MLP input (the substitute is excluded from the
+                        # carried residual). Checkpointing is unused here — the seam
+                        # forward is either no_grad (eval / metrics) or backwarded
+                        # per block (the D=1 block loop drives training).
+                        if self._collect_chp and self._chp_sums is not None:
+                            per_track_h, _sum_y, _ghat = self.run_seam_layer(
+                                layer_idx, per_track_h, position_embeddings,
+                                text_position_ids, causal_mask, linear_attn_mask,
+                                collect_predict=True,
+                            )
+                            if _ghat is not None:  # fresh / fresh_yself backends
+                                _tgt = (
+                                    _sum_y if _ghat.ndim == _sum_y.ndim
+                                    else _sum_y.unsqueeze(0).expand_as(_ghat)
+                                )
+                                rel = _ghat.float().sub(_tgt.float()).pow(2).sum() / (
+                                    _tgt.float().pow(2).sum().clamp_min(1e-12)
+                                )
+                                self._chp_sums[layer_idx] += rel
+                        else:
+                            per_track_h = self.run_seam_layer(
+                                layer_idx, per_track_h, position_embeddings,
+                                text_position_ids, causal_mask, linear_attn_mask,
+                            )
+                        if return_intra_window_hiddens and layer_idx not in sync_set:
+                            sync_hiddens[layer_idx] = self.sync_module(per_track_h, block_start)
+                        continue
                     new_h: list[torch.Tensor] = []
                     for k, tm in enumerate(self.text_models):
                         layer = tm.layers[layer_idx]

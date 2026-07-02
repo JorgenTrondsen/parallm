@@ -40,8 +40,12 @@ from pt_converter.eval.fidelity import _LOGIT_METRIC_NAMES, _fidelity_logit_metr
 from pt_converter.eval.intervention import (
     CalibratedFixedLowRankChannel,
     MaskedOracleChannel,
+    PhasedMode,
     intervention_forward,
     parse_channel,
+    phased_intervention_forward,
+    seam_intervention_forward,
+    seam_predictability_analysis,
 )
 from pt_converter.train.distill import _block_ranges
 from pt_converter.model.pt_model import PTWrappedModel
@@ -54,7 +58,7 @@ from pt_converter.train.data import (
     preset_sources,
 )
 from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_manifest, load_track
+from pt_converter.utils.checkpoint import load_cross_head, load_manifest, load_track
 
 
 def _log(rank: int, msg: str) -> None:
@@ -62,7 +66,49 @@ def _log(rank: int, msg: str) -> None:
         print(msg, flush=True)
 
 
-def _kl_pass(student, teacher, batches, channel, sync_indices, chunk_size, device):
+def _print_seam_analysis(res: "dict[int, dict]", ckpt: str) -> None:
+    """Per-layer predictability table + a verdict aggregate. All columns are relMSE
+    (1.0 = predicting zero) except ``d<-hln`` (fraction of the 1-token drift that
+    h_ln linearly explains = the complementarity signal) and the SVD energy fractions."""
+    layers = sorted(res)
+    print()
+    print(f"===== Seam predictability of ΣY (the chp target), per layer  ckpt={ckpt} =====")
+    print("  relMSE (1=predict-zero): stale=1-tok cache | hln=best linear h_ln→ΣY | "
+          "hybrid=stale+linear-h_ln-correction | d<-hln=frac of drift h_ln explains")
+    print(f"{'L':>3} {'stale':>7} {'avg4':>7} {'avg16':>7} {'hln':>7} {'hybrid':>7} "
+          f"{'d<-hln':>7} | {'ΣY r64':>7} {'ΣY r256':>8} {'drift r64':>9} {'drift r256':>10}")
+    import statistics
+    agg = {k: [] for k in ("stale", "hln", "hybrid", "drift_by_hln")}
+    sv = {"sumy64": [], "sumy256": [], "drift64": [], "drift256": []}
+    for L in layers:
+        r = res[L]
+        a4 = r["avg"].get(4, float("nan"))
+        a16 = r["avg"].get(16, float("nan"))
+        s64 = r["svd_sumy"].get(64, float("nan"))
+        s256 = r["svd_sumy"].get(256, float("nan"))
+        d64 = r["svd_drift"].get(64, float("nan"))
+        d256 = r["svd_drift"].get(256, float("nan"))
+        print(f"{L:>3} {r['stale']:>7.3f} {a4:>7.3f} {a16:>7.3f} {r['hln']:>7.3f} "
+              f"{r['hybrid']:>7.3f} {r['drift_by_hln']:>7.3f} | "
+              f"{s64:>7.3f} {s256:>8.3f} {d64:>9.3f} {d256:>10.3f}")
+        for k in agg:
+            agg[k].append(r[k])
+        sv["sumy64"].append(s64); sv["sumy256"].append(s256)
+        sv["drift64"].append(d64); sv["drift256"].append(d256)
+    mean = lambda xs: statistics.fmean([x for x in xs if x == x]) if xs else float("nan")
+    print()
+    print("  layer-mean: "
+          + "  ".join(f"{k}={mean(v):.3f}" for k, v in agg.items())
+          + f"  | ΣY-energy@r64={mean(sv['sumy64']):.3f} r256={mean(sv['sumy256']):.3f}"
+          + f"  drift-energy@r64={mean(sv['drift64']):.3f} r256={mean(sv['drift256']):.3f}")
+    print("  Read: hybrid ≪ min(stale,hln) ⇒ h_ln & stale are COMPLEMENTARY ⇒ a better predictor is "
+          "worth building. hybrid ≈ stale (d<-hln≈0) AND drift-energy spread over many ranks ⇒ the "
+          "drift is high-rank/orthogonal ⇒ the wall ⇒ go to D>1. Compare hybrid to the trained chp "
+          "(~0.43/block): hybrid<chp ⇒ training/arch headroom; hybrid≈chp ⇒ predictor already optimal.")
+    print()
+
+
+def _kl_pass(student, teacher, batches, channel, sync_indices, chunk_size, device, fwd):
     """Mean KL/top-1/ppl over the materialized ``batches`` under ``channel``.
 
     Peer ranks emit zero placeholders for the logit metrics; the SUM all-reduce
@@ -76,7 +122,7 @@ def _kl_pass(student, teacher, batches, channel, sync_indices, chunk_size, devic
         labels = batch["labels"].to(device, non_blocking=True)
 
         teacher_logits, _ = teacher.forward(input_ids, attention_mask=attn)
-        hidden = intervention_forward(student, input_ids, attn, sync_indices, channel)
+        hidden = fwd(student, input_ids, attn, sync_indices, channel)
         if student.lm_head is not None:
             student_logits = student.lm_head(hidden)
             m = _fidelity_logit_metrics(student_logits, teacher_logits, labels, attn, chunk_size)
@@ -94,10 +140,10 @@ def _kl_pass(student, teacher, batches, channel, sync_indices, chunk_size, devic
 
 
 @torch.no_grad()
-def _calibrate(student, calib_batches, channel, sync_indices, device):
+def _calibrate(student, calib_batches, channel, sync_indices, device, fwd):
     """Fit a CalibratedFixedLowRankChannel's frozen basis over a calibration set.
 
-    Runs ``intervention_forward`` with the channel in observing mode (it records the
+    Runs the intervention forward with the channel in observing mode (it records the
     D=2-trajectory ``other_k`` per layer/track and returns zeros), then finalizes the
     per-(layer,track) PCA bases. Every rank runs it in lockstep (the forward all-reduces)."""
     channel.start_observing()
@@ -105,11 +151,11 @@ def _calibrate(student, calib_batches, channel, sync_indices, device):
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attn = batch.get("attention_mask")
         attn = attn.to(device, non_blocking=True) if attn is not None else None
-        intervention_forward(student, input_ids, attn, sync_indices, channel)
+        fwd(student, input_ids, attn, sync_indices, channel)
     channel.finalize()
 
 
-def _downstream_pass(student, tok, channel, sync_indices, args, rank, device):
+def _downstream_pass(student, tok, channel, sync_indices, args, rank, device, fwd):
     """lm-eval downstream accuracy of the intervention forward (broadcast score)."""
     from lm_eval import simple_evaluate
 
@@ -119,7 +165,7 @@ def _downstream_pass(student, tok, channel, sync_indices, args, rank, device):
     tasks = [t.strip() for t in args.downstream_tasks.split(",") if t.strip()]
 
     def _fn(input_ids, attention_mask):
-        hidden = intervention_forward(student, input_ids, attention_mask, sync_indices, channel)
+        hidden = fwd(student, input_ids, attention_mask, sync_indices, channel)
         return student.lm_head(hidden) if student.lm_head is not None else None
 
     lm = PTLM(
@@ -173,6 +219,19 @@ def main() -> int:
     p.add_argument("--sync-indices", default=None,
                    help="Override the manifest schedule (comma-separated). The intervention windows "
                         "and the real boundaries both follow it.")
+    p.add_argument("--seam", action="store_true",
+                   help="Intra-block (post-attention) intervention: substitute the missing cross-HEAD "
+                        "attention output Sigma_others(Y) at the MLP input of every layer, instead of the "
+                        "whole-layer residual substitution. For the D=1 study (oracle==dense teacher, "
+                        "zero==current D=1). Channels reuse the same specs on other_k = SigmaY - Y_self.")
+    p.add_argument("--sync-phase", choices=["boundary", "post-attn"], default="boundary",
+                   help="'post-attn' runs the PHASED intervention forward (mirrors the lever-B deployed "
+                        "regime: post-attn sync at every boundary except the last layer, post-MLP at the "
+                        "last, non-boundary layers fully partial) and interprets --channels as phased "
+                        "modes: zero (deployed floor), oracle (perfect-delivery ceiling), kv (write-side "
+                        "memory-correction gate: k/v + gated-delta write gate/decay from the exact full "
+                        "residual), q (read-side complement, diagnostic). Use on a post-attn-trained "
+                        "checkpoint. Default 'boundary' = the whole-layer/--seam harnesses.")
     # Data (mirrors eval_fidelity.py: held-out front of the training mixture by default).
     p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names())
     p.add_argument("--data-source", action="append", default=None, metavar="NAME[:CONFIG[:KEY[:WEIGHT]]]")
@@ -193,6 +252,16 @@ def main() -> int:
     p.add_argument("--fixed-calib-batches", type=int, default=32,
                    help="For calib-fixed-lowrank channels: data batches used to PCA-fit the "
                         "frozen basis (a collect pass on the D=2 trajectory) before scoring.")
+    p.add_argument("--seam-analyze", action="store_true",
+                   help="Training-free predictability decomposition of the missing ΣY at the D=1 seam "
+                        "(NOT the channel/KL/downstream loop): per-layer ceilings for stale/avg/h_ln "
+                        "prediction, the drift-vs-h_ln COMPLEMENTARITY, and SVD structure. Use the "
+                        "trained seam stream if the checkpoint has a cross_head. Pair with "
+                        "--num-batches 0 and no --downstream-tasks.")
+    p.add_argument("--analyze-batches", type=int, default=8,
+                   help="Calibration batches for --seam-analyze (token pool for the ridge fit + SVD).")
+    p.add_argument("--analyze-ridge-lambda", type=float, default=1e-2,
+                   help="Ridge regularization (relative to mean diag of FᵀF) for the linear ceilings.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -218,7 +287,16 @@ def main() -> int:
             "[error] checkpoint manifest has no sync_layer_indices. Pass --sync-indices, or point "
             "--checkpoint-dir at a trained checkpoint."
         )
-    if args.oracle_sweep:
+    if args.sync_phase == "post-attn" and (args.seam or args.oracle_sweep or args.seam_analyze):
+        raise SystemExit(
+            "[error] --sync-phase post-attn is its own harness (phased modes zero/oracle/kv/q) "
+            "and is incompatible with --seam / --oracle-sweep / --seam-analyze."
+        )
+    if args.seam_analyze:
+        channels = []  # analyze mode bypasses the channel/KL/downstream loop
+    elif args.sync_phase == "post-attn":
+        channels = [PhasedMode(s.strip()) for s in args.channels.split(",") if s.strip()]
+    elif args.oracle_sweep:
         # Mid-window (partial-read) layers = every layer that is NOT a window end
         # (the harness only substitutes at those; a window end is the real boundary).
         mid = [
@@ -236,12 +314,12 @@ def main() -> int:
         channels = [parse_channel("zero"), parse_channel("oracle"), *probes]
     else:
         channels = [parse_channel(s) for s in args.channels.split(",") if s.strip()]
-    run_kl = args.num_batches > 0
-    run_ds = bool(args.downstream_tasks.strip())
-    if not run_kl and not run_ds:
+    run_kl = args.num_batches > 0 and not args.seam_analyze
+    run_ds = bool(args.downstream_tasks.strip()) and not args.seam_analyze
+    if not run_kl and not run_ds and not args.seam_analyze:
         raise SystemExit(
-            "[error] nothing to do: set --num-batches > 0 (KL vs teacher) and/or --downstream-tasks. "
-            "Downstream-only (--num-batches 0) skips the teacher entirely — much lower memory."
+            "[error] nothing to do: set --num-batches > 0 (KL vs teacher) and/or --downstream-tasks, "
+            "or --seam-analyze. Downstream-only (--num-batches 0) skips the teacher entirely."
         )
     _log(rank, f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
                f"K={layout.tracks_per_rank} num_layers={manifest.num_layers}")
@@ -332,15 +410,44 @@ def main() -> int:
         _log(rank, f"[data] materialized {len(calib_batches)} calibration batches (seq_len={args.seq_len})")
 
     sync_indices = tuple(sync_layers)
+
+    # ----- Training-free predictability decomposition (bypasses the channel loop). -----
+    if args.seam_analyze:
+        abatches = _materialize(args.analyze_batches)
+        _log(rank, f"[data] materialized {len(abatches)} analyze batches (seq_len={args.seq_len})")
+        ch = load_cross_head(args.checkpoint_dir)
+        if ch is not None:
+            student.cross_head = ch.to(device).to(torch.bfloat16)
+            _log(rank, f"[init] analysing the TRAINED seam stream (cross_head backend={ch.backend}).")
+        else:
+            _log(rank, "[init] no cross_head in checkpoint; analysing the plain-D1 stream.")
+        res = seam_predictability_analysis(
+            student, abatches, sync_indices, ridge_lambda=args.analyze_ridge_lambda,
+        )
+        if rank == 0:
+            _print_seam_analysis(res, args.checkpoint_dir)
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
+
+    if args.sync_phase == "post-attn":
+        fwd = phased_intervention_forward
+        _log(rank, "[init] PHASED mode (--sync-phase post-attn): write-side memory-correction "
+                   "gate (zero==deployed phased forward, oracle==perfect delivery).")
+    else:
+        fwd = seam_intervention_forward if args.seam else intervention_forward
+        if args.seam:
+            _log(rank, "[init] SEAM mode: intra-block post-attention substitution "
+                       "(oracle==dense teacher, zero==current D=1).")
     results: dict[str, dict] = {}
     for ch in channels:
         if isinstance(ch, CalibratedFixedLowRankChannel):
             _log(rank, f"[run] channel={ch.name} — PCA-fitting basis on {len(calib_batches)} batches…")
-            _calibrate(student, calib_batches, ch, sync_indices, device)
+            _calibrate(student, calib_batches, ch, sync_indices, device, fwd)
         kl_m = {"kl": math.nan, "top1": math.nan, "ppl": math.nan}
         if run_kl:
             _log(rank, f"[run] channel={ch.name} — KL pass…")
-            kl = _kl_pass(student, teacher, batches, ch, sync_indices, args.chunk_size, device)
+            kl = _kl_pass(student, teacher, batches, ch, sync_indices, args.chunk_size, device, fwd)
             kl_m = {
                 "kl": kl["kl_forward"].item(),
                 "top1": kl["top1_agree"].item(),
@@ -349,7 +456,7 @@ def main() -> int:
         ds_score, per_task = (math.nan, {})
         if run_ds:
             _log(rank, f"[run] channel={ch.name} — downstream…")
-            ds_score, per_task = _downstream_pass(student, tok, ch, sync_indices, args, rank, device)
+            ds_score, per_task = _downstream_pass(student, tok, ch, sync_indices, args, rank, device, fwd)
         results[ch.name] = {**kl_m, "ds": ds_score, "per_task": per_task}
 
     if rank == 0:

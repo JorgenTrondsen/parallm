@@ -82,9 +82,11 @@ from pt_converter.eval.sensitivity import debias_partial_error, partial_residual
 from pt_converter.slicer.convert import _resolve_sync_schedule, place_sync_boundaries
 from pt_converter.train.teacher import HookedTeacher
 from pt_converter.utils.checkpoint import (
+    load_cross_head,
     load_manifest,
     load_track,
     load_track_keys,
+    save_cross_head,
     save_manifest,
 )
 from pt_converter.utils.mem_report import (
@@ -264,6 +266,13 @@ def main() -> int:
     p.add_argument("--sync-indices", default=None,
                    help="Explicit comma-separated sync layer indices, bypassing the probe "
                         "(reproducibility / fixed-schedule A-B). Overrides --num-sync-boundaries.")
+    p.add_argument("--sync-phase", choices=["boundary", "post-attn"], default="boundary",
+                   help="Lever B — where the single per-block sync lands. 'boundary' (default) is "
+                        "the legacy post-MLP sync. 'post-attn' phase-shifts it to the post-attention "
+                        "point: the MLP reads the EXACT (real) Sigma_others Y while the next layer's "
+                        "attention reads the partial residual — SAME sync count. Delivers real "
+                        "cross-track content to the seam (no predictor). D=1 only; incompatible with "
+                        "--cross-head-estimator and --free-running-mse.")
     p.add_argument("--sensitivity-probe-depth", type=int, default=2,
                    help="Reference uniform sync depth for the startup sensitivity probe (must "
                         "divide num_layers). A fine depth makes rel_err_partial a LOCAL per-layer "
@@ -460,6 +469,60 @@ def main() -> int:
                         "the logit-relevant residual directions isotropic block-MSE misses. "
                         "0 = off (default).")
     p.add_argument("--kl-temperature", type=float, default=1.0)
+    p.add_argument("--divergence", default="forward_kl",
+                   choices=["forward_kl", "reverse_kl", "jsd"],
+                   help="Which divergence the --lambda-kl output term uses (GKD family). "
+                        "'forward_kl' (default) = mean-seeking KL(teacher||student), "
+                        "bit-identical legacy. 'reverse_kl' = mode-seeking KL(student||teacher) "
+                        "— penalizes student mass where the teacher assigns none (the A2a "
+                        "lever against hard-reasoning logit collapse). 'jsd' = symmetric "
+                        "0.5*KL(s||m)+0.5*KL(t||m). Training loss only: val_kl stays "
+                        "forward-KL for comparability across runs.")
+    p.add_argument("--cross-head-estimator", default="off",
+                   choices=["off", "fresh", "fresh_yself", "temporal", "oracle_lowrank",
+                            "stale", "stale_corr", "oracle", "window_stale"],
+                   help="Attach a cross-head attention-output estimator at the D=1 post-attention "
+                        "seam (recovers the missing Sigma_others(Y) the MLP doesn't see). 'fresh' = "
+                        "a comm-free per-layer predictor of the full token-mixer output from the "
+                        "synced block input (trained by --lambda-cross-head-predict + end-to-end). "
+                        "'stale' = the 1-token-stale cross-head content (a sync-payload cache; only "
+                        "the gate trains). 'stale_corr' = HYBRID: the stale frame (skip, no extra "
+                        "sync) + a comm-free predictor of the 1-token drift (trained by "
+                        "--lambda-cross-head-predict); degrades gracefully to 'stale'. "
+                        "'oracle' = the EXACT current-token Sigma_others(Y) (learned "
+                        "gate) — a comm-FULL co-trained CEILING (gate→1 = exact tensor parallelism), "
+                        "NOT deployable; use it to measure whether the model can USE perfect content. "
+                        "Requires --intra-window-mse and a D=1 schedule (sync "
+                        "every layer). The estimator is zero-init ⇒ a warm-start is a no-op at step 0.")
+    p.add_argument("--cross-head-lr", type=float, default=1e-3,
+                   help="LR for the cross-head estimator's own optimizer param group. The grads are "
+                        "SUM-reduced across ranks (track-split), so this is a sum-grad LR.")
+    p.add_argument("--cross-head-rank", type=int, default=512,
+                   help="Low-rank width of the fresh predictor's per-layer down/up projection.")
+    p.add_argument("--cross-head-gate-warmup", type=int, default=0,
+                   help="Gate-warmup steps: hold the seam gate at ~0 for the first N steps (the "
+                        "predictor still trains via the predict loss), then linearly ramp the gate "
+                        "0→1 over steps [N, 2N). Decouples 'learn to predict' from 'use it' to avoid "
+                        "the gate↔predictor feedback divergence seen with strong predictors "
+                        "(fresh_yself). 0 = off.")
+    p.add_argument("--cross-head-oracle-noise", type=float, default=0.0,
+                   help="CALIBRATION (oracle backend only): degrade the delivered ΣY to this target "
+                        "relMSE before the seam, so a co-trained run measures the accuracy→downstream "
+                        "curve (captured fraction = 1 − this; 0 = exact oracle, 0.46 ≈ the fresh "
+                        "predictor's accuracy). The additive noise is rank-consistent (seeded per "
+                        "step+layer).")
+    p.add_argument("--cross-head-depth", type=int, default=1,
+                   help="Number of rank-space hidden blocks in the fresh predictor "
+                        "(down -> [gelu -> mid]*(depth-1) -> gelu -> up). depth=1 is the plain "
+                        "low-rank map; >1 buys map expressivity for the h_ln->SigmaY function.")
+    p.add_argument("--cross-head-window", type=int, default=1,
+                   help="temporal backend: number of cached past-token ΣY frames the predictor "
+                        "reads (predict current ΣY from its own real recent history). 1 = just the "
+                        "1-token-stale frame.")
+    p.add_argument("--lambda-cross-head-predict", type=float, default=1.0,
+                   help="Weight on the fresh backend's direct predict loss relMSE(g(h_ln), "
+                        "Sigma(Y).detach()) — the stable driver of the predictor. Ignored by 'stale'. "
+                        "Scaled by 1/world internally (the predict loss is replicated).")
     p.add_argument("--student-forcing-prob", type=float, default=0.0,
                    help="Scheduled-sampling probability of feeding a block the student's "
                         "OWN synced hidden (instead of the teacher's) as input, while the MSE "
@@ -668,10 +731,16 @@ def main() -> int:
         if not (0.0 <= args.fr_grad_alpha <= 1.0):
             p.error("--fr-grad-alpha must be in [0, 1]")
         if args.lambda_kl != 0.0 or args.lambda_ce != 0.0 or args.lambda_logit_mse != 0.0:
-            p.error("--fr-grad-alpha < 1.0 damps every gradient through the full student "
-                    "forward; the KL/CE/logit-MSE backward shares that graph and would be "
-                    "silently damped too. Run with --lambda-kl 0 --lambda-ce 0 "
-                    "--lambda-logit-mse 0.")
+            # Intentional combination for on-policy output training (A2a): the
+            # output objective's through-depth gradient is geometrically damped
+            # per sync window crossed — that IS the divergence fix that lets an
+            # output loss train the free-running forward. Warn (it silently
+            # weakens shallow-window supervision) but allow.
+            print("[warn] --fr-grad-alpha < 1.0 with a non-zero output objective "
+                  "(--lambda-kl/--lambda-ce/--lambda-logit-mse): the output loss "
+                  "backward shares the damped full-forward graph, so its gradient "
+                  "into window w is scaled by alpha^(windows crossed). This is the "
+                  "intended on-policy (A2a) configuration.", flush=True)
     if args.selection_metric == "downstream" and args.downstream_eval_every <= 0:
         p.error("--selection-metric downstream requires --downstream-eval-every > 0 (the "
                 "downstream eval is what produces the selection metric).")
@@ -687,6 +756,11 @@ def main() -> int:
             f"K = n_tracks / world_size tracks are hosted per rank."
         )
     torch.cuda.set_device(local_rank)
+    # The compiled cross-head seam drives self_attn to the memory-efficient (cutlass)
+    # SDPA backend at downstream-eval shapes/padding-masks, where it has "no kernel to
+    # launch" (crashes run_downstream). Force flash/math, which have kernels for every
+    # train + eval config; harmless when no estimator is attached.
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -803,6 +877,17 @@ def main() -> int:
     # the captured hiddens are all-gathered back to the full batch on every rank
     # — identical results, ~world_size-fold less teacher compute per rank.
     shard_teacher = args.shard_teacher_fwd and world_size > 1
+    # Lever B (post-attn): the post-attention capture set must be installed at BUILD
+    # time (before FSDP wrapping) — re-registering forward-pre-hooks on FSDP-wrapped
+    # submodules does NOT fire. The phased boundaries (= explicit schedule minus the
+    # final layer) capture the teacher's post-attention residual (X+Y); the rest keep
+    # post-MLP (mid-window taps + the final layer). Requires an explicit --sync-indices.
+    post_attn_layers = None
+    if args.sync_phase == "post-attn":
+        if not args.sync_indices:
+            raise SystemExit("[error] --sync-phase post-attn requires an explicit --sync-indices.")
+        _b = sorted({int(x) for x in args.sync_indices.split(",") if x.strip() != ""})
+        post_attn_layers = set(_b) - {manifest.num_layers - 1}
     teacher = HookedTeacher(
         text_model=text_model,
         lm_head=teacher_lm_head,
@@ -810,10 +895,22 @@ def main() -> int:
         shard_group=layout.track_group if shard_teacher else None,
         shard_world_size=world_size if shard_teacher else 1,
         shard_rank=rank,
+        capture_post_attn=(args.sync_phase == "post-attn"),
+        post_attn_layers=post_attn_layers,
     )
+    # Lever B (post-attn): torch.compile on the teacher layers traces away the
+    # forward-pre-hook on the post_attention_layernorm SUBMODULE (it fires for
+    # full-attention layers but NOT compiled linear-attention layers), so the
+    # post-attention (X+Y) targets at those boundaries go missing → KeyError. The
+    # layer-level post-MLP hooks are unaffected. Disable teacher layer compile for
+    # post-attn runs (small teacher-forward slowdown; correctness first).
+    _compile_teacher = args.compile_teacher and args.sync_phase != "post-attn"
+    if args.compile_teacher and not _compile_teacher:
+        _log(rank, "[init] teacher layer compile DISABLED for sync_phase=post-attn "
+                   "(compiled layers swallow the post-attention submodule pre-hook)")
     wrap_teacher_with_fsdp(
         text_model, fsdp_lm_head,
-        compile_layers=args.compile_teacher, compile_mode=args.compile_mode,
+        compile_layers=_compile_teacher, compile_mode=args.compile_mode,
     )
     mem_stage("teacher loaded (FSDP-sharded)")
 
@@ -857,6 +954,42 @@ def main() -> int:
     wrap_student_with_fsdp(student, layout)
     mem_stage("student loaded (K tracks + vocab-parallel embed/lm_head)")
 
+    # ----- Cross-head attention-output estimator (optional, D=1 post-attention seam) -----
+    # A shared (replicated-across-ranks) module that supplies the missing Σ_others Y
+    # at each layer's MLP input. Zero-init ⇒ a warm-start is a no-op at step 0; the
+    # gate opens during training. Built before the optimizer so its params join it
+    # in their own LR group; its grads are SUM-reduced across ranks each step.
+    if args.cross_head_estimator != "off":
+        from pt_converter.model.cross_head_estimator import CrossHeadEstimator
+        if not args.intra_window_mse:
+            raise SystemExit("[error] --cross-head-estimator requires --intra-window-mse "
+                             "(the seam is trained via the per-layer block-MSE path).")
+        ch = CrossHeadEstimator(
+            num_layers=manifest.num_layers,
+            hidden_size=cfg.text_config.hidden_size,
+            backend=args.cross_head_estimator,
+            rank=args.cross_head_rank,
+            depth=args.cross_head_depth,
+            window=args.cross_head_window,
+        )
+        prior = load_cross_head(state_src)
+        if prior is not None and prior.backend == args.cross_head_estimator:
+            ch.load_state_dict(prior.state_dict())
+            _log(rank, f"[init] cross-head estimator: resumed from {state_src}")
+        else:
+            _log(rank, f"[init] cross-head estimator: fresh zero-init")
+        student.cross_head = ch.to(torch.cuda.current_device()).to(torch.bfloat16)
+        student.cross_head.oracle_noise = args.cross_head_oracle_noise  # 0 = exact; >0 = calibration
+        student.cross_head.broadcast_from_rank0(layout.track_group)
+        # The seam path calls layer submodules directly (bypassing layer.compile()),
+        # so compile the submodules to recover inductor fusion on attn/MLP.
+        if args.compile:
+            student.compile_seam_submodules(args.compile_mode)
+        n_ch = sum(p.numel() for p in student.cross_head.parameters())
+        _log(rank, f"[init] cross-head estimator: backend={args.cross_head_estimator} "
+                   f"{n_ch / 1e6:.1f}M params, lr={args.cross_head_lr:g}, "
+                   f"rank={args.cross_head_rank}")
+
     # ----- Replicated-parameter gradient sync -----
     # The residual-stream norms (input/post layernorm, final norm, linear-attn
     # norm) hold bit-identical copies across tracks and MUST stay synced — we
@@ -870,6 +1003,20 @@ def main() -> int:
         student, adapter=adapter, text_cfg=cfg.text_config, layout=layout,
         force_sync=args.sync_attention_heads,
     )
+    # The cross-head estimator is replicated across ALL ranks (one copy/rank), so
+    # register each of its params as a world-spanning replication group: this gives
+    # MEAN cross-rank grad semantics (matched to the per-track norms) AND correct
+    # grad-norm dedup (counted once, not world×) for the clip. The fresh predict
+    # loss is pre-scaled 1/world (distill.chp_scale), so under the MEAN divide it
+    # lands at the same scale as the (track-split) end-to-end gradients.
+    if getattr(student, "cross_head", None) is not None:
+        from pt_converter.train.sync_grads import ReplicationCoordGroup
+        for p in student.cross_head.parameters():
+            replication_plan.append(
+                ReplicationCoordGroup(
+                    local_params=[p], process_group=dist.group.WORLD, group_size=world_size,
+                )
+            )
     assert_replicated_consistent(replication_plan)
     _log(rank, f"[init] replication plan: {len(replication_plan)} groups synced per step "
                f"(attention-head sync: {'ON' if args.sync_attention_heads else 'OFF — diverging'})")
@@ -938,7 +1085,23 @@ def main() -> int:
     # student_fwd peak under vocab-parallel — it does NOT raise the step peak. The
     # old foreach=False was to avoid OOM on the LEGACY rank-0-heavy layout (rank 0
     # carried embed+lm_head+K tracks at ~36 GB); vocab-parallel balanced that away.
-    param_groups = [{"params": [p for p in student.parameters() if p.requires_grad], "lr": args.lr}]
+    # The cross-head estimator (if attached) is a submodule of `student`, so its
+    # params appear in student.parameters(). Split it into its OWN LR group
+    # (--cross-head-lr) — it trains on SUM-reduced (sum-grad) gradients, so its LR
+    # is decoupled from the per-track AdamW LR.
+    ch_param_ids = (
+        {id(p) for p in student.cross_head.parameters()}
+        if getattr(student, "cross_head", None) is not None else set()
+    )
+    base_params = [
+        p for p in student.parameters() if p.requires_grad and id(p) not in ch_param_ids
+    ]
+    param_groups = [{"params": base_params, "lr": args.lr}]
+    if ch_param_ids:
+        param_groups.append(
+            {"params": [p for p in student.cross_head.parameters() if p.requires_grad],
+             "lr": args.cross_head_lr}
+        )
     optim = torch.optim.AdamW(
         param_groups,
         lr=args.lr,
@@ -1010,6 +1173,44 @@ def main() -> int:
     _log(rank, f"[sched] sync_layer_indices={chosen} ({len(chosen)} boundaries)")
     student.set_sync_schedule(chosen)
     manifest.sync_layer_indices = list(chosen)
+    # The cross-head seam assumes D=1 (every layer enters from the SAME synced
+    # residual, so h_ln — and the fresh predictor's estimate — is shared). Enforce it.
+    if getattr(student, "cross_head", None) is not None \
+            and student.cross_head.backend != "window_stale":
+        if set(chosen) != set(range(manifest.num_layers)):
+            raise SystemExit(
+                "[error] --cross-head-estimator requires a D=1 schedule (sync after EVERY "
+                f"layer); got {len(chosen)} syncs for {manifest.num_layers} layers. "
+                "Pass --sync-indices 0,1,...,N-1."
+            )
+    # Lever B: phase-shift the single per-block sync to post-attention. D=1 only;
+    # delivers REAL Sigma_others Y to the MLP (no predictor), so it is mutually
+    # exclusive with the cross-head seam and with the free-running unroll term.
+    if args.sync_phase == "post-attn":
+        # D=1 OR D>1: phase the per-window sync to post-attention. The final layer
+        # must be a sync boundary (the norm needs a synced hidden); it stays post-MLP.
+        if (manifest.num_layers - 1) not in set(chosen):
+            raise SystemExit(
+                "[error] --sync-phase post-attn requires the final layer to be a sync "
+                f"boundary; got {chosen}."
+            )
+        if args.cross_head_estimator not in ("off", "window_stale"):
+            raise SystemExit(
+                "[error] --sync-phase post-attn is incompatible with --cross-head-estimator "
+                f"{args.cross_head_estimator!r} (B delivers the real Sigma_others Y; only "
+                "'window_stale' — depth-stale fill of the partial non-boundary layers — fits)."
+            )
+        if args.free_running_mse:
+            raise SystemExit("[error] --sync-phase post-attn is incompatible with --free-running-mse.")
+        student.set_sync_phase("post-attn")
+        # The post-attn path calls layer submodules directly (bypassing layer.compile()),
+        # so compile the submodules to recover inductor fusion on attn/MLP (attention is
+        # left eager — see compile_seam_submodules). The cross-head build already compiled
+        # them when an estimator is attached (window_stale), so skip the double-compile.
+        if args.compile and getattr(student, "cross_head", None) is None:
+            student.compile_seam_submodules(args.compile_mode)
+        _log(rank, "[init] sync_phase=post-attn (lever B): single sync shifted to post-attention"
+                   + (" + window_stale depth-fill" if args.cross_head_estimator == "window_stale" else ""))
     # Communication budget held fixed for any mid-run re-placement (--resync-probe-every):
     # re-place the SAME number of boundaries on the current weights.
     num_boundaries = len(chosen)
@@ -1019,7 +1220,11 @@ def main() -> int:
     # Narrow the teacher hooks to the boundaries unless intra-window MSE needs
     # every layer (the probe is done, so the extra captures are no longer needed).
     # Re-placement re-hooks every layer transiently, then narrows back.
-    if not args.intra_window_mse:
+    # Narrow hooks to the boundaries unless intra-window needs every layer. Skipped for
+    # post-attn (its post-attention pre-hooks were installed pre-FSDP at build and must
+    # not be re-installed post-FSDP; keeping all-layer hooks is also what intra-window
+    # mid-window taps need).
+    if not args.intra_window_mse and args.sync_phase != "post-attn":
         teacher.set_hook_indices(chosen)
 
     distill_cfg = DistillConfig(
@@ -1028,11 +1233,18 @@ def main() -> int:
         lambda_kl=args.lambda_kl,
         lambda_ce=args.lambda_ce,
         lambda_logit_mse=args.lambda_logit_mse,
+        divergence=args.divergence,
         kl_temperature=args.kl_temperature,
         kl_ce_chunk_size=args.kl_ce_chunk_size,
         normalize_block_mse=args.normalize_block_mse,
         block_mse_clamp=(args.block_mse_clamp if args.block_mse_clamp > 0 else None),
         intra_window_mse=args.intra_window_mse,
+        lambda_cross_head_predict=(
+            args.lambda_cross_head_predict
+            if args.cross_head_estimator in
+            ("fresh", "fresh_yself", "temporal", "oracle_lowrank", "stale_corr") else 0.0
+        ),
+        sync_phase=args.sync_phase,
         free_running_mse=args.free_running_mse,
         lambda_free_running=args.lambda_free_running,
         free_running_taps=args.free_running_taps,
@@ -1065,6 +1277,11 @@ def main() -> int:
             # Write the structural manifest WITH the dynamically-chosen schedule
             # (set above), so eval reproduces the exact boundaries trained against.
             save_manifest(ck_dir, manifest)
+            # Cross-head estimator sidecar (replicated → rank 0 only). Kept out of
+            # the per-track shards so load_track_state_dicts is untouched; eval
+            # rebuilds it from here.
+            if getattr(student, "cross_head", None) is not None:
+                save_cross_head(ck_dir, student.cross_head)
         dist.barrier()
         # Collective: all-gather the vocab shards → full embed/lm_head on rank 0
         # (None on peers). Must run on every rank before the per-track loop.
@@ -1304,7 +1521,7 @@ def main() -> int:
         loss_scale = 1.0 / G
         optim.zero_grad(set_to_none=True)
         loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0,
-                     "logit_mse": 0.0, "fr_mse": 0.0}
+                     "logit_mse": 0.0, "fr_mse": 0.0, "cross_head_predict": 0.0}
         relmse_sums: dict[int, torch.Tensor] = {}
         data_wait = 0.0
         micro_count = 0
@@ -1322,6 +1539,15 @@ def main() -> int:
                 batch = {k: v.unsqueeze(0) for k, v in batch.items()}
             # Pass the mem-capture dict on the FIRST microbatch only (it resets peak stats).
             micro_mem = step_mem if (do_mem_capture and micro == 0) else None
+            # Rank-consistent seed for the oracle-noise calibration knob (no-op when
+            # oracle_noise == 0). step+micro are identical on every rank.
+            if getattr(student, "cross_head", None) is not None:
+                student.cross_head._noise_base = step * 1000 + micro
+                if args.cross_head_gate_warmup > 0:
+                    N = args.cross_head_gate_warmup
+                    student.cross_head._gate_scale = (
+                        0.0 if step < N else min(1.0, (step - N) / N)
+                    )
             # distill_step backwards each block immediately to bound peak memory;
             # grads accumulate on student params across blocks AND microbatches.
             losses = distill_step(
@@ -1333,6 +1559,7 @@ def main() -> int:
                 track_layer_relmse=args.adaptive_layer_weight,
                 free_running_scale=fr_scale,
                 compute_klce_metrics=klce_metrics,
+                cross_head_world_size=world_size,
             )
             for k in loss_sums:
                 loss_sums[k] = loss_sums[k] + losses[k].detach()
@@ -1444,6 +1671,7 @@ def main() -> int:
                 f"fr_mse={mean_losses['fr_mse'].item():.4f} "
                 f"kl={mean_losses['kl'].item():.4f} ce={mean_losses['ce'].item():.4f} "
                 f"logit_mse={mean_losses['logit_mse'].item():.4f} "
+                f"chp={mean_losses['cross_head_predict'].item():.4f} "
                 f"grad_norm={total_norm.item():.3e} "
                 f"lr={lr_now:.2e} elapsed={elapsed:.1f}s",
             )

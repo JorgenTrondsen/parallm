@@ -93,10 +93,18 @@ def _kl_ce_chunked(
     chunk_size: int,
     loss_scale: float = 1.0,
     compute_grads: bool = True,
+    divergence: str = "forward_kl",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compute lambda_kl * KL + lambda_ce * CE (+ lambda_logit_mse * centered
     logit-MSE) in seq-chunks; return the accumulated gradient w.r.t. ``hidden``
     for the caller to backward.
+
+    ``divergence`` selects the λ_kl term (GKD family): ``forward_kl`` (default,
+    mean-seeking KL(t‖s), bit-identical to the legacy behaviour), ``reverse_kl``
+    (mode-seeking KL(s‖t) — penalizes student mass where the teacher has none),
+    or ``jsd`` (symmetric 0.5·KL(s‖m)+0.5·KL(t‖m), m=(p_s+p_t)/2). All use the
+    same ×T² KD temperature convention; validation stays forward-KL (callers
+    there don't pass this).
 
     ``loss_scale`` (gradient-accumulation: 1/grad_accum_steps) multiplies the
     accumulated gradients only — the returned KL/CE scalars stay UNSCALED so
@@ -173,11 +181,27 @@ def _kl_ce_chunked(
             s_chunk = lm_head(h_chunk)                      # (B, chunk, V) bf16
             t_chunk = teacher_logits[:, t0:t1, :]           # detached
 
-            # KL contribution for this chunk. Reuses t_logp.exp() in place of a
-            # second log_softmax — saves one fp32 vocab-wide intermediate.
+            # Divergence contribution for this chunk (autograd handles backward;
+            # only the VP path needs hand-derived grads). Reuses .exp() of the
+            # log_softmax in place of a second one — saves a vocab-wide fp32.
             s_logp = F.log_softmax(s_chunk.float() / kl_temperature, dim=-1)
             t_logp = F.log_softmax(t_chunk.float() / kl_temperature, dim=-1)
-            per_token_kl = (t_logp.exp() * (t_logp - s_logp)).sum(dim=-1)
+            if divergence == "forward_kl":
+                per_token_kl = (t_logp.exp() * (t_logp - s_logp)).sum(dim=-1)
+            elif divergence == "reverse_kl":
+                per_token_kl = (s_logp.exp() * (s_logp - t_logp)).sum(dim=-1)
+            elif divergence == "jsd":
+                p_s, p_t = s_logp.exp(), t_logp.exp()
+                # clamp guards log(0) when BOTH probs underflow fp32 at a vocab
+                # slot; the p·(·) factors there are exactly 0 so the value is
+                # unaffected — this only avoids 0·(−inf)=nan.
+                log_m = (0.5 * (p_s + p_t)).clamp_min(1e-30).log()
+                per_token_kl = 0.5 * (
+                    (p_s * (s_logp - log_m)).sum(dim=-1)
+                    + (p_t * (t_logp - log_m)).sum(dim=-1)
+                )
+            else:
+                raise ValueError(f"unknown divergence {divergence!r}")
             if attention_mask is not None:
                 per_token_kl = per_token_kl * attention_mask[:, t0:t1]
             kl_chunk = per_token_kl.sum() / kl_denom * temp_sq
@@ -258,7 +282,7 @@ class _VocabParallelKLCE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, s_local, t_local, ce_target, ce_valid, kl_mask, cfg):
-        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V, group, ws = cfg
+        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V, group, ws, divergence = cfg
         s = s_local.float()
         t = t_local.float()
         s_kl = s / T
@@ -286,8 +310,27 @@ class _VocabParallelKLCE(torch.autograd.Function):
         p_t_kl = exp_t_kl / gsum_t_kl.unsqueeze(-1)      # teacher probs (T-scaled)
         logps_kl = s_kl - glse_s_kl.unsqueeze(-1)        # log p_s (shard)
         logpt_kl = t_kl - glse_t_kl.unsqueeze(-1)        # log p_t (shard)
-        B_term = (p_t_kl * logps_kl).sum(-1)             # Σ_shard p_t·log p_s
-        A_term = (p_t_kl * logpt_kl).sum(-1)             # Σ_shard p_t·log p_t
+        # Divergence shard partials (two rows; their combination below gives the
+        # per-token value). ``div_mat``/``div_tok`` are what backward needs beyond
+        # the probs: the shard-local log-ratio matrix and the per-token scalar
+        # (empty for forward_kl, whose grad is just p_s − p_t).
+        if divergence == "forward_kl":
+            row1 = (p_t_kl * logps_kl).sum(-1)           # Σ_shard p_t·log p_s
+            row2 = (p_t_kl * logpt_kl).sum(-1)           # Σ_shard p_t·log p_t
+            div_mat = s.new_zeros(0)
+        elif divergence == "reverse_kl":
+            row1 = (p_s_kl * logpt_kl).sum(-1)           # Σ_shard p_s·log p_t
+            row2 = (p_s_kl * logps_kl).sum(-1)           # Σ_shard p_s·log p_s
+            div_mat = logps_kl - logpt_kl
+        elif divergence == "jsd":
+            # clamp guards log(0) when both probs underflow at a slot; the p·(·)
+            # factors there are exactly 0 (avoids 0·(−inf)=nan only).
+            log_m = (0.5 * (p_s_kl + p_t_kl)).clamp_min(1e-30).log()
+            row1 = (p_s_kl * (logps_kl - log_m)).sum(-1)  # Σ_shard p_s·log(p_s/m)
+            row2 = (p_t_kl * (logpt_kl - log_m)).sum(-1)  # Σ_shard p_t·log(p_t/m)
+            div_mat = logps_kl - log_m
+        else:
+            raise ValueError(f"unknown divergence {divergence!r}")
 
         valid_in_shard = ce_valid & (ce_target >= 0)
         sel_idx = ce_target.clamp(min=0).unsqueeze(-1)
@@ -299,17 +342,25 @@ class _VocabParallelKLCE(torch.autograd.Function):
         do_lm = lam_lm != 0.0
         if do_lm:
             d = s - t
-            cross_rows = [B_term, A_term, ce_sel, d.sum(-1), (d * d).sum(-1)]
+            cross_rows = [row1, row2, ce_sel, d.sum(-1), (d * d).sum(-1)]
         else:
-            cross_rows = [B_term, A_term, ce_sel]
+            cross_rows = [row1, row2, ce_sel]
 
         # 3) vocab-summed cross terms (one SUM all-reduce).
         crosses = torch.stack(cross_rows, dim=0)
         _vp_all_reduce(crosses, dist.ReduceOp.SUM, group, ws)
-        B_full, A_full, ce_sel_full = crosses[0], crosses[1], crosses[2]
+        row1_full, row2_full, ce_sel_full = crosses[0], crosses[1], crosses[2]
 
-        # KL(t‖s) per token = Σ p_t log p_t − Σ p_t log p_s; ×T² (KD convention).
-        per_tok_kl = (A_full - B_full) * kl_mask
+        # Per-token divergence; ×T² (KD convention). forward: KL(t‖s)=Σp_t·log p_t
+        # −Σp_t·log p_s; reverse: KL(s‖t)=Σp_s·log p_s−Σp_s·log p_t (same
+        # row2−row1 shape); jsd: 0.5·(KL(s‖m)+KL(t‖m)) = 0.5·(row1+row2).
+        if divergence == "jsd":
+            per_tok_div = 0.5 * (row1_full + row2_full)
+            div_tok = row1_full                          # KL(p_s‖m), backward's scalar
+        else:
+            per_tok_div = row2_full - row1_full
+            div_tok = per_tok_div if divergence == "reverse_kl" else s.new_zeros(0)
+        per_tok_kl = per_tok_div * kl_mask
         kl_val = per_tok_kl.sum() / kl_denom * (T * T)
         # CE per predicting position = global_logsumexp − selected-label logit.
         per_pos_ce = (glse_s_ce - ce_sel_full) * ce_valid.to(glse_s_ce.dtype)
@@ -330,18 +381,30 @@ class _VocabParallelKLCE(torch.autograd.Function):
 
         loss = lam_kl * kl_val + lam_ce * ce_val + lam_lm * lm_val
         ctx.save_for_backward(
-            p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask, d_save, dbar_save
+            p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask, d_save, dbar_save,
+            div_mat, div_tok,
         )
-        ctx.consts = (T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V)
+        ctx.consts = (T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V, divergence)
         return loss, kl_val.detach(), ce_val.detach(), lm_val.detach()
 
     @staticmethod
     def backward(ctx, grad_loss, grad_kl, grad_ce, grad_lm):
         (p_s_kl, p_t_kl, p_s_ce, ce_target, ce_valid, kl_mask,
-         d_save, dbar_save) = ctx.saved_tensors
-        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V = ctx.consts
-        # KL grad: ∂kl/∂s = (T/kl_denom)·mask·(p_s − p_t)  (after the ×T² factor).
-        g_kl = lam_kl * (T / kl_denom) * kl_mask.unsqueeze(-1) * (p_s_kl - p_t_kl)
+         d_save, dbar_save, div_mat, div_tok) = ctx.saved_tensors
+        T, lam_kl, lam_ce, lam_lm, kl_denom, ce_denom, V, divergence = ctx.consts
+        # Divergence grad w.r.t. the raw student shard logits (after the ×T²
+        # factor; all hand-derived, collective-free — the saved tensors are
+        # shard-local and the per-token scalars already all-reduced):
+        #   forward_kl: (T/denom)·mask·(p_s − p_t)
+        #   reverse_kl: (T/denom)·mask·p_s·(log p_s − log p_t − rkl)
+        #   jsd:        (0.5T/denom)·mask·p_s·(log(p_s/m) − KL(p_s‖m))
+        if divergence == "forward_kl":
+            g_core = p_s_kl - p_t_kl
+        elif divergence == "reverse_kl":
+            g_core = p_s_kl * (div_mat - div_tok.unsqueeze(-1))
+        else:  # jsd
+            g_core = 0.5 * p_s_kl * (div_mat - div_tok.unsqueeze(-1))
+        g_kl = lam_kl * (T / kl_denom) * kl_mask.unsqueeze(-1) * g_core
         # CE grad: ∂ce/∂s = (1/ce_denom)·valid·(p_s − onehot(label)).
         onehot = torch.zeros_like(p_s_ce)
         valid_in_shard = ce_valid & (ce_target >= 0)
@@ -379,9 +442,14 @@ def _kl_ce_vocab_parallel(
     world_size: int,
     compute_grads: bool = True,
     loss_scale: float = 1.0,
+    divergence: str = "forward_kl",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Vocab-parallel KL+CE (+ centered logit-MSE): runs on EVERY rank, each owning
     vocab rows [v_lo, v_hi).
+
+    ``divergence`` selects the λ_kl term (see ``_kl_ce_chunked``): forward_kl
+    (default, bit-identical legacy), reverse_kl, or jsd — the extra shard
+    partials ride the existing SUM all-reduce and backward stays collective-free.
 
     Mirrors ``_kl_ce_chunked`` (seq-chunked lm_head, grad-w.r.t.-hidden returned
     for the caller to backward, lm_head grads accumulated in place) but the
@@ -449,7 +517,7 @@ def _kl_ce_vocab_parallel(
             )
 
             cfg = (kl_temperature, lambda_kl, lambda_ce, lambda_logit_mse,
-                   kl_denom, ce_denom, vocab_size, group, world_size)
+                   kl_denom, ce_denom, vocab_size, group, world_size, divergence)
             loss, kl_d, ce_d, lm_d = _VocabParallelKLCE.apply(
                 s_local.float(), t_local.float(), ce_target, ce_valid, kl_mask, cfg
             )
@@ -479,6 +547,13 @@ class DistillConfig:
     # single KL/CE logit pass (reuses the already-computed lm_head matmul), so the
     # marginal cost is ~zero. See losses.logit_mse. 0.0 = off (default).
     lambda_logit_mse: float = 0.0
+    # Which divergence the λ_kl output term uses (GKD family): "forward_kl"
+    # (default, mean-seeking KL(t‖s), bit-identical legacy), "reverse_kl"
+    # (mode-seeking KL(s‖t) — penalizes student mass the teacher assigns none;
+    # the A2a lever against hard-reasoning logit collapse), or "jsd" (symmetric).
+    # Training-loss only: validate_step / val_kl stay forward-KL for
+    # comparability across runs.
+    divergence: str = "forward_kl"
     kl_temperature: float = 1.0
     # Relative (scale-free) block MSE: Σ(s−t)²/Σt² per block instead of the raw
     # masked mean. Rescales the block term to O(1)/block so deep, large-norm
@@ -498,6 +573,26 @@ class DistillConfig:
     # D=1 (one layer per window) it is bit-identical to the legacy boundary MSE.
     # Requires the teacher to be hooked at every layer (see scripts/train_*.py).
     intra_window_mse: bool = False
+    # Cross-head attention-output estimator (D=1 post-attention seam): when the
+    # student has a ``cross_head`` module attached, the intra-window block loop and
+    # the full forward inject its estimate of the missing ``Σ_others Y`` at each
+    # layer's MLP input (see model/cross_head_estimator). This weight is on the
+    # FRESH backend's direct predict loss ``relMSE(g(h_ln), ΣY.detach())`` (averaged
+    # over the window's layers), the stable driver of the predictor; the gate and
+    # MLP train end-to-end via the existing block-MSE. The predict loss is
+    # replicated across ranks, so it is scaled by ``1/cross_head_world_size`` before
+    # backward to land at the same 1x scale as the (track-split, SUM-reduced)
+    # end-to-end gradients. 0.0 = off / stale backend (no predictor). Requires
+    # intra_window_mse.
+    lambda_cross_head_predict: float = 0.0
+    # Lever B — where the single per-block sync lands. "boundary" (default) is the
+    # legacy post-MLP sync. "post-attn" phase-shifts it to the post-attention point:
+    # the MLP reads the EXACT (real, not predicted) Σ_others Y while the NEXT layer's
+    # attention reads the partial residual — same sync COUNT. Block-MSE targets become
+    # the teacher's post-attention residual (X+Y) for layers 0..L-2 and the post-MLP
+    # hidden for the last layer (which keeps a boundary sync). D=1 only; mutually
+    # exclusive with a cross_head seam and with free_running_mse.
+    sync_phase: str = "boundary"
     # Free-running feature matching: relative-MSE the END-TO-END student forward's
     # synced hiddens (the same full forward the KL/CE pass uses — the student runs
     # on its OWN hiddens throughout) against the teacher hiddens at the sync
@@ -706,6 +801,7 @@ def distill_step(
     track_layer_relmse: bool = False,
     free_running_scale: float = 1.0,
     compute_klce_metrics: bool = True,
+    cross_head_world_size: int = 1,
 ) -> dict[str, torch.Tensor]:
     """Run one distillation step. Backward is done internally, per block.
 
@@ -864,11 +960,15 @@ def distill_step(
         )
         return loss, rel
     block_loss_val = torch.zeros((), device=input_ids.device)
+    # Cross-head estimator fresh-predict loss accumulator (0 unless attached + fresh).
+    cross_head_predict_val = torch.zeros((), device=input_ids.device)
+    chp_scale = cfg.lambda_cross_head_predict / max(1, cross_head_world_size)
     # Block 0 reads the synced student embedding (detached); subsequent blocks
     # read the teacher's post-block hidden state at the previous sync index.
     prev_h = inputs_embeds.detach()
     with _phase("block_loop", timings, mem):
-        for start, end in ranges:
+        for start, end in (ranges if cfg.sync_phase != "post-attn" else ()):
+            win_predict = torch.zeros((), device=input_ids.device)
             if cfg.intra_window_mse:
                 # Per-layer supervision: run the window track-locally and at EACH
                 # layer compute the synced reconstruction and MSE it against the
@@ -880,24 +980,47 @@ def distill_step(
                 win_loss = torch.zeros((), device=input_ids.device)
                 t_end = None
                 for layer_idx in range(start, end + 1):
-                    new_h: list[torch.Tensor] = []
-                    for k, tm in enumerate(student.text_models):
-                        layer = tm.layers[layer_idx]
-                        layer_mask = (
-                            linear_attn_mask
-                            if tm.config.layer_types[layer_idx] == "linear_attention"
-                            else causal_mask
+                    if student.cross_head is not None:
+                        # Cross-head seam: inject the estimate of Σ_others Y at this
+                        # layer's MLP input; collect ΣY + the fresh predictor's ghat
+                        # for the direct predict loss.
+                        new_h, sum_y, ghat = student.run_seam_layer(
+                            layer_idx, per_track_h, position_embeddings,
+                            text_position_ids, causal_mask, linear_attn_mask,
+                            collect_predict=True,
                         )
-                        new_h.append(
-                            layer(
-                                per_track_h[k],
-                                position_embeddings=position_embeddings,
-                                attention_mask=layer_mask,
-                                position_ids=text_position_ids,
-                                past_key_values=None,
-                                use_cache=False,
+                        if ghat is not None and chp_scale != 0.0:
+                            if ghat.ndim == sum_y.ndim:
+                                win_predict = win_predict + block_mse(
+                                    ghat, sum_y, attention_mask=attention_mask, normalize=True
+                                )
+                            else:
+                                # fresh_yself: ghat is per-track (K, …); mean-over-tracks
+                                # relMSE(ghat_k, ΣY) (unmasked — mask broadcast doesn't
+                                # align with the leading track dim; packed data ≈ no pad).
+                                tgt = sum_y.unsqueeze(0).expand_as(ghat)
+                                win_predict = win_predict + block_mse(
+                                    ghat, tgt, attention_mask=None, normalize=True
+                                )
+                    else:
+                        new_h: list[torch.Tensor] = []
+                        for k, tm in enumerate(student.text_models):
+                            layer = tm.layers[layer_idx]
+                            layer_mask = (
+                                linear_attn_mask
+                                if tm.config.layer_types[layer_idx] == "linear_attention"
+                                else causal_mask
                             )
-                        )
+                            new_h.append(
+                                layer(
+                                    per_track_h[k],
+                                    position_embeddings=position_embeddings,
+                                    attention_mask=layer_mask,
+                                    position_ids=text_position_ids,
+                                    past_key_values=None,
+                                    use_cache=False,
+                                )
+                            )
                     h_synced = student.sync_module(new_h, prev_h)
                     t_l = teacher_hiddens.pop(layer_idx).detach()
                     if layer_idx == end:
@@ -914,6 +1037,7 @@ def distill_step(
                 # Average over the window so the scale (and lambda_block) matches
                 # the boundary-only path; identical to it when the window is 1 layer.
                 block_loss_b = win_loss / (end - start + 1)
+                win_predict = win_predict / (end - start + 1)
             else:
                 h_post_list = _run_student_block(
                     student,
@@ -939,9 +1063,22 @@ def distill_step(
                 block_loss_b = eff_w[end] * tap_loss
                 if tap_rel is not None:
                     layer_relmse[end] = tap_rel
+            # Per-block backward: block-MSE (opens the cross-head gate + trains the
+            # MLP end-to-end) plus, for the fresh backend, the direct predict loss
+            # (trains the predictor). Combined into one scalar so the shared seam
+            # graph is traversed once and freed before the next block.
+            backward_terms: list[torch.Tensor] = []
             if cfg.lambda_block != 0.0:
-                (cfg.lambda_block * block_loss_b * loss_scale).backward()
+                backward_terms.append(cfg.lambda_block * block_loss_b)
+            if chp_scale != 0.0 and win_predict.requires_grad:
+                backward_terms.append(chp_scale * win_predict)
+            if backward_terms:
+                block_b_total = backward_terms[0]
+                for extra in backward_terms[1:]:
+                    block_b_total = block_b_total + extra
+                (block_b_total * loss_scale).backward()
             block_loss_val = block_loss_val + block_loss_b.detach()
+            cross_head_predict_val = cross_head_predict_val + win_predict.detach()
             # Next block's input: teacher hidden (teacher forcing) or the
             # student's own synced output (student forcing). Either way detach()
             # keeps the per-block backward memory-bounded. The draw is seeded by
@@ -949,6 +1086,101 @@ def distill_step(
             # SyncBoundary choices in lock-step.
             use_student = forcing_rng.random() < student_forcing_prob
             prev_h = h_synced.detach() if use_student else t_end
+
+        if cfg.sync_phase == "post-attn":
+            # Lever B (D=1 and D>1): the single per-WINDOW sync is phase-shifted to
+            # POST-ATTENTION. Sync after attention at each boundary except the final
+            # layer (delivering the real Σ_others Y to that layer's MLP, which is then
+            # CARRIED), sync after MLP at the final layer, and run NON-boundary layers
+            # fully partial. With intra-window MSE the non-boundary layers also get a
+            # loss-only post-MLP tap (the teacher hooks every layer; post-attn targets
+            # at the boundaries, post-MLP elsewhere). Losses are accumulated per SEGMENT
+            # (between carried syncs) and averaged+backwarded at each carried sync — the
+            # same per-window-mean scale as the boundary intra-window path, so the two
+            # --sync-phase arms are a fair A/B — keeping memory bounded to one segment's
+            # graph and detaching the carried state each segment. Reduces to the D=1
+            # per-layer loop (every layer a boundary, segments of length 1).
+            from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+            L = num_layers
+            last = L - 1
+            sync_attn_set = set(cfg.sync_layer_indices) - {last}
+            # window_stale: train the gate that fills the partial non-boundary layers
+            # with the previous boundary's real ΣY (depth-stale, frequency-free). The
+            # gate gets gradient through the non-boundary tap's block_mse; gate-only,
+            # no predictor / predict loss. None for plain phased (the floor).
+            ch = (
+                student.cross_head
+                if getattr(student, "cross_head", None) is not None
+                and getattr(student.cross_head, "backend", None) == "window_stale"
+                else None
+            )
+            prev_sum_y = None
+            block_input = [inputs_embeds.detach() for _ in student.text_models]
+            block_start = inputs_embeds.detach()
+            seg_loss = torch.zeros((), device=input_ids.device)
+            seg_count = 0
+
+            def _flush(sl, sc):
+                if sc > 0 and cfg.lambda_block != 0.0 and sl.requires_grad:
+                    (cfg.lambda_block * (sl / sc) * loss_scale).backward()
+
+            for i in range(L):
+                h_attn: list[torch.Tensor] = []
+                y_list: list[torch.Tensor] = []
+                for k, tm in enumerate(student.text_models):
+                    layer = tm.layers[i]
+                    layer_mask = (
+                        linear_attn_mask
+                        if tm.config.layer_types[i] == "linear_attention"
+                        else causal_mask
+                    )
+                    ha, _y, _h_ln = seam_token_mixer(
+                        layer, block_input[k], position_embeddings, layer_mask, text_position_ids
+                    )
+                    h_attn.append(ha)
+                    y_list.append(_y)
+                is_boundary = i in sync_attn_set
+                supervise = is_boundary or i == last or cfg.intra_window_mse
+                if is_boundary:
+                    h_synced = student.sync_module(h_attn, block_start)  # post-attn, carried
+                else:
+                    if ch is not None and i != last and prev_sum_y is not None:
+                        subs = ch.subs_window_stale(i, y_list, prev_sum_y)
+                    else:
+                        subs = [None] * len(student.text_models)
+                    new_h = [
+                        seam_mlp(student.text_models[k].layers[i], h_attn[k], subs[k])
+                        for k in range(len(student.text_models))
+                    ]
+                    # Final layer: post-MLP carried sync. Non-boundary: loss-only post-MLP
+                    # tap (synced reconstruction; the forward keeps carrying the partial).
+                    h_synced = (
+                        student.sync_module(new_h, block_start) if supervise else None
+                    )
+                if supervise:
+                    t_l = teacher_hiddens.pop(i).detach()
+                    tap_loss, tap_rel = tap_loss_and_relmse(h_synced, t_l)
+                    seg_loss = seg_loss + eff_w[i] * tap_loss
+                    seg_count += 1
+                    block_loss_val = block_loss_val + (eff_w[i] * tap_loss).detach()
+                    if tap_rel is not None:
+                        layer_relmse[i] = tap_rel
+                if is_boundary:
+                    if ch is not None:
+                        prev_sum_y = student._sum_all_tracks(y_list)  # cache ΣY for the next partial layer
+                    _flush(seg_loss, seg_count)
+                    seg_loss = torch.zeros((), device=input_ids.device)
+                    seg_count = 0
+                    use_student = forcing_rng.random() < student_forcing_prob
+                    chosen = h_synced.detach() if use_student else t_l
+                    block_start = chosen
+                    block_input = [
+                        seam_mlp(tm.layers[i], chosen, None) for tm in student.text_models
+                    ]
+                elif i == last:
+                    _flush(seg_loss, seg_count)
+                else:
+                    block_input = new_h  # carry partial
 
     # ----- Final-logit KL + LM CE (full student forward, chunked lm_head) -----
     # All ranks call the full forward so cross-track SyncBoundary all-reduces
@@ -1034,6 +1266,7 @@ def distill_step(
                 kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 group=student.vp_group, world_size=student.vp_world_size,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
+                divergence=cfg.divergence,
             )
     elif student.lm_head is not None:
         # Legacy: only the track-0 owner has lm_head; peers run the forward for
@@ -1045,6 +1278,7 @@ def distill_step(
                 lambda_logit_mse=cfg.lambda_logit_mse,
                 kl_temperature=cfg.kl_temperature, chunk_size=klce_chunk,
                 loss_scale=loss_scale, compute_grads=need_klce_grads,
+                divergence=cfg.divergence,
             )
     else:
         kl_val = torch.zeros((), device=input_ids.device)
@@ -1084,6 +1318,9 @@ def distill_step(
         "logit_mse": lm_val,
         # Free-running feature-matching relMSE (mean over taps; zeros when off).
         "fr_mse": fr_val,
+        # Cross-head fresh-predict relMSE (sum over blocks of per-window means;
+        # zeros unless a fresh estimator is attached with lambda_cross_head_predict>0).
+        "cross_head_predict": cross_head_predict_val,
         # Per-tap relative MSE (detached; empty unless track_layer_relmse). NOT a
         # scalar loss — the caller reads it to update the adaptive-weight EMA.
         "layer_relmse": layer_relmse,
