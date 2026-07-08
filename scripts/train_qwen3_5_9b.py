@@ -266,13 +266,35 @@ def main() -> int:
     p.add_argument("--sync-indices", default=None,
                    help="Explicit comma-separated sync layer indices, bypassing the probe "
                         "(reproducibility / fixed-schedule A-B). Overrides --num-sync-boundaries.")
-    p.add_argument("--sync-phase", choices=["boundary", "post-attn"], default="boundary",
+    p.add_argument("--replica-copies", default=None,
+                   help="Sparse-copy CO-TRAINING (mixed replica design): a replica degradation "
+                        "spec without the 'replica:' prefix (e.g. 'wanda:0.65'). The TF chain "
+                        "becomes the DEPLOYED replica forward — every carry is the shadow "
+                        "estimate from frozen degraded copies of ALL tracks (lagged, refreshed "
+                        "every --replica-refresh steps), syncs correct drift, supervision taps "
+                        "unchanged. Requires --sync-phase post-attn + explicit --sync-indices; "
+                        "TF-only (--lambda-kl/--lambda-ce/--lambda-logit-mse must be 0 — the FR "
+                        "forward has no shadow support); the in-loop downstream eval scores the "
+                        "replica forward (deployed configuration).")
+    p.add_argument("--replica-refresh", type=int, default=200,
+                   help="Refresh the frozen replica copies from the live weights every N steps.")
+    p.add_argument("--replica-calib-batches", type=int, default=16,
+                   help="Data batches through the dense teacher (pre-FSDP) for the wanda "
+                        "input-norm calibration at startup.")
+    p.add_argument("--sync-phase", choices=["boundary", "post-attn", "window-parallel"],
+                   default="boundary",
                    help="Lever B — where the single per-block sync lands. 'boundary' (default) is "
                         "the legacy post-MLP sync. 'post-attn' phase-shifts it to the post-attention "
                         "point: the MLP reads the EXACT (real) Sigma_others Y while the next layer's "
                         "attention reads the partial residual — SAME sync count. Delivers real "
                         "cross-track content to the seam (no predictor). D=1 only; incompatible with "
-                        "--cross-head-estimator and --free-running-mse.")
+                        "--cross-head-estimator and --free-running-mse. 'window-parallel' (Gate 2, "
+                        "slices of a HEALED dense window-parallel model): per window all attns read "
+                        "the per-track entry state, ONE carried sync, all MLPs read it; TF loss = one "
+                        "tap per window vs the teacher's post-MLP boundary hidden (standard captures, "
+                        "no post-attn hooks). Requires explicit --sync-indices (window ENDS, final "
+                        "layer included); incompatible with --cross-head-estimator, "
+                        "--free-running-mse and --intra-window-mse.")
     p.add_argument("--sensitivity-probe-depth", type=int, default=2,
                    help="Reference uniform sync depth for the startup sensitivity probe (must "
                         "divide num_layers). A fine depth makes rel_err_partial a LOCAL per-layer "
@@ -744,6 +766,18 @@ def main() -> int:
     if args.selection_metric == "downstream" and args.downstream_eval_every <= 0:
         p.error("--selection-metric downstream requires --downstream-eval-every > 0 (the "
                 "downstream eval is what produces the selection metric).")
+    if args.replica_copies:
+        if args.sync_phase != "post-attn":
+            p.error("--replica-copies requires --sync-phase post-attn")
+        if args.lambda_kl != 0.0 or args.lambda_ce != 0.0 or args.lambda_logit_mse != 0.0:
+            p.error("--replica-copies is TF-only: set --lambda-kl 0 --lambda-ce 0 "
+                    "--lambda-logit-mse 0 (the FR forward has no shadow support)")
+        if args.free_running_mse:
+            p.error("--replica-copies is incompatible with --free-running-mse")
+        if ":mlp:" in args.replica_copies:
+            p.error("--replica-copies :mlp: sub-specs (attn-only replicas) are "
+                    "probe-only for now — the distill replica branch has no "
+                    "mlp:none shadow bookkeeping yet")
 
     # ----- Distributed init -----
     dist.init_process_group(backend="nccl")
@@ -883,9 +917,12 @@ def main() -> int:
     # final layer) capture the teacher's post-attention residual (X+Y); the rest keep
     # post-MLP (mid-window taps + the final layer). Requires an explicit --sync-indices.
     post_attn_layers = None
-    if args.sync_phase == "post-attn":
+    if args.sync_phase in ("post-attn", "window-parallel"):
         if not args.sync_indices:
-            raise SystemExit("[error] --sync-phase post-attn requires an explicit --sync-indices.")
+            raise SystemExit(
+                f"[error] --sync-phase {args.sync_phase} requires an explicit --sync-indices."
+            )
+    if args.sync_phase == "post-attn":
         _b = sorted({int(x) for x in args.sync_indices.split(",") if x.strip() != ""})
         post_attn_layers = set(_b) - {manifest.num_layers - 1}
     teacher = HookedTeacher(
@@ -898,6 +935,32 @@ def main() -> int:
         capture_post_attn=(args.sync_phase == "post-attn"),
         post_attn_layers=post_attn_layers,
     )
+    # ----- Sparse-copy co-training channel: wanda input-norm calibration on the
+    # DENSE teacher BEFORE the FSDP wrap (pre-hooks registered on wrapped
+    # submodules do not fire — the proven ordering). -----
+    replica_channel = None
+    if args.replica_copies:
+        from pt_converter.eval.intervention import PhasedMode, collect_input_norms
+
+        replica_channel = PhasedMode(f"replica:{args.replica_copies}")
+        _ctok = AutoTokenizer.from_pretrained(args.hf_model)
+        _ccfg = CalibrationDataConfig(
+            sources=preset_sources(args.data_preset), seq_len=args.seq_len, seed=args.seed,
+        )
+        _cbatches = []
+        for _b in DataLoader(PackedTokenStream(_ctok, _ccfg), batch_size=1, num_workers=0):
+            if _b["input_ids"].ndim == 1:
+                _b = {k: v.unsqueeze(0) for k, v in _b.items()}
+            _cbatches.append(_b)
+            if len(_cbatches) >= args.replica_calib_batches:
+                break
+        _cnorms = collect_input_norms(text_model, _cbatches, torch.cuda.current_device())
+        replica_channel.set_input_norms(_cnorms, manifest.n_tracks)
+        del _cbatches, _ctok
+        _log(rank, f"[init] replica co-training: copies=replica:{args.replica_copies}, "
+                   f"{len(_cnorms)} input spaces calibrated, refresh every "
+                   f"{args.replica_refresh} steps")
+
     # Lever B (post-attn): torch.compile on the teacher layers traces away the
     # forward-pre-hook on the post_attention_layernorm SUBMODULE (it fires for
     # full-attention layers but NOT compiled linear-attention layers), so the
@@ -1211,6 +1274,39 @@ def main() -> int:
             student.compile_seam_submodules(args.compile_mode)
         _log(rank, "[init] sync_phase=post-attn (lever B): single sync shifted to post-attention"
                    + (" + window_stale depth-fill" if args.cross_head_estimator == "window_stale" else ""))
+    elif args.sync_phase == "window-parallel":
+        # Gate 2: the slice of a healed dense window-parallel model. One carried
+        # sync per window; the final layer must end the schedule (the norm needs
+        # a synced hidden). Teacher captures stay standard post-MLP at the
+        # boundaries — no post-attn hooks, so teacher compile is unaffected.
+        if (manifest.num_layers - 1) not in set(chosen):
+            raise SystemExit(
+                "[error] --sync-phase window-parallel requires the final layer to be a "
+                f"sync boundary; got {chosen}."
+            )
+        if args.cross_head_estimator != "off":
+            raise SystemExit(
+                "[error] --sync-phase window-parallel is incompatible with "
+                "--cross-head-estimator (the window sync delivers the real content)."
+            )
+        if args.free_running_mse:
+            raise SystemExit(
+                "[error] --sync-phase window-parallel is incompatible with "
+                "--free-running-mse (its sync taps are post-attn R states, not "
+                "post-MLP boundary hiddens — the targets would be mismatched)."
+            )
+        if args.intra_window_mse:
+            raise SystemExit(
+                "[error] --sync-phase window-parallel is incompatible with "
+                "--intra-window-mse (supervision is one tap per window by design)."
+            )
+        student.set_sync_phase("window-parallel")
+        # Same seam-submodule path as post-attn: the forward calls layer
+        # submodules directly, bypassing layer.compile().
+        if args.compile:
+            student.compile_seam_submodules(args.compile_mode)
+        _log(rank, "[init] sync_phase=window-parallel (Gate 2): parallel window attns, "
+                   "one carried sync per window, MLPs on the synced state")
     # Communication budget held fixed for any mid-run re-placement (--resync-probe-every):
     # re-place the SAME number of boundaries on the current weights.
     num_boundaries = len(chosen)
@@ -1245,6 +1341,7 @@ def main() -> int:
             ("fresh", "fresh_yself", "temporal", "oracle_lowrank", "stale_corr") else 0.0
         ),
         sync_phase=args.sync_phase,
+        replica_channel=replica_channel,
         free_running_mse=args.free_running_mse,
         lambda_free_running=args.lambda_free_running,
         free_running_taps=args.free_running_taps,
@@ -1368,9 +1465,13 @@ def main() -> int:
         aggregate score is broadcast from rank 0 so the (collective) best/ save and
         early-stop decisions are taken identically on every rank.
         """
-        from pt_converter.eval.downstream import run_downstream_eval
+        from pt_converter.eval.downstream import make_replica_forward_fn, run_downstream_eval
 
         student.eval()
+        fwd = None
+        if replica_channel is not None:
+            replica_channel._shadow = None  # score copies of the CURRENT weights
+            fwd = make_replica_forward_fn(student, replica_channel)
         res = run_downstream_eval(
             student, tok,
             tasks=[t.strip() for t in args.downstream_tasks.split(",") if t.strip()],
@@ -1380,6 +1481,7 @@ def main() -> int:
             num_fewshot=args.downstream_num_fewshot,
             seed=args.seed,
             rank=rank,
+            forward_fn=fwd,
         )
         student.train()
         return res
@@ -1519,6 +1621,9 @@ def main() -> int:
         # schedule all count optimizer steps. G=1 ⇒ the legacy single-batch loop.
         G = max(1, args.grad_accum_steps)
         loss_scale = 1.0 / G
+        if (replica_channel is not None and args.replica_refresh > 0
+                and step % args.replica_refresh == 0):
+            replica_channel._shadow = None  # lagged copies: re-derive from live weights
         optim.zero_grad(set_to_none=True)
         loss_sums = {"total": 0.0, "block_mse": 0.0, "kl": 0.0, "ce": 0.0,
                      "logit_mse": 0.0, "fr_mse": 0.0, "cross_head_predict": 0.0}

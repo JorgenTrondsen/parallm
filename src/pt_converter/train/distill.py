@@ -592,7 +592,29 @@ class DistillConfig:
     # the teacher's post-attention residual (X+Y) for layers 0..L-2 and the post-MLP
     # hidden for the last layer (which keeps a boundary sync). D=1 only; mutually
     # exclusive with a cross_head seam and with free_running_mse.
+    # "window-parallel" (Gate 2, slices of a healed dense window-parallel model):
+    # per window all attns read the per-track window-entry state, ONE carried sync
+    # delivers the fully-summed post-attn state, all MLPs read it; TF supervision
+    # is one tap per window (the loss-only fully-synced post-window reconstruction
+    # vs the teacher's post-MLP hidden at the window end — no post-attn teacher
+    # captures needed). Mutually exclusive with cross_head, free_running_mse and
+    # intra_window_mse.
     sync_phase: str = "boundary"
+    # Sparse-copy CO-TRAINING (mixed replica design; requires sync_phase
+    # "post-attn"): a ``PhasedMode`` replica channel (eval/intervention.py) whose
+    # frozen degraded copies drive the DEPLOYED replica forward as the TF chain —
+    # every carry is the shadow estimate (reset at each boundary sync), the true
+    # residual accumulates via sync_module and is supervised at the same taps as
+    # the plain phased branch. The shadow is constant within a segment (no_grad):
+    # gradients flow weight-ward only, and compounding adaptation happens across
+    # segments via student forcing. The train script refreshes the copies from
+    # live weights by clearing ``channel._shadow`` every --replica-refresh steps.
+    # Incompatible with output objectives (λ_kl/λ_ce/λ_logit_mse — the FR forward
+    # has no shadow support) and with cross_head / free_running_mse.
+    replica_channel: "object | None" = None
+    # Debug/test tap capture for the replica branch: {layer_idx: true base at the
+    # supervised tap}. None = off.
+    replica_taps: "dict | None" = None
     # Free-running feature matching: relative-MSE the END-TO-END student forward's
     # synced hiddens (the same full forward the KL/CE pass uses — the student runs
     # on its OWN hiddens throughout) against the teacher hiddens at the sync
@@ -967,7 +989,9 @@ def distill_step(
     # read the teacher's post-block hidden state at the previous sync index.
     prev_h = inputs_embeds.detach()
     with _phase("block_loop", timings, mem):
-        for start, end in (ranges if cfg.sync_phase != "post-attn" else ()):
+        for start, end in (
+            ranges if cfg.sync_phase not in ("post-attn", "window-parallel") else ()
+        ):
             win_predict = torch.zeros((), device=input_ids.device)
             if cfg.intra_window_mse:
                 # Per-layer supervision: run the window track-locally and at EACH
@@ -1087,7 +1111,114 @@ def distill_step(
             use_student = forcing_rng.random() < student_forcing_prob
             prev_h = h_synced.detach() if use_student else t_end
 
-        if cfg.sync_phase == "post-attn":
+        if cfg.sync_phase == "post-attn" and cfg.replica_channel is not None:
+            # Sparse-copy CO-TRAINING: the DEPLOYED replica forward
+            # (phased_intervention_forward semantics, the rail-validated
+            # bookkeeping) as the TF chain. Deployed semantics: every per-track
+            # carry is the SHADOW estimate (frozen degraded copies of ALL tracks
+            # advanced from the last synced state, reset to the true residual at
+            # each boundary); per-track exact outputs enter only the TRUE
+            # residual accumulation (sync_module) and the supervision taps
+            # (post-attn at boundaries, post-MLP at non-boundary/last — same
+            # targets as the plain phased branch, fair A/B). Under sf=1.0 the
+            # chain reproduces the deployed replica forward exactly (the rail).
+            from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+            ch_rep = cfg.replica_channel
+            shadow_layers = ch_rep.ensure_shadow(student)
+            L = num_layers
+            last = L - 1
+            sync_attn_set = set(cfg.sync_layer_indices) - {last}
+            K = len(student.text_models)
+            base = inputs_embeds.detach()
+            shadow_base = inputs_embeds.detach()
+            per_track_h = [inputs_embeds.detach() for _ in student.text_models]
+            seg_loss = torch.zeros((), device=input_ids.device)
+            seg_count = 0
+
+            def _flush_rep(sl, sc):
+                if sc > 0 and cfg.lambda_block != 0.0 and sl.requires_grad:
+                    (cfg.lambda_block * (sl / sc) * loss_scale).backward()
+
+            for i in range(L):
+                layer_mask = (
+                    linear_attn_mask
+                    if student.text_models[0].config.layer_types[i] == "linear_attention"
+                    else causal_mask
+                )
+                # Exact per-track attention on the carried (shadow) state; the
+                # true residual advances by the summed attention deltas.
+                attn_states = []
+                for k, tm in enumerate(student.text_models):
+                    ha, _y, _h_ln = seam_token_mixer(
+                        tm.layers[i], per_track_h[k], position_embeddings,
+                        layer_mask, text_position_ids,
+                    )
+                    attn_states.append(base + (ha - per_track_h[k]))
+                base = student.sync_module(attn_states, base)
+                with torch.no_grad():  # shadow attn step (constant within segment)
+                    sh_attn = [
+                        seam_token_mixer(
+                            shadow_layers[k][i], shadow_base, position_embeddings,
+                            layer_mask, text_position_ids,
+                        )[0]
+                        for k in range(K)
+                    ]
+                    shadow_base = student.sync_module(sh_attn, shadow_base)
+                if i in sync_attn_set:
+                    # Boundary: post-attn tap on the true residual, segment flush,
+                    # student-forced carry, then the boundary MLP (exact from
+                    # ``chosen``; shadow resets to ``chosen`` and advances).
+                    t_l = teacher_hiddens.pop(i).detach()
+                    tap_loss, tap_rel = tap_loss_and_relmse(base, t_l)
+                    seg_loss = seg_loss + eff_w[i] * tap_loss
+                    seg_count += 1
+                    block_loss_val = block_loss_val + (eff_w[i] * tap_loss).detach()
+                    if tap_rel is not None:
+                        layer_relmse[i] = tap_rel
+                    if cfg.replica_taps is not None:
+                        cfg.replica_taps[i] = base.detach().clone()
+                    _flush_rep(seg_loss, seg_count)
+                    seg_loss = torch.zeros((), device=input_ids.device)
+                    seg_count = 0
+                    use_student = forcing_rng.random() < student_forcing_prob
+                    chosen = base.detach() if use_student else t_l
+                    new_states = [seam_mlp(tm.layers[i], chosen, None)
+                                  for tm in student.text_models]
+                    base = student.sync_module(new_states, chosen)
+                    with torch.no_grad():
+                        sh_mlp = [seam_mlp(shadow_layers[k][i], chosen, None)
+                                  for k in range(K)]
+                        shadow_base = student.sync_module(sh_mlp, chosen)
+                else:
+                    # Non-boundary (or final) layer: the exact MLPs read the
+                    # SUBSTITUTED post-attn shadow state; only their deltas enter
+                    # the true residual. Post-MLP tap when supervised.
+                    mlp_in = shadow_base
+                    new_states = [
+                        base + (seam_mlp(tm.layers[i], mlp_in, None) - mlp_in)
+                        for tm in student.text_models
+                    ]
+                    base = student.sync_module(new_states, base)
+                    with torch.no_grad():
+                        sh_prev = shadow_base
+                        sh_mlp = [seam_mlp(shadow_layers[k][i], sh_prev, None)
+                                  for k in range(K)]
+                        shadow_base = student.sync_module(sh_mlp, sh_prev)
+                    if cfg.intra_window_mse or i == last:
+                        t_l = teacher_hiddens.pop(i).detach()
+                        tap_loss, tap_rel = tap_loss_and_relmse(base, t_l)
+                        seg_loss = seg_loss + eff_w[i] * tap_loss
+                        seg_count += 1
+                        block_loss_val = block_loss_val + (eff_w[i] * tap_loss).detach()
+                        if tap_rel is not None:
+                            layer_relmse[i] = tap_rel
+                        if cfg.replica_taps is not None:
+                            cfg.replica_taps[i] = base.detach().clone()
+                    if i == last:
+                        _flush_rep(seg_loss, seg_count)
+                per_track_h = [shadow_base for _ in student.text_models]
+
+        elif cfg.sync_phase == "post-attn":
             # Lever B (D=1 and D>1): the single per-WINDOW sync is phase-shifted to
             # POST-ATTENTION. Sync after attention at each boundary except the final
             # layer (delivering the real Σ_others Y to that layer's MLP, which is then
@@ -1181,6 +1312,107 @@ def distill_step(
                     _flush(seg_loss, seg_count)
                 else:
                     block_input = new_h  # carry partial
+
+        elif cfg.sync_phase == "window-parallel":
+            # Gate 2: teacher-forced per-WINDOW loop of the window-parallel slice
+            # function (see PTWrappedModel._run_window_parallel_stack). Per
+            # non-final window: all attns read the per-track entry state, ONE
+            # carried sync (R), all MLPs read R; ONE supervised tap per window —
+            # the loss-only fully-synced post-window reconstruction (R + Σ_k Σ m)
+            # vs the teacher's post-MLP hidden at the window end. Backward per
+            # window, entries detached, so memory holds one window's graph.
+            #
+            # Teacher forcing keeps the DEPLOYED seam in-distribution: the next
+            # window's per-track entry is ``chosen + (carry_k − h_synced).detach()``
+            # (= chosen − Σ_{j≠k} m_j) and the carried base is
+            # ``chosen − (h_synced − R).detach()`` — under student forcing both
+            # reduce EXACTLY to the deployed forward's carry/base, so the sf-1.0
+            # chain reproduces the full window-parallel forward bit-for-bit.
+            from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+            last = num_layers - 1
+            bounds = sorted(set(cfg.sync_layer_indices))
+            if not bounds or bounds[-1] != last:
+                raise ValueError(
+                    f"window-parallel needs the final layer in the sync schedule, got {bounds}"
+                )
+            windows: list[list[int]] = []
+            prev_b = -1
+            for b in bounds:
+                windows.append(list(range(prev_b + 1, b + 1)))
+                prev_b = b
+            K = len(student.text_models)
+
+            def _wp_mask(i: int):
+                return (
+                    linear_attn_mask
+                    if tm0.config.layer_types[i] == "linear_attention"
+                    else causal_mask
+                )
+
+            block_start = inputs_embeds.detach()
+            per_track_h = [block_start for _ in range(K)]
+            for window in windows:
+                e = window[-1]
+                if e == last:
+                    # Final window: per-track serial (partial) layers, ONE
+                    # post-MLP sync — the deployed final-window convention.
+                    new_h = per_track_h
+                    for i in window:
+                        layer_mask = _wp_mask(i)
+                        new_h = [
+                            seam_mlp(
+                                tm.layers[i],
+                                seam_token_mixer(
+                                    tm.layers[i], new_h[k], position_embeddings,
+                                    layer_mask, text_position_ids,
+                                )[0],
+                                None,
+                            )
+                            for k, tm in enumerate(student.text_models)
+                        ]
+                    h_synced = student.sync_module(new_h, block_start)
+                    carry = new_h
+                    R = None
+                else:
+                    h_attn: list[torch.Tensor] = []
+                    for k, tm in enumerate(student.text_models):
+                        acc = per_track_h[k]
+                        for i in window:
+                            acc = acc + seam_token_mixer(
+                                tm.layers[i], per_track_h[k], position_embeddings,
+                                _wp_mask(i), text_position_ids,
+                            )[1]
+                        h_attn.append(acc)
+                    R = student.sync_module(h_attn, block_start)
+                    carry = []
+                    for k, tm in enumerate(student.text_models):
+                        acc = R
+                        for i in window:
+                            acc = acc + (seam_mlp(tm.layers[i], R, None) - R)
+                        carry.append(acc)
+                    # Loss-only tap: the fully-synced post-window state. Training-
+                    # only all-reduce (deployment syncs once per window, at R).
+                    h_synced = student.sync_module(carry, R)
+                t_e = teacher_hiddens.pop(e).detach()
+                tap_loss, tap_rel = tap_loss_and_relmse(h_synced, t_e)
+                win_loss = eff_w[e] * tap_loss
+                if cfg.lambda_block != 0.0 and win_loss.requires_grad:
+                    (cfg.lambda_block * win_loss * loss_scale).backward()
+                block_loss_val = block_loss_val + win_loss.detach()
+                if tap_rel is not None:
+                    layer_relmse[e] = tap_rel
+                if e == last:
+                    break
+                use_student = forcing_rng.random() < student_forcing_prob
+                if use_student:
+                    # Exact deployed carry/base — the sf-1.0 chain IS the
+                    # deployed window-parallel forward, bit-for-bit.
+                    per_track_h = [c.detach() for c in carry]
+                    block_start = R.detach()
+                else:
+                    h_det = h_synced.detach()
+                    per_track_h = [t_e + (carry[k].detach() - h_det) for k in range(K)]
+                    block_start = t_e - (h_det - R.detach())
 
     # ----- Final-logit KL + LM CE (full student forward, chunked lm_head) -----
     # All ranks call the full forward so cross-track SyncBoundary all-reduces

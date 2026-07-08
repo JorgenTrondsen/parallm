@@ -141,10 +141,18 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0,
                    help="lm-eval random/numpy/torch seed. Identical on every rank so request "
                         "ordering and fewshot sampling line up across ranks.")
-    p.add_argument("--sync-phase", choices=["boundary", "post-attn"], default="boundary",
+    p.add_argument("--sync-phase", choices=["boundary", "post-attn", "window-parallel"],
+                   default="boundary",
                    help="Lever B: evaluate a post-attn-trained checkpoint in its DEPLOYED regime "
-                        "(the single per-block sync after attention). MUST match how the checkpoint "
-                        "was trained, else the weights run in the wrong regime. Default 'boundary'.")
+                        "(the single per-block sync after attention). 'window-parallel' (Gate 2): "
+                        "all window attns on the window-entry state, one post-attn sync per window, "
+                        "all window MLPs on the synced state — for slices of a HEALED dense "
+                        "window-parallel model. MUST match how the checkpoint was trained, else "
+                        "the weights run in the wrong regime. Default 'boundary'.")
+    p.add_argument("--sync-indices", default=None,
+                   help="Override the manifest sync schedule (comma-separated layer indices; "
+                        "window ENDS for window-parallel). Required when the checkpoint is a raw "
+                        "convert output, which carries no schedule.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -158,13 +166,16 @@ def main() -> int:
 
     manifest = load_manifest(args.checkpoint_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
-    if manifest.sync_layer_indices is None:
+    if args.sync_indices is not None:
+        sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
+    elif manifest.sync_layer_indices is not None:
+        sync_layers = list(manifest.sync_layer_indices)
+    else:
         raise SystemExit(
             "[error] checkpoint manifest has no sync_layer_indices — point "
             "--checkpoint-dir at a trained checkpoint (the schedule is placed at "
-            "train time, so a raw convert output carries none)."
+            "train time, so a raw convert output carries none), or pass --sync-indices."
         )
-    sync_layers = list(manifest.sync_layer_indices)
     _log(
         rank,
         f"[init] target={args.target} world={layout.world_size} "
@@ -182,9 +193,13 @@ def main() -> int:
 
     if want_student:
         cfg = AutoConfig.from_pretrained(args.hf_model)
+        # The original snapshot wraps the text config (`cfg.text_config`); a
+        # dense checkpoint saved from the text-only causal model (e.g. a healed
+        # best/) IS the text config already.
+        text_cfg = cfg.text_config if hasattr(cfg, "text_config") else cfg
         _log(rank, f"[init] building PT student for tracks {layout.local_track_ids}…")
         student = PTWrappedModel(
-            text_config=cfg.text_config,
+            text_config=text_cfg,
             n_tracks=manifest.n_tracks,
             local_track_ids=layout.local_track_ids,
             sync_after_layers=sync_layers,

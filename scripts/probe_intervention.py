@@ -41,12 +41,15 @@ from pt_converter.eval.intervention import (
     CalibratedFixedLowRankChannel,
     MaskedOracleChannel,
     PhasedMode,
+    collect_input_covs,
+    collect_input_norms,
     intervention_forward,
     parse_channel,
     phased_intervention_forward,
     seam_intervention_forward,
     seam_predictability_analysis,
 )
+from pt_converter.eval.refine import RefineSpec, refine_forward, refine_intervention_forward
 from pt_converter.train.distill import _block_ranges
 from pt_converter.model.pt_model import PTWrappedModel
 from pt_converter.train.data import (
@@ -230,8 +233,35 @@ def main() -> int:
                         "last, non-boundary layers fully partial) and interprets --channels as phased "
                         "modes: zero (deployed floor), oracle (perfect-delivery ceiling), kv (write-side "
                         "memory-correction gate: k/v + gated-delta write gate/decay from the exact full "
-                        "residual), q (read-side complement, diagnostic). Use on a post-attn-trained "
-                        "checkpoint. Default 'boundary' = the whole-layer/--seam harnesses.")
+                        "residual), q (read-side complement, diagnostic), and replica:{exact|int8|int4|"
+                        "svd:<r>|prune:<frac>} (degraded LOCAL-RECOMPUTATION estimator: shadow replay of "
+                        "all tracks from the last synced residual with degraded weight copies; "
+                        "prune:<frac> = magnitude-sparse copies, the precision-orthogonal cheapness that "
+                        "composes with an already-quantized base; replica:exact must "
+                        "reproduce oracle — the rail). Use on a post-attn-trained "
+                        "checkpoint (or the untrained slice for de-confounded replica gates). "
+                        "Default 'boundary' = the whole-layer/--seam harnesses.")
+    p.add_argument("--refine-iters", default=None,
+                   help="Comma-separated refinement pass counts x (e.g. '0,1,2'). Activates the "
+                        "Jacobi/iterative-refinement harness (eval/refine.py) and REPLACES "
+                        "--channels: pass 0 runs the full stack comm-free per track, then x "
+                        "refinement passes each fed by ONE bulk all-layer exchange. Sync events "
+                        "per token = x+1 (+ any --refine-base-syncs).")
+    p.add_argument("--refine-carry", default="own-fresh",
+                   help="Comma-separated carry rules for the refinement passes: 'own-fresh' (each "
+                        "track keeps its own residual fresh and fills with others' previous-pass "
+                        "content) and/or 'shared' (every sublayer computes on the previous pass's "
+                        "reconstructed trunk). Cross-product with --refine-iters.")
+    p.add_argument("--refine-base-syncs", default=None,
+                   help="Optional comma-separated layer indices given REAL boundary syncs during "
+                        "pass 0 (the hybrid arm; +1 event each; the last layer is subsumed by the "
+                        "final combine).")
+    p.add_argument("--refine-exactness-check", action="store_true",
+                   help="One-batch correctness rail instead of the eval loop: relMSE between the "
+                        "refine hidden at each requested --refine-iters and the phased-oracle "
+                        "hidden (perfect per-sublayer delivery == dense on a fresh slice). Run "
+                        "with --refine-iters 63 (=2L-1, where the forward is provably exact) to "
+                        "validate the NCCL path + bf16 drift before spending eval hours.")
     # Data (mirrors eval_fidelity.py: held-out front of the training mixture by default).
     p.add_argument("--data-preset", default=DEFAULT_PRESET, choices=preset_names())
     p.add_argument("--data-source", action="append", default=None, metavar="NAME[:CONFIG[:KEY[:WEIGHT]]]")
@@ -252,6 +282,9 @@ def main() -> int:
     p.add_argument("--fixed-calib-batches", type=int, default=32,
                    help="For calib-fixed-lowrank channels: data batches used to PCA-fit the "
                         "frozen basis (a collect pass on the D=2 trajectory) before scoring.")
+    p.add_argument("--wanda-calib-batches", type=int, default=16,
+                   help="For replica:wanda channels: batches run through the DENSE model to "
+                        "collect per-input-channel L2 norms (the |w|*||x|| pruning criterion).")
     p.add_argument("--seam-analyze", action="store_true",
                    help="Training-free predictability decomposition of the missing ΣY at the D=1 seam "
                         "(NOT the channel/KL/downstream loop): per-layer ceilings for stale/avg/h_ln "
@@ -282,6 +315,9 @@ def main() -> int:
         sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
     elif manifest.sync_layer_indices is not None:
         sync_layers = list(manifest.sync_layer_indices)
+    elif args.refine_iters is not None:
+        # Refinement has no boundary schedule; the wrapper just needs a valid one.
+        sync_layers = [manifest.num_layers - 1]
     else:
         raise SystemExit(
             "[error] checkpoint manifest has no sync_layer_indices. Pass --sync-indices, or point "
@@ -292,8 +328,25 @@ def main() -> int:
             "[error] --sync-phase post-attn is its own harness (phased modes zero/oracle/kv/q) "
             "and is incompatible with --seam / --oracle-sweep / --seam-analyze."
         )
+    if args.refine_iters is not None and (
+        args.seam or args.oracle_sweep or args.seam_analyze or args.sync_phase == "post-attn"
+    ):
+        raise SystemExit(
+            "[error] --refine-iters is its own harness (Jacobi iterative refinement) and is "
+            "incompatible with --seam / --oracle-sweep / --seam-analyze / --sync-phase post-attn."
+        )
+    if args.refine_exactness_check and args.refine_iters is None:
+        raise SystemExit("[error] --refine-exactness-check requires --refine-iters.")
     if args.seam_analyze:
         channels = []  # analyze mode bypasses the channel/KL/downstream loop
+    elif args.refine_iters is not None:
+        iters_list = [int(x) for x in args.refine_iters.split(",") if x.strip() != ""]
+        carries = [c.strip() for c in args.refine_carry.split(",") if c.strip()]
+        base_syncs = (
+            tuple(int(x) for x in args.refine_base_syncs.split(",") if x.strip() != "")
+            if args.refine_base_syncs else None
+        )
+        channels = [RefineSpec(x, c, base_syncs) for c in carries for x in iters_list]
     elif args.sync_phase == "post-attn":
         channels = [PhasedMode(s.strip()) for s in args.channels.split(",") if s.strip()]
     elif args.oracle_sweep:
@@ -316,7 +369,7 @@ def main() -> int:
         channels = [parse_channel(s) for s in args.channels.split(",") if s.strip()]
     run_kl = args.num_batches > 0 and not args.seam_analyze
     run_ds = bool(args.downstream_tasks.strip()) and not args.seam_analyze
-    if not run_kl and not run_ds and not args.seam_analyze:
+    if not run_kl and not run_ds and not args.seam_analyze and not args.refine_exactness_check:
         raise SystemExit(
             "[error] nothing to do: set --num-batches > 0 (KL vs teacher) and/or --downstream-tasks, "
             "or --seam-analyze. Downstream-only (--num-batches 0) skips the teacher entirely."
@@ -409,6 +462,75 @@ def main() -> int:
     if need_calib:
         _log(rank, f"[data] materialized {len(calib_batches)} calibration batches (seq_len={args.seq_len})")
 
+    # ----- Wanda/SparseGPT calibration: one dense-model pass collecting per-input-
+    # channel L2 norms (wanda/qwanda/chanwanda) and/or input covariances H = XᵀX
+    # (sparsegpt), then freed (each rank computes identical stats from the
+    # identical seed-deterministic batches). -----
+    def _needs_norms(ch) -> bool:
+        # A wanda/lsparse-family base spec, or such a :mlp: sub-spec on any base.
+        sub = getattr(ch, "mlp_mode", None)
+        return (getattr(ch, "wanda", False) or getattr(ch, "chanwanda", False)
+                or getattr(ch, "lsparse", False)
+                or getattr(ch, "shared_lsparse", False)
+                or getattr(sub, "wanda", False) or getattr(sub, "lsparse", False))
+
+    need_norms = any(_needs_norms(ch) for ch in channels)
+    need_covs = any(getattr(ch, "sparsegpt", False) for ch in channels)
+    if need_norms or need_covs:
+        wbatches = _materialize(args.wanda_calib_batches)
+        _log(rank, f"[data] materialized {len(wbatches)} calibration batches "
+                   f"(seq_len={args.seq_len})")
+        _log(rank, "[init] loading dense model for copy calibration…")
+        calib_model = AutoModelForCausalLM.from_pretrained(
+            args.hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True
+        ).eval()
+        c_text = (
+            calib_model.model.language_model
+            if hasattr(calib_model.model, "language_model")
+            else calib_model.model
+        )
+        calib_model = calib_model.to(device)
+        if need_norms:
+            norms = collect_input_norms(c_text, wbatches, device)
+            for ch in channels:
+                if _needs_norms(ch):
+                    ch.set_input_norms(norms, manifest.n_tracks)
+            _log(rank, f"[init] wanda calibration done ({len(norms)} input spaces).")
+            for ch in channels:
+                if getattr(ch, "shared_lsparse", False):
+                    from pt_converter.eval.intervention import compute_shared_lsparse_slices
+
+                    _log(rank, f"[init] {ch.name}: dense-level shared-L decomposition…")
+                    ch.set_shared_slices(compute_shared_lsparse_slices(
+                        c_text, student, ch.lsparse_rank, ch.wanda_frac, norms,
+                        quant_bits=ch.pre_quant_bits,
+                    ))
+                    _log(rank, f"[init] {ch.name}: shared slices ready.")
+        if need_covs:
+            covs = collect_input_covs(
+                c_text, wbatches, device,
+                slice_keys={"self_attn.o_proj": manifest.n_tracks,
+                            "linear_attn.out_proj": manifest.n_tracks,
+                            "mlp.down_proj": manifest.n_tracks},
+            )
+            for ch in channels:
+                if getattr(ch, "sparsegpt", False):
+                    ch.set_input_covs(covs, manifest.n_tracks)
+            _log(rank, f"[init] sparsegpt covariance calibration done ({len(covs)} input spaces).")
+        del calib_model, c_text
+        torch.cuda.empty_cache()
+        for ch in channels:
+            if getattr(ch, "profiled", False):
+                from pt_converter.eval.intervention import allocate_layer_fracs
+
+                fracs = allocate_layer_fracs(
+                    student, ch, sync_layers, ch.wanda_frac,
+                    group=layout.track_group if dist.get_world_size() > 1 else None,
+                )
+                ch.set_layer_fracs(fracs)
+                _log(rank, f"[init] {ch.name} layer fracs: "
+                           + ",".join(f"{f:.2f}" for f in fracs))
+
     sync_indices = tuple(sync_layers)
 
     # ----- Training-free predictability decomposition (bypasses the channel loop). -----
@@ -430,7 +552,34 @@ def main() -> int:
         dist.destroy_process_group()
         return 0
 
-    if args.sync_phase == "post-attn":
+    # ----- Refine exactness rail (bypasses the channel/KL/downstream loop). -----
+    if args.refine_exactness_check:
+        xb = _materialize(1)[0]
+        ids = xb["input_ids"].to(device, non_blocking=True)
+        attn = xb.get("attention_mask")
+        attn = attn.to(device, non_blocking=True) if attn is not None else None
+        # Phased oracle = perfect per-sublayer delivery = the dense forward on a
+        # fresh slice (the validated rail) — the fixed point refine converges to.
+        ref = phased_intervention_forward(student, ids, attn, sync_indices, PhasedMode("oracle"))
+        ref_sq = ref.float().pow(2).sum()
+        for ch in channels:
+            out = refine_forward(
+                student, ids, attn,
+                iters=ch.iters, carry=ch.carry, base_sync_indices=ch.base_sync_indices,
+            )
+            rel = ((out.float() - ref.float()).pow(2).sum() / ref_sq).item()
+            _log(rank, f"[exactness] {ch.name}: relMSE vs phased-oracle(=dense on fresh slice) "
+                       f"= {rel:.3e}" + ("  [OK]" if rel < 1e-3 else "  [DRIFT]"))
+        dist.barrier()
+        dist.destroy_process_group()
+        return 0
+
+    if args.refine_iters is not None:
+        fwd = refine_intervention_forward
+        _log(rank, "[init] REFINE mode (--refine-iters): Jacobi iterative refinement — pass 0 "
+                   "comm-free, then x refinement passes each fed by one bulk all-layer exchange "
+                   "(sync events/token = x+1).")
+    elif args.sync_phase == "post-attn":
         fwd = phased_intervention_forward
         _log(rank, "[init] PHASED mode (--sync-phase post-attn): write-side memory-correction "
                    "gate (zero==deployed phased forward, oracle==perfect delivery).")

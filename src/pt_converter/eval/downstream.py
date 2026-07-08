@@ -113,6 +113,27 @@ def make_student_forward_fn(student):
     return _fn
 
 
+def make_replica_forward_fn(student, channel):
+    """``ForwardFn`` running the DEPLOYED sparse-copy replica forward
+    (``phased_intervention_forward`` with ``channel``'s frozen copies) — the
+    in-loop selection metric for replica co-training scores exactly the
+    deployed configuration. Same vocab-parallel logits contract as
+    ``make_student_forward_fn``."""
+    from pt_converter.eval.intervention import phased_intervention_forward
+
+    vp = getattr(student, "vocab_parallel", False) and student.vp_world_size > 1
+
+    def _fn(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> "torch.Tensor | None":
+        hidden = phased_intervention_forward(
+            student, input_ids, attention_mask,
+            list(student.sync_after_layers), channel,
+        )
+        logits = student.lm_head(hidden)
+        return gather_full_logits(student, logits) if vp else logits
+
+    return _fn
+
+
 def run_downstream_eval(
     student,
     tokenizer,
@@ -124,6 +145,7 @@ def run_downstream_eval(
     num_fewshot: "int | None",
     seed: int,
     rank: int,
+    forward_fn=None,
 ) -> dict:
     """Run a small lm-eval pass on the student; return a broadcast aggregate score.
 
@@ -144,7 +166,7 @@ def run_downstream_eval(
 
     device = torch.cuda.current_device()
     lm = PTLM(
-        forward_fn=make_student_forward_fn(student),
+        forward_fn=forward_fn if forward_fn is not None else make_student_forward_fn(student),
         tokenizer=tokenizer,
         max_length=max_length,
         batch_size=batch_size,

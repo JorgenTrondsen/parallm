@@ -541,6 +541,38 @@ def seam_intervention_forward(
 #                  strictly-past deployable form (~1/T of reads at MC lengths).
 #   * ``q``      — the read-side complement (q + z from ``ln_full``, write side
 #                  partial). NOT deploy-realizable; interprets the split.
+#   * ``replica:*`` — degraded LOCAL RECOMPUTATION (the last untested estimator
+#                  family): a shadow replay of ALL tracks' sublayers from the
+#                  last synced residual, with degraded weight copies, estimates
+#                  the full residual comm-free; every track's carry is
+#                  substituted with that estimate (oracle geometry, degraded
+#                  content). Well-posed because each between-sync trajectory is
+#                  a deterministic function of (synced residual, weights) — so
+#                  ``replica:exact`` (no degradation) ≡ ``oracle`` by
+#                  construction (the rail). ``replica:int8`` / ``replica:int4``
+#                  = fake-quantized copies (full-rank — REFUTED BY REQUIREMENT
+#                  2026-07-06: the base model may already ship quantized, so
+#                  precision headroom is not a usable cheapness axis; kept as
+#                  diagnostic anchors). ``replica:svd:<r>`` = rank-r factorized
+#                  copies (fixed-rank ceiling on raw weights). ``replica:prune:<f>``
+#                  = magnitude-sparse copies at fraction ``f`` zeroed —
+#                  STRUCTURAL cheapness, composes with a quantized base.
+#                  The shadow's per-sublayer all-reduce is a probe-only
+#                  distribution convenience — every input it reads is the
+#                  shared synced residual, so deployment computes it locally.
+#                  Optional ``:mlp:<sub|none>`` suffix splits the spec per
+#                  sublayer: the base governs token-mixer Linears, the sub-spec
+#                  the mlp.* Linears. ``:mlp:none`` = ATTN-ONLY replicas (the
+#                  <1GB memory point — MLP is 67.9% of block params): no MLP
+#                  copies exist, the shadow chain advances on attention deltas
+#                  only, and each track carries its OWN exact MLP deltas as a
+#                  per-track offset on the common shadow estimate (deployment
+#                  truth: a track always computes its own sublayers exactly),
+#                  reset at every post-attn boundary sync. The symmetric base
+#                  spec ``none`` (``replica:none:mlp:<sub>``) = MLP-ONLY
+#                  replicas: no attention copies (⇒ no shadow KV/GDN state at
+#                  all), shadow chain advances on MLP replica deltas only, and
+#                  the offsets carry each track's OWN exact attention deltas.
 # The exact full residual is the same telescoping running sum the whole-layer
 # harness uses (``_sum_track_deltas`` after each sublayer), so ``zero`` matches
 # the deployed forward up to fp summation order — the established anchor standard.
@@ -548,16 +580,846 @@ def seam_intervention_forward(
 _PHASED_MODES = ("zero", "oracle", "kv", "q")
 
 
+def fake_quant_weight(w: torch.Tensor, bits: int) -> torch.Tensor:
+    """Per-output-channel symmetric absmax fake-quantization (fp32 compute,
+    returned in ``w``'s dtype) — simulates an int-``bits`` weight copy."""
+    qmax = float(2 ** (bits - 1) - 1)
+    wf = w.float()
+    flat = wf.reshape(wf.shape[0], -1)
+    scale = (flat.abs().amax(dim=1) / qmax).clamp(min=1e-12)
+    q = torch.round(flat / scale[:, None]).clamp(-qmax - 1.0, qmax)
+    return (q * scale[:, None]).reshape_as(wf).to(w.dtype)
+
+
+def svd_truncate_weight(w: torch.Tensor, rank: int) -> torch.Tensor:
+    """Best rank-``rank`` approximation of a 2D weight (fp32 SVD, returned in
+    ``w``'s dtype) — simulates a factorized U·V copy."""
+    U, S, Vh = torch.linalg.svd(w.float(), full_matrices=False)
+    r = min(rank, S.numel())
+    return ((U[:, :r] * S[:r]) @ Vh[:r]).to(w.dtype)
+
+
+def prune_weight(w: torch.Tensor, frac: float) -> torch.Tensor:
+    """Unstructured magnitude pruning per output row: zero the ``frac``
+    smallest-|w| entries of each row — simulates a sparse weight copy.
+    Structural (precision-orthogonal) cheapness: composes with an
+    already-quantized base, unlike the int8/int4 arms."""
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"prune frac must be in (0, 1), got {frac}")
+    wf = w.float()
+    flat = wf.reshape(wf.shape[0], -1)
+    k = int(round(frac * flat.shape[1]))
+    if k > 0:
+        thresh = flat.abs().kthvalue(k, dim=1, keepdim=True).values
+        flat = flat * (flat.abs() > thresh)
+    return flat.reshape_as(wf).to(w.dtype)
+
+
+def wanda_prune_weight(w: torch.Tensor, frac: float, in_norms: torch.Tensor) -> torch.Tensor:
+    """Activation-aware (Wanda-style) pruning per output row: score each weight
+    ``|w_ij| * ||x_j||`` with calibration input norms and zero the ``frac``
+    lowest-scored entries per row. Survivors keep their EXACT values."""
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"wanda frac must be in (0, 1), got {frac}")
+    if in_norms.numel() != w.shape[-1]:
+        raise ValueError(f"in_norms has {in_norms.numel()} entries for in_features {w.shape[-1]}")
+    wf = w.float()
+    score = wf.abs() * in_norms.to(device=wf.device, dtype=torch.float32)[None, :]
+    k = int(round(frac * score.shape[1]))
+    if k > 0:
+        thresh = score.kthvalue(k, dim=1, keepdim=True).values
+        wf = wf * (score > thresh)
+    return wf.to(w.dtype)
+
+
+def lsparse_decompose_weight(w: torch.Tensor, rank: int, frac: float,
+                             in_norms: torch.Tensor, iters: int = 3,
+                             quant_bits: "int | None" = None) -> torch.Tensor:
+    """OATS-style low-rank + sparse copy: on the activation-scaled matrix
+    ``W·diag(‖x‖)``, alternate a truncated rank-``rank`` SVD (L, the correlated
+    bulk) with a per-row prune keeping the ``1−frac`` largest residual entries
+    (S, the outliers; survivors exact). Returns ``L + S`` unscaled, in ``w``'s
+    dtype. The bet vs plain wanda: pure-L failed (svd:256 = 38%) and pure-S has
+    its knee at 0.55 — L+S wins only if those failures are complementary weight
+    populations. ``quant_bits`` mirrors qwanda: the base weights are quantized
+    FIRST (an already-int4 base) and the stored S values re-quantized after;
+    the small L factors stay high-precision."""
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"lsparse frac must be in (0, 1), got {frac}")
+    if rank < 1:
+        raise ValueError(f"lsparse rank must be >= 1, got {rank}")
+    if in_norms.numel() != w.shape[-1]:
+        raise ValueError(f"in_norms has {in_norms.numel()} entries for in_features {w.shape[-1]}")
+    if quant_bits is not None:
+        w = fake_quant_weight(w, quant_bits)
+    scale = in_norms.to(device=w.device, dtype=torch.float32).clamp(min=1e-12)
+    ws = w.float() * scale[None, :]
+    s = torch.zeros_like(ws)
+    k = int(round(frac * ws.shape[-1]))
+    r = min(rank, min(ws.shape))
+    # Randomized SVD for big matrices where only the top-r is needed (dense-level
+    # shared-L path); exact SVD otherwise. Seeded so every rank derives the same
+    # decomposition (deployment computes it once).
+    use_randomized = min(ws.shape) >= 1024 and 4 * r <= min(ws.shape)
+    for _ in range(iters):
+        if use_randomized:
+            U, sv, V = torch.svd_lowrank(ws - s, q=min(r + 32, min(ws.shape)), niter=2)
+            low = (U[:, :r] * sv[:r]) @ V[:, :r].T
+        else:
+            U, sv, Vh = torch.linalg.svd(ws - s, full_matrices=False)
+            low = (U[:, :r] * sv[:r]) @ Vh[:r]
+        resid = ws - low
+        if k > 0:
+            thresh = resid.abs().kthvalue(k, dim=-1, keepdim=True).values
+            s = resid * (resid.abs() > thresh)
+        else:
+            s = resid
+    low_w = low / scale[None, :]
+    s_w = s / scale[None, :]
+    if quant_bits is not None:
+        s_w = fake_quant_weight(s_w, quant_bits).float()
+    return (low_w + s_w).to(w.dtype)
+
+
+def block_wanda_prune_weight(w: torch.Tensor, frac: float, in_norms: torch.Tensor,
+                             block_size: int) -> torch.Tensor:
+    """Wanda pruning at BLOCK granularity: score blocks of ``block_size``
+    consecutive input weights per output row by their summed ``|w|·‖x‖`` and
+    zero the ``frac`` lowest-scoring blocks. Index cost drops from ~1 bit/weight
+    (unstructured bitmap) to ~1/block_size — the cheap-index variant."""
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"blockwanda frac must be in (0, 1), got {frac}")
+    d = w.shape[-1]
+    if d % block_size != 0:
+        raise ValueError(f"in_features {d} not divisible by block_size {block_size}")
+    if in_norms.numel() != d:
+        raise ValueError(f"in_norms has {in_norms.numel()} entries for in_features {d}")
+    wf = w.float()
+    scored = (wf.abs() * in_norms.to(device=wf.device, dtype=torch.float32)[None, :])
+    blocks = scored.reshape(wf.shape[0], d // block_size, block_size).sum(-1)
+    k = int(round(frac * blocks.shape[1]))
+    if k > 0:
+        thresh = blocks.kthvalue(k, dim=1, keepdim=True).values
+        keep = (blocks > thresh).unsqueeze(-1).expand(-1, -1, block_size)
+        wf = wf * keep.reshape(wf.shape[0], d)
+    return wf.to(w.dtype)
+
+
+def wanda24_prune_weight(w: torch.Tensor, in_norms: torch.Tensor) -> torch.Tensor:
+    """2:4 semi-structured wanda: in every group of 4 consecutive input weights
+    keep the top-2 by ``|w|·‖x‖`` (fixed 50% sparsity). The NVIDIA-real sparse
+    format — same memory as unstructured 0.5 but hardware 2× GEMMs."""
+    d = w.shape[-1]
+    if d % 4 != 0:
+        raise ValueError(f"in_features {d} not divisible by 4")
+    if in_norms.numel() != d:
+        raise ValueError(f"in_norms has {in_norms.numel()} entries for in_features {d}")
+    wf = w.float()
+    score = (wf.abs() * in_norms.to(device=wf.device, dtype=torch.float32)[None, :])
+    groups = score.reshape(wf.shape[0], d // 4, 4)
+    keep_idx = groups.topk(2, dim=-1).indices
+    mask = torch.zeros_like(groups, dtype=torch.bool).scatter_(-1, keep_idx, True)
+    return (wf * mask.reshape(wf.shape[0], d)).to(w.dtype)
+
+
+def allocate_layer_fracs(student, channel, sync_indices, avg_frac: float,
+                         *, alpha: float = 0.5, clip: "tuple[float, float]" = (0.35, 0.85),
+                         group=None) -> "list[float]":
+    """Non-uniform per-LAYER sparsity budget at a constant parameter-weighted
+    average. Importance of layer i = the wanda mass that uniform ``avg_frac``
+    pruning would discard there (the criterion's own estimate of functional
+    error) × the remaining depth of i's sync window (early-window copy errors
+    compound through more layers before the next boundary resets the drift).
+    Keep fractions ∝ importance^alpha, clipped, then rescaled so
+    Σ params·(1−frac) matches the uniform budget. Aggregated across ranks'
+    local tracks via all-reduce when ``group`` is given."""
+    L = len(student.text_models[0].layers)
+    last = L - 1
+    bounds = sorted(set(int(i) for i in sync_indices) | {last})
+    depth_w = torch.zeros(L, dtype=torch.float64)
+    prev = -1
+    for b in bounds:
+        for i in range(prev + 1, b + 1):
+            depth_w[i] = b - i + 1
+        prev = b
+    pruned_mass = torch.zeros(L, dtype=torch.float64)
+    params = torch.zeros(L, dtype=torch.float64)
+    for tm in student.text_models:
+        track_id = tm.pt_cfg.track_id
+        for li, layer in enumerate(tm.layers):
+            for rel, mod in layer.named_modules():
+                if not isinstance(mod, torch.nn.Linear):
+                    continue
+                w = mod.weight.data
+                norms = channel._norms_for(li, rel, w.shape[-1], track_id)
+                score = (w.float().abs()
+                         * norms.to(device=w.device, dtype=torch.float32)[None, :])
+                k = int(round(avg_frac * score.shape[1]))
+                if k > 0:
+                    kth = score.kthvalue(k, dim=1, keepdim=True).values
+                    pruned_mass[li] += float(score[score <= kth].pow(2).sum())
+                params[li] += w.numel()
+    if group is not None:
+        import torch.distributed as dist
+
+        stacked = torch.stack([pruned_mass, params]).cuda()
+        dist.all_reduce(stacked, group=group)
+        pruned_mass, params = stacked[0].cpu(), stacked[1].cpu()
+    imp = (pruned_mass * depth_w).clamp(min=1e-30)
+    keep = imp.pow(alpha)
+    # Rescale keep so the parameter-weighted keep budget matches uniform
+    # (Σ params·(1−frac) == (1−avg_frac)·Σ params), iterating because the
+    # clip perturbs the budget.
+    target_keep = (1.0 - avg_frac) * params.sum()
+    keep = keep * (target_keep / float((keep * params).sum()))
+    lo, hi = clip
+    frac = (1.0 - keep).clamp(lo, hi)
+    for _ in range(8):
+        budget = float((params * (1.0 - frac)).sum())
+        if abs(budget - float(target_keep)) / float(target_keep) < 1e-3:
+            break
+        keep = (1.0 - frac) * (float(target_keep) / budget)
+        frac = (1.0 - keep).clamp(lo, hi)
+    return [float(f) for f in frac]
+
+
+# One capture module per DISTINCT Linear input space in a dense decoder layer;
+# siblings (k/v ≡ q; z/b/a ≡ qkv; up ≡ gate) reuse it via _WANDA_KEY.
+_WANDA_CAPTURE = (
+    "self_attn.q_proj", "self_attn.o_proj",
+    "linear_attn.in_proj_qkv", "linear_attn.out_proj",
+    "mlp.gate_proj", "mlp.down_proj",
+)
+_WANDA_KEY = {
+    "self_attn.q_proj": "self_attn.q_proj",
+    "self_attn.k_proj": "self_attn.q_proj",
+    "self_attn.v_proj": "self_attn.q_proj",
+    "self_attn.o_proj": "self_attn.o_proj",
+    "linear_attn.in_proj_qkv": "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z": "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_b": "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_a": "linear_attn.in_proj_qkv",
+    "linear_attn.out_proj": "linear_attn.out_proj",
+    "mlp.gate_proj": "mlp.gate_proj",
+    "mlp.up_proj": "mlp.gate_proj",
+    "mlp.down_proj": "mlp.down_proj",
+}
+
+
+def sparsegpt_prune_weight(w: torch.Tensor, frac: float, H: torch.Tensor,
+                           damp_ratio: float = 0.01, block: int = 128) -> torch.Tensor:
+    """SparseGPT-style prune-and-RECONSTRUCT: prune per output row (block-wise,
+    scored ``w² / diag(H⁻¹)²``) and update the SURVIVORS via the calibration
+    input covariance ``H = XᵀX`` so the layer's functional output is preserved.
+    The compensation power comes from H's off-diagonals; with ``H = I`` this
+    reduces to block-wise magnitude pruning."""
+    if not (0.0 < frac < 1.0):
+        raise ValueError(f"sparsegpt frac must be in (0, 1), got {frac}")
+    d = w.shape[-1]
+    if H.shape != (d, d):
+        raise ValueError(f"H is {tuple(H.shape)} for in_features {d}")
+    W = w.float().clone()
+    Hf = H.to(device=W.device, dtype=torch.float32).clone()
+    dead = Hf.diagonal() == 0
+    Hf.diagonal()[dead] = 1.0
+    W[:, dead] = 0
+    Hf.diagonal().add_(damp_ratio * Hf.diagonal().mean())
+    # Upper-Cholesky of H⁻¹ (the SparseGPT recursion operates on this factor).
+    Hinv = torch.linalg.cholesky(
+        torch.cholesky_inverse(torch.linalg.cholesky(Hf)), upper=True
+    )
+    for start in range(0, d, block):
+        end = min(start + block, d)
+        Wb = W[:, start:end]
+        Hb = Hinv[start:end, start:end]
+        Eb = torch.zeros_like(Wb)
+        scores = Wb.pow(2) / Hb.diagonal().pow(2)[None, :]
+        k = int(round(frac * (end - start)))
+        if k > 0:
+            thresh = scores.kthvalue(k, dim=1, keepdim=True).values
+            pruned = scores <= thresh
+        else:
+            pruned = torch.zeros_like(Wb, dtype=torch.bool)
+        for j in range(end - start):
+            wj = Wb[:, j].clone()
+            ej = (wj * pruned[:, j]) / Hb[j, j]
+            Wb[:, j] = wj * ~pruned[:, j]
+            if j + 1 < end - start:
+                Wb[:, j + 1:] -= ej[:, None] * Hb[j, j + 1:][None, :]
+            Eb[:, j] = ej
+        if end < d:
+            W[:, end:] -= Eb @ Hinv[start:end, end:]
+    return W.to(w.dtype)
+
+
+def collect_input_covs(text_model, batches, device, *,
+                       slice_keys: "dict[str, int] | None" = None,
+                       gpu_budget_bytes: int = 10 * 2 ** 30) -> "dict[str, torch.Tensor]":
+    """SparseGPT calibration on the DENSE model: per-input-space covariances
+    ``H = XᵀX`` for every capture key (see ``collect_input_norms`` for the key
+    scheme). Keys in ``slice_keys`` (relpath → n_slices) have per-TRACK diagonal
+    blocks kept instead of the full matrix (returned as ``(n_slices, dsub,
+    dsub)``) — the col-sliced slabs only ever read their own block, and this
+    keeps host memory bounded. Accumulators are grouped into multiple passes
+    over ``batches`` so GPU usage stays under ``gpu_budget_bytes``."""
+    slice_keys = slice_keys or {}
+    specs = []  # (key, dim, relpath)
+    for li, layer in enumerate(text_model.layers):
+        for rel in _WANDA_CAPTURE:
+            try:
+                mod = layer.get_submodule(rel)
+            except AttributeError:
+                continue
+            specs.append((f"{li}.{rel}", mod.in_features, rel))
+    covs: "dict[str, torch.Tensor]" = {}
+    pending = list(specs)
+    while pending:
+        group, used = [], 0
+        while pending:
+            key, dim, rel = pending[0]
+            need = dim * dim * 4
+            if group and used + need > gpu_budget_bytes:
+                break
+            group.append(pending.pop(0))
+            used += need
+        acc = {key: torch.zeros(dim, dim, dtype=torch.float32, device=device)
+               for key, dim, _ in group}
+        hooks = []
+
+        def _mk(key: str):
+            def hook(_mod, args):
+                x = args[0].detach()
+                xf = x.reshape(-1, x.shape[-1]).float()
+                acc[key] += xf.T @ xf
+            return hook
+
+        for li, layer in enumerate(text_model.layers):
+            for rel in _WANDA_CAPTURE:
+                key = f"{li}.{rel}"
+                if key not in acc:
+                    continue
+                hooks.append(layer.get_submodule(rel).register_forward_pre_hook(_mk(key)))
+        try:
+            with torch.no_grad():
+                for b in batches:
+                    ids = b["input_ids"].to(device)
+                    mask = b.get("attention_mask")
+                    text_model(input_ids=ids,
+                               attention_mask=mask.to(device) if mask is not None else None)
+        finally:
+            for h in hooks:
+                h.remove()
+        for key, dim, rel in group:
+            H = acc.pop(key)
+            n = slice_keys.get(rel)
+            if n:
+                dsub = dim // n
+                blocks = torch.stack(
+                    [H[t * dsub:(t + 1) * dsub, t * dsub:(t + 1) * dsub] for t in range(n)]
+                )
+                covs[key] = blocks.cpu()
+            else:
+                covs[key] = H.cpu()
+            del H
+        torch.cuda.empty_cache()
+    return covs
+
+
+def collect_input_norms(text_model, batches, device) -> "dict[str, torch.Tensor]":
+    """Wanda calibration on the DENSE model: per-input-channel L2 norms for every
+    distinct Linear input space, keyed ``'{layer_idx}.{capture_relpath}'``. The
+    track slabs' input spaces are exactly the dense spaces (row-sliced weights
+    read the full hidden; col-sliced weights read the track's contiguous slice
+    of the dense intermediate — the conversion identity), so per-track norms are
+    the dense vector or its slice."""
+    acc: "dict[str, torch.Tensor]" = {}
+    hooks = []
+
+    def _mk(key: str):
+        def hook(_mod, args):
+            x = args[0]
+            s = x.detach().float().pow(2).reshape(-1, x.shape[-1]).sum(0)
+            acc[key] = s if key not in acc else acc[key] + s
+        return hook
+
+    for li, layer in enumerate(text_model.layers):
+        for rel in _WANDA_CAPTURE:
+            try:
+                mod = layer.get_submodule(rel)
+            except AttributeError:
+                continue
+            hooks.append(mod.register_forward_pre_hook(_mk(f"{li}.{rel}")))
+    try:
+        with torch.no_grad():
+            for b in batches:
+                ids = b["input_ids"].to(device)
+                mask = b.get("attention_mask")
+                text_model(input_ids=ids,
+                           attention_mask=mask.to(device) if mask is not None else None)
+    finally:
+        for h in hooks:
+            h.remove()
+    return {k: v.sqrt().cpu() for k, v in acc.items()}
+
+
+def compute_shared_lsparse_slices(dense_text_model, student, rank: int, frac: float,
+                                  input_norms: "dict[str, torch.Tensor]", *,
+                                  quant_bits: "int | None" = None,
+                                  iters: int = 3) -> "dict":
+    """SHARED-factor L+S: decompose each DENSE decoder-layer Linear ONCE as
+    L(rank) + S(frac) — one L per dense matrix serves every replica on a device
+    (the 15 replicas are slices of the same dense weights, so rank is ~15×
+    cheaper than per-slice factors) — then cut the degraded dense matrix into
+    per-track shadow weights with the converter's own SlicerSpecs. Returns
+    ``{(track_id, layer_idx, rel): degraded slice (cpu, w.dtype)}`` for the
+    student's LOCAL tracks.
+
+    Correspondence rail (runs on every slab): slicing the UNdegraded dense
+    weight must reproduce the track's own weight bit-exactly — any mapping
+    error fails loudly instead of silently degrading the channel. Randomized
+    SVDs are seeded per (layer, rel) so every rank derives the same
+    decomposition (deployment computes it once)."""
+    import zlib
+
+    from pt_converter.slicer.qwen3_5 import decoder_layer_specs
+
+    n_tracks = student.text_models[0].pt_cfg.n_tracks
+    layer_types = dense_text_model.config.layer_types
+    tm0 = student.text_models[0]
+    out: "dict" = {}
+    for i, dense_layer in enumerate(dense_text_model.layers):
+        specs = decoder_layer_specs(dense_text_model.config, layer_types[i])
+        rels = [rel for rel, mod in tm0.layers[i].named_modules()
+                if isinstance(mod, torch.nn.Linear)]
+        for rel in rels:
+            spec = specs[f"{rel}.weight"]
+            dense_w = dense_layer.get_submodule(rel).weight.data
+            norms = input_norms[f"{i}.{_WANDA_KEY[rel]}"]
+            if norms.numel() != dense_w.shape[-1]:
+                raise ValueError(
+                    f"dense norms ({norms.numel()}) do not match in_features "
+                    f"{dense_w.shape[-1]} for {i}.{rel}"
+                )
+            for tm in student.text_models:
+                tid = tm.pt_cfg.track_id
+                raw = spec.slice(dense_w, tid, n_tracks)
+                track_w = tm.layers[i].get_submodule(rel).weight.data
+                if not torch.equal(raw, track_w):
+                    raise RuntimeError(
+                        f"dense→slice correspondence failed at layer {i} {rel} "
+                        f"track {tid}: sliced dense weight != track weight "
+                        "(is the checkpoint an untrained raw slice of this dense model?)"
+                    )
+            with torch.random.fork_rng(
+                devices=[dense_w.device] if dense_w.is_cuda else []
+            ):
+                torch.manual_seed(zlib.crc32(f"{i}.{rel}".encode()) & 0x7FFFFFFF)
+                degraded = lsparse_decompose_weight(
+                    dense_w, rank, frac, norms, iters=iters, quant_bits=quant_bits
+                )
+            for tm in student.text_models:
+                tid = tm.pt_cfg.track_id
+                out[(tid, i, rel)] = spec.slice(degraded, tid, n_tracks).cpu()
+            del degraded
+    return out
+
+
 class PhasedMode:
     """Mode marker for ``phased_intervention_forward`` (duck-types ``Channel.name``
-    so the probe's anchor/%head bookkeeping applies unchanged)."""
+    so the probe's anchor/%head bookkeeping applies unchanged). See the section
+    comment for the ``replica:*`` degraded-recomputation specs."""
 
     def __init__(self, name: str):
-        if name not in _PHASED_MODES:
+        self.degrade = None  # weight transform for replica shadow copies
+        self.wanda = False  # activation-aware pruning (needs set_input_norms)
+        self.chanwanda = False  # MLP-channel-structured wanda (needs set_input_norms)
+        self.sparsegpt = False  # prune + reconstruct (needs set_input_covs)
+        self.pre_quant_bits: "int | None" = None  # qwanda: quantize copy before pruning
+        self.wanda_block: "int | None" = None  # blockwanda: block granularity
+        self.wanda24 = False  # 2:4 semi-structured
+        self.profiled = False  # profwanda: per-layer fracs via set_layer_fracs
+        self.lsparse = False  # low-rank + sparse decomposition (needs set_input_norms)
+        self.lsparse_rank: "int | None" = None
+        self.shared_lsparse = False  # dense-level shared-L (needs set_shared_slices)
+        self._shared_slices: "dict | None" = None
+        self.mlp_none = False  # attn-only replicas: no MLP copies at all
+        self.attn_none = False  # MLP-only replicas: no attention copies at all
+        self.mlp_mode: "PhasedMode | None" = None  # separate spec for mlp.* Linears
+        self._layer_fracs: "list[float] | None" = None
+        self._input_norms: "dict[str, torch.Tensor] | None" = None
+        self._input_covs: "dict[str, torch.Tensor] | None" = None
+        self._n_tracks: "int | None" = None
+        self.replica = name.startswith("replica")
+        if self.replica:
+            spec = name
+            if ":mlp:" in name:
+                # Per-sublayer split: ``<base>:mlp:<sub>`` — the base spec governs
+                # the token-mixer Linears only; ``mlp:none`` drops the MLP copies
+                # entirely (attn-only replicas), any other sub-spec degrades the
+                # mlp.* Linears independently (asymmetric budgets).
+                spec, mlp_spec = name.split(":mlp:", 1)
+                if ":mlp:" in mlp_spec:
+                    raise ValueError(f"multiple :mlp: sub-specs in {name!r}")
+                if mlp_spec == "none":
+                    self.mlp_none = True
+                else:
+                    sub = PhasedMode("replica:" + mlp_spec)
+                    if (sub.chanwanda or sub.sparsegpt or sub.wanda24
+                            or sub.wanda_block is not None or sub.profiled):
+                        raise ValueError(
+                            f"unsupported :mlp: sub-spec {mlp_spec!r} in {name!r} "
+                            "(use none | exact | int8 | int4 | svd:<r> | prune:<f> | "
+                            "wanda:<f> | qwanda:<b>:<f>)"
+                        )
+                    self.mlp_mode = sub
+            parts = spec.split(":")
+            if parts == ["replica", "exact"]:
+                pass
+            elif parts == ["replica", "none"]:
+                # MLP-only replicas: no attention copies at all — the shadow
+                # chain advances on MLP replica deltas only; each track carries
+                # its OWN exact attention deltas as per-track offsets.
+                self.attn_none = True
+            elif len(parts) == 2 and parts[1] in ("int8", "int4"):
+                bits = int(parts[1][3:])
+                self.degrade = lambda w, b=bits: fake_quant_weight(w, b)
+            elif len(parts) == 3 and parts[1] == "svd":
+                rank = int(parts[2])
+                self.degrade = lambda w, r=rank: svd_truncate_weight(w, r)
+            elif len(parts) == 3 and parts[1] == "prune":
+                frac = float(parts[2])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:prune fraction must be in (0, 1), got {frac}")
+                self.degrade = lambda w, f=frac: prune_weight(w, f)
+            elif len(parts) == 3 and parts[1] == "wanda":
+                frac = float(parts[2])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:wanda fraction must be in (0, 1), got {frac}")
+                self.wanda = True
+                self.wanda_frac = frac
+            elif len(parts) == 4 and parts[1] == "qwanda":
+                # Quantize the copy to int-<bits> FIRST (a bf16 base's precision
+                # headroom), then wanda-prune the quantized values.
+                bits, frac = int(parts[2]), float(parts[3])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:qwanda fraction must be in (0, 1), got {frac}")
+                self.wanda = True
+                self.wanda_frac = frac
+                self.pre_quant_bits = bits
+            elif len(parts) == 3 and parts[1] == "chanwanda":
+                # MLP intermediate CHANNELS pruned jointly (gate/up rows + down
+                # cols — index-free, dense-kernel copies); mixer Linears get
+                # unstructured wanda at the same fraction.
+                frac = float(parts[2])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:chanwanda fraction must be in (0, 1), got {frac}")
+                self.chanwanda = True
+                self.wanda_frac = frac
+            elif len(parts) == 3 and parts[1] == "sparsegpt":
+                frac = float(parts[2])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:sparsegpt fraction must be in (0, 1), got {frac}")
+                self.sparsegpt = True
+                self.wanda_frac = frac
+            elif len(parts) == 4 and parts[1] == "blockwanda":
+                # Block-granular wanda: index ~1/block_size bit/weight.
+                bs, frac = int(parts[2]), float(parts[3])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:blockwanda fraction must be in (0, 1), got {frac}")
+                if bs < 2:
+                    raise ValueError(f"replica:blockwanda block size must be ≥ 2, got {bs}")
+                self.wanda = True
+                self.wanda_frac = frac
+                self.wanda_block = bs
+            elif parts == ["replica", "wanda24"]:
+                # 2:4 semi-structured (hardware-real; fixed 50%).
+                self.wanda = True
+                self.wanda_frac = 0.5
+                self.wanda24 = True
+            elif len(parts) == 4 and parts[1] == "lsparse":
+                # Low-rank + sparse copies: L (rank-<r>, dense, tiny) + S
+                # (frac-<f> sparse residual). Quality-only simulation — byte
+                # accounting (shared-L across replicas, int8 factors) on paper.
+                rank, frac = int(parts[2]), float(parts[3])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:lsparse fraction must be in (0, 1), got {frac}")
+                if rank < 1:
+                    raise ValueError(f"replica:lsparse rank must be >= 1, got {rank}")
+                self.lsparse = True
+                self.lsparse_rank = rank
+                self.wanda_frac = frac
+            elif len(parts) == 5 and parts[1] == "qlsparse":
+                # lsparse on an already-quantized base: weights int-<bits> first,
+                # stored S values re-quantized; L factors stay high-precision.
+                bits, rank, frac = int(parts[2]), int(parts[3]), float(parts[4])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:qlsparse fraction must be in (0, 1), got {frac}")
+                if rank < 1:
+                    raise ValueError(f"replica:qlsparse rank must be >= 1, got {rank}")
+                self.lsparse = True
+                self.lsparse_rank = rank
+                self.wanda_frac = frac
+                self.pre_quant_bits = bits
+            elif len(parts) == 4 and parts[1] == "slsparse":
+                # SHARED-factor L+S: L computed on the DENSE weight, stored once
+                # per device for the whole replica pool; per-track S. Slices
+                # arrive precomputed via set_shared_slices
+                # (compute_shared_lsparse_slices).
+                rank, frac = int(parts[2]), float(parts[3])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:slsparse fraction must be in (0, 1), got {frac}")
+                if rank < 1:
+                    raise ValueError(f"replica:slsparse rank must be >= 1, got {rank}")
+                self.shared_lsparse = True
+                self.lsparse_rank = rank
+                self.wanda_frac = frac
+            elif len(parts) == 5 and parts[1] == "qslsparse":
+                bits, rank, frac = int(parts[2]), int(parts[3]), float(parts[4])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:qslsparse fraction must be in (0, 1), got {frac}")
+                if rank < 1:
+                    raise ValueError(f"replica:qslsparse rank must be >= 1, got {rank}")
+                self.shared_lsparse = True
+                self.lsparse_rank = rank
+                self.wanda_frac = frac
+                self.pre_quant_bits = bits
+            elif len(parts) == 3 and parts[1] == "profwanda":
+                # Non-uniform per-LAYER budgets at this parameter-weighted average
+                # fraction; the profile arrives via set_layer_fracs
+                # (allocate_layer_fracs) before the first forward.
+                frac = float(parts[2])
+                if not (0.0 < frac < 1.0):
+                    raise ValueError(f"replica:profwanda fraction must be in (0, 1), got {frac}")
+                self.wanda = True
+                self.wanda_frac = frac
+                self.profiled = True
+            else:
+                raise ValueError(
+                    f"unknown replica spec {name!r} (replica:exact | replica:int8 | "
+                    f"replica:int4 | replica:svd:<r> | replica:prune:<frac> | "
+                    f"replica:wanda:<frac> | replica:qwanda:<bits>:<frac> | "
+                    f"replica:chanwanda:<frac> | replica:sparsegpt:<frac> | "
+                    f"replica:blockwanda:<bs>:<frac> | replica:profwanda:<frac> | "
+                    f"replica:lsparse:<rank>:<frac> | replica:qlsparse:<bits>:<rank>:<frac>; "
+                    f"optional :mlp:<sub|none> suffix for a separate MLP spec)"
+                )
+            if self.chanwanda and (self.mlp_none or self.mlp_mode is not None):
+                raise ValueError(
+                    f"{name!r}: chanwanda already prunes the MLP jointly — "
+                    "it cannot take a :mlp: sub-spec"
+                )
+            if self.attn_none and self.mlp_mode is None:
+                raise ValueError(
+                    f"{name!r}: replica:none (no attention copies) requires a "
+                    "non-none :mlp: sub-spec — dropping both is the zero channel"
+                )
+            self._shadow: "list[list] | None" = None
+        elif name not in _PHASED_MODES:
             raise ValueError(
-                f"unknown phased mode {name!r} (choose from {', '.join(_PHASED_MODES)})"
+                f"unknown phased mode {name!r} (choose from {', '.join(_PHASED_MODES)}, "
+                f"replica:exact, replica:int8, replica:int4, replica:svd:<r>, "
+                f"replica:prune:<frac>, replica:wanda:<frac>)"
             )
         self.name = name
+
+    def set_input_norms(self, norms: "dict[str, torch.Tensor]", n_tracks: int) -> None:
+        """Attach ``collect_input_norms`` output (wanda/qwanda/chanwanda channels)."""
+        self._input_norms = norms
+        self._n_tracks = n_tracks
+        if self.mlp_mode is not None:
+            self.mlp_mode.set_input_norms(norms, n_tracks)
+
+    def set_input_covs(self, covs: "dict[str, torch.Tensor]", n_tracks: int) -> None:
+        """Attach ``collect_input_covs`` output (sparsegpt channels only)."""
+        self._input_covs = covs
+        self._n_tracks = n_tracks
+        if self.mlp_mode is not None:
+            self.mlp_mode.set_input_covs(covs, n_tracks)
+
+    def set_layer_fracs(self, fracs: "list[float]") -> None:
+        """Attach the per-layer sparsity profile (profwanda channels only;
+        see ``allocate_layer_fracs``)."""
+        self._layer_fracs = list(fracs)
+
+    def set_shared_slices(self, slices: "dict") -> None:
+        """Attach ``compute_shared_lsparse_slices`` output (slsparse channels)."""
+        self._shared_slices = slices
+
+    def _covs_for(self, layer_idx: int, rel_name: str, in_features: int,
+                  track_id: int) -> torch.Tensor:
+        v = self._input_covs[f"{layer_idx}.{_WANDA_KEY[rel_name]}"]
+        if v.ndim == 3:  # per-track diagonal blocks (col-sliced input spaces)
+            if v.shape[0] != self._n_tracks or v.shape[1] != in_features:
+                raise ValueError(
+                    f"cov blocks {tuple(v.shape)} do not match in_features {in_features} "
+                    f"× n_tracks {self._n_tracks} for {layer_idx}.{rel_name}"
+                )
+            return v[track_id]
+        if v.shape[-1] != in_features:
+            raise ValueError(
+                f"cov ({tuple(v.shape)}) does not match in_features {in_features} "
+                f"for {layer_idx}.{rel_name}"
+            )
+        return v
+
+    def _norms_for(self, layer_idx: int, rel_name: str, in_features: int,
+                   track_id: int) -> torch.Tensor:
+        v = self._input_norms[f"{layer_idx}.{_WANDA_KEY[rel_name]}"]
+        if v.numel() != in_features:
+            slices, rem = divmod(v.numel(), in_features)
+            if rem != 0 or slices != self._n_tracks:
+                raise ValueError(
+                    f"norms ({v.numel()}) do not tile in_features {in_features} "
+                    f"× n_tracks {self._n_tracks} for {layer_idx}.{rel_name}"
+                )
+            v = v[track_id * in_features:(track_id + 1) * in_features]
+        return v
+
+    def ensure_shadow(self, student: PTWrappedModel) -> "list[list]":
+        """Build (once, cached across batches) degraded copies of every local
+        track's decoder layers. Plain deepcopy — the per-track weights are
+        unsharded local tensors (``wrap_student_with_fsdp`` is a no-op for the
+        track layout). Norms/biases/convs stay exact; every ``nn.Linear`` weight
+        is degraded."""
+        if self._shadow is None:
+            import copy
+
+            needs_norms = (self.wanda or self.chanwanda or self.lsparse
+                           or (self.mlp_mode is not None
+                               and (self.mlp_mode.wanda or self.mlp_mode.lsparse)))
+            if needs_norms and self._input_norms is None:
+                raise RuntimeError(
+                    f"{self.name} needs set_input_norms(collect_input_norms(...), n_tracks) "
+                    "before the first forward"
+                )
+            if self.sparsegpt and self._input_covs is None:
+                raise RuntimeError(
+                    f"{self.name} needs set_input_covs(collect_input_covs(...), n_tracks) "
+                    "before the first forward"
+                )
+            if self.shared_lsparse and self._shared_slices is None:
+                raise RuntimeError(
+                    f"{self.name} needs set_shared_slices(compute_shared_lsparse_slices(...)) "
+                    "before the first forward"
+                )
+            shadow: "list[list]" = []
+            for tm in student.text_models:
+                track_id = tm.pt_cfg.track_id
+                layers = []
+                for li, layer in enumerate(tm.layers):
+                    clone = copy.deepcopy(layer)
+                    self._degrade_layer(clone, li, track_id)
+                    # Frozen constants: co-training treats the copies as a lagged
+                    # target-network (refreshed by clearing _shadow), never trained.
+                    for prm in clone.parameters():
+                        prm.requires_grad_(False)
+                    layers.append(clone)
+                shadow.append(layers)
+            self._shadow = shadow
+        return self._shadow
+
+    def _degrade_layer(self, clone, layer_idx: int, track_id: int) -> None:
+        """Apply this spec's degradation to one shadow layer clone, in place."""
+        if self.attn_none:
+            # MLP-only replicas: the forward never calls the shadow mixer, so
+            # drop it — this IS the memory saving (and the shadow needs no KV
+            # cache / GDN state at all in deployment).
+            for attr in ("self_attn", "linear_attn"):
+                if getattr(clone, attr, None) is not None:
+                    setattr(clone, attr, None)
+            self.mlp_mode._degrade_selected(clone, layer_idx, track_id,
+                                            lambda rel: rel.startswith("mlp."))
+            return
+        if self.mlp_none:
+            # Attn-only replicas: the forward never calls the shadow MLP, so drop
+            # the module — this IS the memory saving being gated.
+            clone.mlp = None
+            self._degrade_selected(clone, layer_idx, track_id,
+                                   lambda rel: not rel.startswith("mlp."))
+            return
+        if self.mlp_mode is not None:
+            self.mlp_mode._degrade_selected(clone, layer_idx, track_id,
+                                            lambda rel: rel.startswith("mlp."))
+            self._degrade_selected(clone, layer_idx, track_id,
+                                   lambda rel: not rel.startswith("mlp."))
+            return
+        self._degrade_selected(clone, layer_idx, track_id, lambda rel: True)
+
+    def _degrade_selected(self, clone, layer_idx: int, track_id: int,
+                          select) -> None:
+        """Degrade the clone's Linears whose rel-name passes ``select``."""
+        if self.chanwanda:
+            # Joint MLP intermediate-channel prune: gate/up rows + down cols share
+            # one mask (channel score = ‖down[:,j]‖ · ‖x_j‖ — the wanda criterion
+            # at channel granularity). Mixer Linears: unstructured wanda.
+            down = clone.mlp.down_proj
+            ch_norms = self._norms_for(layer_idx, "mlp.down_proj",
+                                       down.weight.shape[-1], track_id)
+            score = down.weight.data.float().norm(dim=0) * ch_norms.to(down.weight.device)
+            k = int(round(self.wanda_frac * score.numel()))
+            if k > 0:
+                pruned = score <= score.kthvalue(k).values
+                clone.mlp.gate_proj.weight.data[pruned] = 0
+                clone.mlp.up_proj.weight.data[pruned] = 0
+                down.weight.data[:, pruned] = 0
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and not rel.startswith("mlp."):
+                    mod.weight.data = wanda_prune_weight(
+                        mod.weight.data, self.wanda_frac,
+                        self._norms_for(layer_idx, rel, mod.weight.shape[-1], track_id),
+                    )
+            return
+        if self.shared_lsparse:
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and select(rel):
+                    w = self._shared_slices[(track_id, layer_idx, rel)]
+                    mod.weight.data = w.to(device=mod.weight.device,
+                                           dtype=mod.weight.dtype)
+            return
+        if self.lsparse:
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and select(rel):
+                    mod.weight.data = lsparse_decompose_weight(
+                        mod.weight.data, self.lsparse_rank, self.wanda_frac,
+                        self._norms_for(layer_idx, rel, mod.weight.shape[-1], track_id),
+                        quant_bits=self.pre_quant_bits,
+                    )
+            return
+        if self.sparsegpt:
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and select(rel):
+                    H = self._covs_for(layer_idx, rel, mod.weight.shape[-1], track_id)
+                    mod.weight.data = sparsegpt_prune_weight(
+                        mod.weight.data, self.wanda_frac, H.to(mod.weight.device)
+                    )
+            return
+        if self.wanda:
+            if self.profiled and self._layer_fracs is None:
+                raise RuntimeError(
+                    f"{self.name} needs set_layer_fracs(allocate_layer_fracs(...)) "
+                    "before the first forward"
+                )
+            frac = (self._layer_fracs[layer_idx] if self._layer_fracs is not None
+                    else self.wanda_frac)
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and select(rel):
+                    w = mod.weight.data
+                    if self.pre_quant_bits is not None:
+                        w = fake_quant_weight(w, self.pre_quant_bits)
+                    norms = self._norms_for(layer_idx, rel, w.shape[-1], track_id)
+                    if self.wanda24:
+                        mod.weight.data = wanda24_prune_weight(w, norms)
+                    elif self.wanda_block is not None:
+                        mod.weight.data = block_wanda_prune_weight(
+                            w, frac, norms, self.wanda_block
+                        )
+                    else:
+                        mod.weight.data = wanda_prune_weight(w, frac, norms)
+            return
+        if self.degrade is not None:
+            for rel, mod in clone.named_modules():
+                if isinstance(mod, torch.nn.Linear) and select(rel):
+                    mod.weight.data = self.degrade(mod.weight.data)
 
 
 def _apply_padding_mask(h: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
@@ -642,6 +1504,8 @@ def phased_intervention_forward(
     from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
 
     mode = channel.name
+    replica = getattr(channel, "replica", False)
+    shadow_layers = channel.ensure_shadow(student) if replica else None
     inputs_embeds = student.embed(input_ids)
     tm0 = student.text_models[0]
     position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
@@ -659,41 +1523,111 @@ def phased_intervention_forward(
     last = num_layers - 1
     sync_attn_set = set(sync_indices) - {last}
     base = inputs_embeds  # exact full residual at the current point (telescoping sum)
+    shadow_base = inputs_embeds  # replica modes: degraded estimate of ``base``
+    # mlp:none (attn-only replicas): no MLP copies exist, so the shadow chain
+    # carries attention deltas only; each track still computes its OWN MLP
+    # exactly (deployment truth), tracked as a per-track offset on the common
+    # shadow estimate. Offsets reset at each post-attn boundary sync.
+    # replica:none:mlp:* (MLP-only replicas) is the symmetric case: no attention
+    # copies, the shadow chain advances on MLP replica deltas only, and the
+    # offsets carry each track's OWN exact attention deltas instead.
+    attn_only = replica and channel.mlp_none
+    mlp_only = replica and channel.attn_none
+    own_mlp_off: "list" = [0.0 for _ in student.text_models]
+    own_attn_off: "list" = [0.0 for _ in student.text_models]
     per_track_h = [inputs_embeds for _ in student.text_models]
     for i in range(num_layers):
         # Norm weights are synced across tracks, so track 0's module serves all.
         ln_full = tm0.layers[i].input_layernorm(base)
+        layer_mask_i = (
+            linear_attn_mask
+            if tm0.config.layer_types[i] == "linear_attention"
+            else causal_mask
+        )
         h_attn: list[torch.Tensor] = []
         y_list: list[torch.Tensor] = []
         for k, tm in enumerate(student.text_models):
             layer = tm.layers[i]
-            layer_mask = (
-                linear_attn_mask
-                if tm.config.layer_types[i] == "linear_attention"
-                else causal_mask
-            )
             with _MixerWriteSwap(layer, mode, ln_full, linear_attn_mask):
                 ha, y = _seam_token_mixer(
-                    layer, per_track_h[k], position_embeddings, layer_mask, text_position_ids
+                    layer, per_track_h[k], position_embeddings, layer_mask_i, text_position_ids
                 )
             h_attn.append(ha)
             y_list.append(y)
         base = base + _sum_track_deltas(list(y_list), group)  # true post-attn residual
+        if mlp_only:
+            # No attention copies: each track's own exact attn delta rides its
+            # private offset; other tracks' attn content is simply absent.
+            own_attn_off = [off + y for off, y in zip(own_attn_off, y_list)]
+        elif replica:
+            # Shadow attn step: degraded copies of every track read the shadow
+            # estimate (oracle geometry), advancing it comm-free-equivalently.
+            sh_y = [
+                _seam_token_mixer(
+                    shadow_layers[k][i], shadow_base, position_embeddings,
+                    layer_mask_i, text_position_ids,
+                )[1]
+                for k in range(len(student.text_models))
+            ]
+            shadow_base = shadow_base + _sum_track_deltas(sh_y, group)
         if mode == "oracle":
             h_attn = [base for _ in h_attn]
+        elif replica and i not in sync_attn_set:
+            if attn_only:
+                h_attn = [shadow_base + off for off in own_mlp_off]
+            elif mlp_only:
+                h_attn = [shadow_base + off for off in own_attn_off]
+            else:
+                h_attn = [shadow_base for _ in h_attn]
         if i in sync_attn_set:
             # Boundary: the post-attn sync delivers the true residual to every
             # track's MLP (== sync_module's reconstruction up to fp order).
             new_h = [_seam_mlp(tm.layers[i], base, None) for tm in student.text_models]
             mlp_deltas = [nh - base for nh in new_h]
+            if attn_only:
+                # The sync delivers the true post-attn residual; with no MLP
+                # copies each track's estimate is that residual plus its OWN
+                # exact boundary-MLP delta.
+                shadow_base = base
+                own_mlp_off = list(mlp_deltas)
+            elif replica:
+                # The sync resets the shadow to the true residual; the boundary
+                # MLP's shadow step advances it with degraded weights.
+                sh_d = [
+                    _seam_mlp(shadow_layers[k][i], base, None) - base
+                    for k in range(len(student.text_models))
+                ]
+                shadow_base = base + _sum_track_deltas(sh_d, group)
+                if mlp_only:
+                    # The post-attn sync corrected all attention content.
+                    own_attn_off = [0.0 for _ in own_attn_off]
         else:
             # Fully-partial layer, or the final layer (whose post-MLP "sync" is the
             # ``base`` accumulation itself — the returned hidden is fully synced).
             new_h = [_seam_mlp(tm.layers[i], h_attn[k], None)
                      for k, tm in enumerate(student.text_models)]
             mlp_deltas = [nh - ha for nh, ha in zip(new_h, h_attn)]
+            if attn_only:
+                # No shadow MLP step; own exact deltas accumulate in the offsets.
+                own_mlp_off = [off + d for off, d in zip(own_mlp_off, mlp_deltas)]
+            elif replica:
+                sh_prev = shadow_base
+                sh_d = [
+                    _seam_mlp(shadow_layers[k][i], sh_prev, None) - sh_prev
+                    for k in range(len(student.text_models))
+                ]
+                shadow_base = sh_prev + _sum_track_deltas(sh_d, group)
         base = base + _sum_track_deltas(mlp_deltas, group)  # true post-MLP residual
-        per_track_h = [base for _ in new_h] if mode == "oracle" else new_h
+        if mode == "oracle":
+            per_track_h = [base for _ in new_h]
+        elif mlp_only:
+            per_track_h = [shadow_base + off for off in own_attn_off]
+        elif replica and not attn_only:
+            per_track_h = [shadow_base for _ in new_h]
+        else:
+            # Plain path, and attn_only (whose carries were already substituted
+            # at h_attn time: new_h[k] == shadow_base + own_mlp_off[k]).
+            per_track_h = new_h
 
     return tm0.norm(base)
 

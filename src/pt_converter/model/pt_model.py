@@ -252,15 +252,27 @@ class PTWrappedModel(nn.Module):
         """Select where the single per-block sync lands (lever B). ``"boundary"``
         (default) is bit-identical to the legacy forward; ``"post-attn"`` shifts it
         to the post-attention point (real Σ_others Y at the MLP input, same sync
-        count). Incompatible with a cross-head seam (B delivers the real content)."""
-        if phase not in ("boundary", "post-attn"):
-            raise ValueError(f"sync_phase must be 'boundary' or 'post-attn', got {phase!r}")
+        count). ``"window-parallel"`` (Gate 2) is the slice of the HEALED dense
+        window-parallel function: within each window ALL attns read the per-track
+        window-entry state, ONE post-attn sync, ALL MLPs read the synced state —
+        same sync count as the boundary schedule. Incompatible with a cross-head
+        seam (post-attn delivers the real content; window-parallel has no partial
+        mid-window layers to fill)."""
+        if phase not in ("boundary", "post-attn", "window-parallel"):
+            raise ValueError(
+                f"sync_phase must be 'boundary', 'post-attn' or 'window-parallel', got {phase!r}"
+            )
         if phase == "post-attn" and self.cross_head is not None \
                 and getattr(self.cross_head, "backend", None) != "window_stale":
             raise ValueError(
                 "sync_phase='post-attn' (lever B) is incompatible with a cross_head seam "
                 "(it delivers the real Σ_others Y); only the 'window_stale' backend — which "
                 "fills the partial non-boundary layers with the cached boundary ΣY — is allowed"
+            )
+        if phase == "window-parallel" and self.cross_head is not None:
+            raise ValueError(
+                "sync_phase='window-parallel' has no partial mid-window layers; a cross_head "
+                "seam does not apply"
             )
         self.sync_phase = phase
 
@@ -587,6 +599,149 @@ class PTWrappedModel(nn.Module):
                     per_track_h = new_h
         return h, sync_hiddens
 
+    def _run_window_parallel_stack(
+        self,
+        h: torch.Tensor,
+        position_embeddings,
+        text_position_ids,
+        causal_mask,
+        linear_attn_mask,
+        sync_hiddens: "dict[int, torch.Tensor] | None" = None,
+        boundary_grad_alpha: float = 1.0,
+    ):
+        """Window-parallel forward (Gate 2) — the slice of the HEALED dense
+        ``parallel-attn`` function (``eval/dense_parallel.py``), one sync per window.
+
+        The boundary schedule's sync indices are the window ENDS. Per non-final
+        window entered at per-track state ``P^k`` (= previous synced state ``A_prev``
+        + this track's previous-window MLP deltas — the 1-phase seam):
+
+            y_i^k = attn_i(P^k)  for EVERY window layer i        (parallel)
+            R = SyncBoundary(P^k + Σ_i y_i^k, A_prev)            ← the ONE all-reduce
+              = A_prev + Σ_k m_prev^k + Σ_k Σ_i y_i^k            (all deltas since A_prev)
+            m_i^k = mlp_i(R) − R for EVERY window layer i        (parallel, REAL synced input)
+            carry P'^k = R + Σ_i m_i^k
+
+        The final window keeps the boundary-phase convention (per-track serial run,
+        post-MLP sync ⇒ fully-synced output for the norm), matching lever B / the
+        trained-phased final layer. Sync COUNT == the boundary schedule's. No
+        partial mid-window layers exist — the fully-partial regime (the proven D>1
+        killer) is architecturally absent."""
+        from pt_converter.model.cross_head_estimator import seam_token_mixer, seam_mlp
+
+        # Per-sublayer activation checkpointing for the grad-carrying full forward
+        # (same rationale as _run_post_attn_stack: an on-policy output objective
+        # backwards through this whole stack). Closures keep collectives OUTSIDE
+        # the recomputed regions; eval (no_grad) always takes the plain path.
+        use_ckpt = self._use_checkpoint and torch.is_grad_enabled()
+
+        def _mixer_y(layer, x, mask):
+            return seam_token_mixer(layer, x, position_embeddings, mask, text_position_ids)[1]
+
+        def _mixer_ha(layer, x, mask):
+            return seam_token_mixer(layer, x, position_embeddings, mask, text_position_ids)[0]
+
+        def _mlp_delta(layer, x):
+            return seam_mlp(layer, x, None) - x
+
+        L = len(self.text_models[0].layers)
+        last = L - 1
+        bounds = sorted(set(self.sync_after_layers))
+        if not bounds or bounds[-1] != last:
+            raise ValueError(
+                f"window-parallel needs the final layer in the sync schedule, got {bounds}"
+            )
+        windows: list[list[int]] = []
+        prev = -1
+        for b in bounds:
+            windows.append(list(range(prev + 1, b + 1)))
+            prev = b
+
+        def _mask(i: int):
+            return (
+                linear_attn_mask
+                if self.text_models[0].config.layer_types[i] == "linear_attention"
+                else causal_mask
+            )
+
+        block_start = h
+        per_track_h = [h for _ in self.text_models]
+        for window in windows:
+            if window[-1] == last:
+                # Final window: per-track serial (partial) layers, ONE post-MLP sync.
+                new_h = per_track_h
+                for i in window:
+                    layer_mask = _mask(i)
+                    if use_ckpt:
+                        new_h = [
+                            checkpoint(
+                                seam_mlp, tm.layers[i],
+                                checkpoint(
+                                    _mixer_ha, tm.layers[i], new_h[k], layer_mask,
+                                    use_reentrant=False,
+                                ),
+                                None, use_reentrant=False,
+                            )
+                            for k, tm in enumerate(self.text_models)
+                        ]
+                    else:
+                        new_h = [
+                            seam_mlp(
+                                tm.layers[i],
+                                seam_token_mixer(
+                                    tm.layers[i], new_h[k], position_embeddings,
+                                    layer_mask, text_position_ids,
+                                )[0],
+                                None,
+                            )
+                            for k, tm in enumerate(self.text_models)
+                        ]
+                h = self.sync_module(new_h, block_start)
+                if sync_hiddens is not None:
+                    sync_hiddens[last] = h
+                return h, sync_hiddens
+            # Parallel window: every attn reads the per-track window-entry state.
+            h_attn: list[torch.Tensor] = []
+            for k, tm in enumerate(self.text_models):
+                acc = per_track_h[k]
+                for i in window:
+                    if use_ckpt:
+                        acc = acc + checkpoint(
+                            _mixer_y, tm.layers[i], per_track_h[k], _mask(i),
+                            use_reentrant=False,
+                        )
+                    else:
+                        acc = acc + seam_token_mixer(
+                            tm.layers[i], per_track_h[k], position_embeddings,
+                            _mask(i), text_position_ids,
+                        )[1]
+                h_attn.append(acc)
+            R = self.sync_module(h_attn, block_start)
+            if sync_hiddens is not None:
+                # Tap stored UNDAMPED at the window's boundary index (same contract
+                # as the phased forward).
+                sync_hiddens[window[-1]] = R
+            if boundary_grad_alpha != 1.0 and torch.is_grad_enabled():
+                # Per-window gradient damping of the free-running unroll (mirrors
+                # the phased forward): forward value EXACTLY R, cross-window
+                # gradient shrunk by alpha per boundary crossed.
+                R = R.detach() + boundary_grad_alpha * (R - R.detach())
+            block_start = R
+            # Every MLP reads the fully-synced R; the carry accumulates own deltas.
+            new_h = []
+            for k, tm in enumerate(self.text_models):
+                acc = R
+                for i in window:
+                    if use_ckpt:
+                        acc = acc + checkpoint(
+                            _mlp_delta, tm.layers[i], R, use_reentrant=False
+                        )
+                    else:
+                        acc = acc + (seam_mlp(tm.layers[i], R, None) - R)
+                new_h.append(acc)
+            per_track_h = new_h
+        raise RuntimeError("unreachable: the final window returns")
+
     def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Full input embedding (B, S, H), grad-connected, identical on every rank.
 
@@ -651,12 +806,19 @@ class PTWrappedModel(nn.Module):
         )
         position_embeddings = tm0.rotary_emb(h, position_ids_resolved)
 
-        # Lever B: the single per-block sync is phase-shifted to post-attention.
-        # Self-contained per-layer split path (the window/checkpoint machinery below
-        # assumes the boundary sync), D=1 only.
-        if self.sync_phase == "post-attn":
+        # Lever B ("post-attn"): the single per-block sync is phase-shifted to
+        # post-attention. Gate 2 ("window-parallel"): all window attns in parallel,
+        # one post-attn sync per window, all window MLPs on the synced state.
+        # Both are self-contained split paths (the window/checkpoint machinery
+        # below assumes the boundary sync).
+        if self.sync_phase in ("post-attn", "window-parallel"):
+            stack = (
+                self._run_post_attn_stack
+                if self.sync_phase == "post-attn"
+                else self._run_window_parallel_stack
+            )
             sh = {} if (return_sync_hiddens or return_intra_window_hiddens) else None
-            h, sh = self._run_post_attn_stack(
+            h, sh = stack(
                 h, position_embeddings, text_position_ids, causal_mask, linear_attn_mask, sh,
                 boundary_grad_alpha=boundary_grad_alpha,
             )
