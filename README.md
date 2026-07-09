@@ -52,14 +52,15 @@ without the `[fast]` kernels; CPU tests force that path automatically.
 ## Convert
 
 ```bash
-python scripts/convert_qwen3_5_9b.py \
-    --hf-model <path-or-id of the dense model> \
+python scripts/convert.py \
+    --hf-model <checkpoint dir (bf16, NVFP4, dense or MoE)> \
     --out-dir  ./pt_tracks \
     --n-tracks 16          # defaults to max-tracks for the model
 ```
 
-Writes `track_0..N-1.safetensors` + `manifest.json`. Runs on CPU; ~9B bf16
-weights ≈ 18 GB host RAM.
+Writes `track_0..N-1.safetensors` + `manifest.json`. One streaming converter for
+every source — it dequantizes NVFP4/FP8 to bf16, drops the vision tower + MTP head,
+and resolves the right adapter from `config.model_type`.
 
 ## Build the replica pool
 
@@ -75,6 +76,13 @@ pool = degrade_track_layers(track_model, norms, n_tracks, track_id, frac=0.5, bi
 
 `frac` is the copy sparsity (0.5 is the depth-safe knee), `bits` the optional
 int-quantized base (`qwanda`). See `parallm/model/replica.py`.
+
+Or build + pack the whole pool to one file (family-general — bf16 / NVFP4 / MoE):
+
+```bash
+python scripts/build_replicas.py --tracks-dir ./pt_tracks --hf-model <checkpoint dir> \
+    --config qwanda:4:0.5        # or wanda:0.5  |  q4mlp/q8mix:0.5 (NVFP4-mlp/FP8-mixer base)
+```
 
 ## Evaluate
 

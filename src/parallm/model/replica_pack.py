@@ -69,6 +69,52 @@ def pack_sparse_weight(w: torch.Tensor, frac: float, in_norms: torch.Tensor, *,
     return packed
 
 
+_FIXED_EXPERT_FIELDS = ("shape", "mask", "scale", "bits")  # equal size across experts
+
+
+def pack_expert_slab(w: torch.Tensor, frac: float, expert_in_norms: torch.Tensor, *,
+                     bits: "int | None" = None, block: "int | None" = None) -> dict:
+    """Pack a fused MoE expert slab ``[E, out, in]`` — one ``pack_sparse_weight`` per
+    expert with that expert's own input norms ``expert_in_norms[E, in]``.
+
+    The mask/scale/shape/bits fields are equal size across experts and stack on a
+    leading E dim; the survivor values (``codes``/``vals``) are RAGGED — after int
+    quantization a weight can round to exactly zero, so the survivor count varies
+    per expert — so they are concatenated with a per-expert length vector ``vlen``.
+    """
+    if w.ndim != 3:
+        raise ValueError(f"pack_expert_slab expects [E, out, in], got {tuple(w.shape)}")
+    E = w.shape[0]
+    if expert_in_norms.shape != (E, w.shape[2]):
+        raise ValueError(f"expert_in_norms {tuple(expert_in_norms.shape)} != [E={E}, in={w.shape[2]}]")
+    packs = [pack_sparse_weight(w[e], frac, expert_in_norms[e], bits=bits, block=block) for e in range(E)]
+    vfield = "codes" if "codes" in packs[0] else "vals"
+
+    out = {"num_experts": torch.tensor([E], dtype=torch.int32),
+           "vals_are_codes": torch.tensor([vfield == "codes"], dtype=torch.int32)}
+    for field in _FIXED_EXPERT_FIELDS:
+        if field in packs[0]:
+            out[field] = torch.stack([p[field] for p in packs], dim=0)
+    out["vlen"] = torch.tensor([p[vfield].shape[0] for p in packs], dtype=torch.int64)
+    out[vfield] = torch.cat([p[vfield] for p in packs], dim=0)
+    return out
+
+
+def unpack_expert_slab(packed: dict, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """Inverse of ``pack_expert_slab`` → the dense degraded slab ``[E, out, in]``."""
+    E = int(packed["num_experts"].item())
+    vfield = "codes" if int(packed["vals_are_codes"].item()) else "vals"
+    lens = packed["vlen"].tolist()
+    off = 0
+    mats = []
+    for e in range(E):
+        pe = {f: packed[f][e] for f in _FIXED_EXPERT_FIELDS if f in packed}
+        pe[vfield] = packed[vfield][off:off + lens[e]]
+        off += lens[e]
+        mats.append(unpack_sparse_weight(pe, dtype))
+    return torch.stack(mats, dim=0)
+
+
 def unpack_sparse_weight(packed: dict, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """Inverse of ``pack_sparse_weight`` → the dense degraded weight (``dtype``)."""
     out, inf = (int(x) for x in packed["shape"].tolist())

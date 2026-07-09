@@ -25,6 +25,7 @@ from parallm.slicer.base import (
     PerHead,
     Replicated,
     Rowwise,
+    build_decoder_layer_specs,
 )
 
 
@@ -97,26 +98,14 @@ def mlp_specs(_text_cfg: Any) -> LayerSpec:
 
 
 def decoder_layer_specs(text_cfg: Any, layer_type: str) -> LayerSpec:
-    """All sliceable params under one decoder layer (with prefixes)."""
-    out: LayerSpec = {}
-    # Input/post norms on hidden_size are kept replicated; each track holds
-    # the same RMS scale and applies it to its track-local residual stream.
-    out["input_layernorm.weight"] = Replicated()
-    out["post_attention_layernorm.weight"] = Replicated()
-
-    if layer_type == "full_attention":
-        for k, v in full_attention_specs(text_cfg).items():
-            out[f"self_attn.{k}"] = v
-    elif layer_type == "linear_attention":
-        for k, v in linear_attention_specs(text_cfg).items():
-            out[f"linear_attn.{k}"] = v
-    else:
-        raise ValueError(f"Unknown layer_type {layer_type!r}")
-
-    for k, v in mlp_specs(text_cfg).items():
-        out[f"mlp.{k}"] = v
-
-    return out
+    """All sliceable params under one dense decoder layer (with prefixes)."""
+    return build_decoder_layer_specs(
+        text_cfg,
+        layer_type,
+        full_attention_specs=full_attention_specs,
+        linear_attention_specs=linear_attention_specs,
+        mlp_specs=mlp_specs,
+    )
 
 
 def top_level_specs(_text_cfg: Any) -> LayerSpec:

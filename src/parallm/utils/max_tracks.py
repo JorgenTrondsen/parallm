@@ -104,3 +104,20 @@ def _qwen3_5_constraints(cfg) -> ConstraintSet:
             int(cfg.intermediate_size),
         ),
     )
+
+
+@register_constraints("qwen3_5_moe_text")
+def _qwen3_5_moe_constraints(cfg) -> ConstraintSet:
+    # Same attention constraints as dense; MLP is MoE so N must divide the expert
+    # width and the shared-expert width. num_experts is replicated (router runs in
+    # full on every track) so it imposes no divisibility constraint.
+    return ConstraintSet(
+        num_attention_heads=int(cfg.num_attention_heads),
+        num_key_value_heads=int(cfg.num_key_value_heads),
+        divides=(
+            int(cfg.linear_num_key_heads),
+            int(cfg.linear_num_value_heads),
+            int(cfg.moe_intermediate_size),
+            int(cfg.shared_expert_intermediate_size),
+        ),
+    )

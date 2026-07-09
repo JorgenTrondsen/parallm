@@ -368,3 +368,33 @@ class GatedQColwise:
 # its slicer spec. A `LayerSpec` is a dict that callers use to slice every
 # parameter in one layer.
 LayerSpec = dict[str, "SlicerSpec"]
+
+
+def build_decoder_layer_specs(
+    text_cfg,
+    layer_type: str,
+    *,
+    full_attention_specs,
+    linear_attention_specs,
+    mlp_specs,
+) -> LayerSpec:
+    """Assemble one decoder layer's specs: replicated norms + the attention specs
+    for `layer_type` (prefixed `self_attn.`/`linear_attn.`) + the MLP specs
+    (prefixed `mlp.`). Model families supply the three spec functions; this shape
+    is identical across dense and MoE.
+    """
+    out: LayerSpec = {
+        "input_layernorm.weight": Replicated(),
+        "post_attention_layernorm.weight": Replicated(),
+    }
+    if layer_type == "full_attention":
+        prefix, specs = "self_attn", full_attention_specs(text_cfg)
+    elif layer_type == "linear_attention":
+        prefix, specs = "linear_attn", linear_attention_specs(text_cfg)
+    else:
+        raise ValueError(f"Unknown layer_type {layer_type!r}")
+    for k, v in specs.items():
+        out[f"{prefix}.{k}"] = v
+    for k, v in mlp_specs(text_cfg).items():
+        out[f"mlp.{k}"] = v
+    return out

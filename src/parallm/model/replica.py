@@ -79,12 +79,15 @@ def block_wanda_prune_weight(w: torch.Tensor, frac: float, in_norms: torch.Tenso
     return wf.to(w.dtype)
 
 
-# One capture module per DISTINCT Linear input space in a dense decoder layer;
-# siblings (k/v ≡ q; z/b/a ≡ qkv; up ≡ gate) reuse it via _WANDA_KEY.
+# One capture module per DISTINCT Linear input space in a decoder layer; siblings
+# (k/v ≡ q; z/b/a ≡ qkv; up ≡ gate) reuse it via _WANDA_KEY. The `mlp.shared_expert.*`
+# entries only exist on MoE layers — dense layers skip them (get_submodule fails);
+# the MoE routed experts are 3-D Parameters, calibrated separately (collect_expert_input_norms).
 _WANDA_CAPTURE = (
     "self_attn.q_proj", "self_attn.o_proj",
     "linear_attn.in_proj_qkv", "linear_attn.out_proj",
     "mlp.gate_proj", "mlp.down_proj",
+    "mlp.shared_expert.gate_proj", "mlp.shared_expert.down_proj",
 )
 _WANDA_KEY = {
     "self_attn.q_proj": "self_attn.q_proj",
@@ -99,6 +102,10 @@ _WANDA_KEY = {
     "mlp.gate_proj": "mlp.gate_proj",
     "mlp.up_proj": "mlp.gate_proj",
     "mlp.down_proj": "mlp.down_proj",
+    # MoE shared expert (a normal dense MLP alongside the routed experts).
+    "mlp.shared_expert.gate_proj": "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj": "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.down_proj": "mlp.shared_expert.down_proj",
 }
 
 
@@ -137,6 +144,54 @@ def collect_input_norms(text_model, batches, device) -> "dict[str, torch.Tensor]
         for h in hooks:
             h.remove()
     return {k: v.sqrt().cpu() for k, v in acc.items()}
+
+
+def collect_expert_input_norms(model, batches, device) -> "dict[int, tuple[torch.Tensor, torch.Tensor]]":
+    """Wanda calibration for MoE routed experts (fused 3-D layout). A pre-hook on
+    each ``mlp.experts`` accumulates, PER EXPERT, the squared input norms of the
+    tokens actually routed to it: for ``gate_up_proj`` the input is the routed
+    hidden (dim=hidden); for ``down_proj`` it is ``act(gate)*up`` recomputed with
+    the exact weights (dim=moe_intermediate). Returns ``{layer_idx: (gate_up_norm
+    [E, hidden], down_norm[E, moe_inter])}`` — the per-expert vectors the packer
+    slices per track (gate_up reads the full hidden; down reads the track's
+    intermediate slice). No-op (empty) on a dense model with no experts."""
+    from transformers.activations import ACT2FN
+    tcfg = getattr(model.config, "text_config", model.config)
+    act = ACT2FN[tcfg.hidden_act]
+    acc: "dict[int, list[torch.Tensor]]" = {}
+    handles = []
+
+    def _mk(li):
+        def pre(mod, args):
+            hidden, top_k_index = args[0], args[1]
+            E, H, I = mod.num_experts, mod.hidden_dim, mod.intermediate_dim
+            if li not in acc:
+                acc[li] = [torch.zeros(E, H, dtype=torch.float64),
+                           torch.zeros(E, I, dtype=torch.float64)]
+            mask = torch.nn.functional.one_hot(top_k_index, E).permute(2, 1, 0)  # E, top_k, tok
+            for e in mask.sum(dim=(-1, -2)).nonzero().flatten().tolist():
+                _, tok = torch.where(mask[e])
+                x = hidden[tok]  # (t, H) exact routed hidden
+                acc[li][0][e] += x.double().pow(2).sum(0).cpu()
+                gate, up = torch.nn.functional.linear(x, mod.gate_up_proj[e]).chunk(2, dim=-1)
+                acc[li][1][e] += (act(gate) * up).double().pow(2).sum(0).cpu()
+        return pre
+
+    m = getattr(model, "model", model)          # CausalLM/ConditionalGeneration wrap, or a bare text model
+    lm = getattr(m, "language_model", m)        # ConditionalGeneration nests a language_model
+    for li, layer in enumerate(lm.layers):
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and hasattr(mlp, "experts") and hasattr(mlp, "gate"):
+            handles.append(mlp.experts.register_forward_pre_hook(_mk(li)))
+    try:
+        with torch.no_grad():
+            for b in batches:
+                ids = b["input_ids"].to(device)
+                model(input_ids=ids, use_cache=False)
+    finally:
+        for h in handles:
+            h.remove()
+    return {li: (gu.sqrt().float(), dn.sqrt().float()) for li, (gu, dn) in acc.items()}
 
 
 def norms_for(input_norms: "dict[str, torch.Tensor]", n_tracks: int,

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
+
 from parallm.adapters import ModelAdapter, register_model_adapter
 from parallm.model.tracks.qwen3_5 import (
     PTTrackTextModel,
@@ -38,6 +40,7 @@ QWEN3_5_ADAPTER = ModelAdapter(
         "input_layernorm",
         "post_attention_layernorm",
     ),
+    full_text_model_cls=Qwen3_5TextModel,
 )
 
 register_model_adapter(QWEN3_5_ADAPTER)

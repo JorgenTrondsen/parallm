@@ -33,9 +33,9 @@ class PTManifest:
     top_level_owners: dict[str, int] = field(default_factory=dict)
     # Sync layer indices (after which an all-reduce fires). The schedule is no
     # longer chosen at conversion time — the train script places it dynamically
-    # on the most sensitive layers (see `place_sync_boundaries`) and writes the
-    # chosen indices here when it saves a checkpoint. `None` in a fresh convert
-    # output (weights are schedule-independent, so the slicer needn't pick one).
+    # on the most sensitive layers and writes the chosen indices here when it
+    # saves a checkpoint. `None` in a fresh convert output (weights are
+    # schedule-independent, so the slicer needn't pick one).
     sync_layer_indices: list[int] | None = None
 
 
@@ -108,43 +108,6 @@ def _resolve_sync_schedule(
             f"non-uniform schedules are not supported yet."
         )
     return [i for i in range(block_depth - 1, num_layers, block_depth)]
-
-
-def place_sync_boundaries(
-    num_layers: int,
-    num_boundaries: int,
-    sensitivity: "dict[int, float] | list[float]",
-) -> list[int]:
-    """Place ``num_boundaries`` sync points on the most sensitive layers.
-
-    The sync schedule is chosen dynamically at train time from a per-layer
-    sensitivity score (higher = the un-synced *partial* residual leaving that
-    layer is more wrong, so a sync there helps more — typically
-    ``rel_err_partial`` from ``partial_residual_probe``). Given a communication
-    budget of ``num_boundaries`` all-reduces, this spends them where they matter.
-
-    A sync after the **last** layer (``num_layers-1``) is always included: the
-    forward only refreshes the residual fed to the post-stack norm at a sync
-    boundary (see ``PTWrappedModel.forward``), so without it the norm / lm_head
-    would read a stale hidden missing the final layers — a correctness
-    requirement, not a sensitivity choice. The remaining ``num_boundaries-1``
-    boundaries are the highest-sensitivity layers among ``0..num_layers-2``.
-    Ties break by (lower) layer index for determinism, so every rank that feeds
-    in the same (all-reduced, identical) sensitivity returns the same schedule.
-
-    Returns sorted 0-based indices "after which an all-reduce fires".
-    """
-    if num_boundaries < 1:
-        raise ValueError(f"num_boundaries must be >= 1, got {num_boundaries}")
-    if num_boundaries > num_layers:
-        raise ValueError(
-            f"num_boundaries {num_boundaries} exceeds num_layers {num_layers}"
-        )
-    forced = num_layers - 1
-    candidates = list(range(num_layers - 1))
-    ranked = sorted(candidates, key=lambda L: (-float(sensitivity[L]), L))
-    chosen = {forced} | set(ranked[: num_boundaries - 1])
-    return sorted(chosen)
 
 
 def _apply_layer_specs(

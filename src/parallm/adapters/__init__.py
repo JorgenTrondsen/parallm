@@ -42,6 +42,11 @@ class ModelAdapter:
     # Sub-module prefixes (under `layers.{i}.*`) that the slicer emits and
     # that need to be re-routed under `text_models.{k}.layers.{i}.*` at load time.
     state_dict_layer_prefixes: tuple[str, ...]
+    # ----- Full (unsliced) text model -----
+    # The HF text-model class used to instantiate the *dense* model for replica
+    # calibration (its state_dict keys match the slicer's canonical `layers.*`
+    # names). Optional so lightweight/test adapters can omit it.
+    full_text_model_cls: type | None = None
 
 
 _REGISTRY: dict[str, ModelAdapter] = {}
@@ -80,3 +85,4 @@ def list_registered() -> list[str]:
 
 # Import-time adapter registrations. Add one line per shipped adapter.
 from parallm.adapters import qwen3_5 as _qwen3_5  # noqa: E402,F401
+from parallm.adapters import qwen3_5_moe as _qwen3_5_moe  # noqa: E402,F401
