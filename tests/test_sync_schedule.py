@@ -1,7 +1,7 @@
 """Verify the sync-block-depth → layer-indices mapping."""
 from __future__ import annotations
 
-from pt_converter.slicer.convert import _resolve_sync_schedule
+from parallm.slicer.convert import _resolve_sync_schedule
 
 # Qwen3.5 layer pattern: full-attention every 4th layer (indices 3, 7, ..., 31).
 QWEN_LAYER_TYPES = [

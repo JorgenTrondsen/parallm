@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from pt_converter.eval.downstream import (
+from parallm.eval.downstream import (
     aggregate_downstream_score,
     gather_full_logits,
 )

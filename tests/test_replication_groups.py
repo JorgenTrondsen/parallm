@@ -3,13 +3,13 @@
 `replication_groups(n_tracks)` partitions tracks into sets that hold
 *identical* slices. The trainer uses this partition to keep replicated
 copies bit-identical under gradient updates. See
-[src/pt_converter/train/sync_grads.py](src/pt_converter/train/sync_grads.py).
+[src/parallm/train/sync_grads.py](src/parallm/train/sync_grads.py).
 """
 from __future__ import annotations
 
 import pytest
 
-from pt_converter.slicer.base import (
+from parallm.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,
@@ -19,7 +19,7 @@ from pt_converter.slicer.base import (
     Replicated,
     Rowwise,
 )
-from pt_converter.train.sync_grads import get_replication_groups
+from parallm.train.sync_grads import get_replication_groups
 
 
 def test_replicated_one_group_with_all_tracks():

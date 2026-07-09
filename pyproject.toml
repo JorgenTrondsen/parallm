@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pt-converter"
+name = "parallm"
 version = "0.1.0"
-description = "Convert pretrained dense/MoE models into Parallel-Track form via SPD-style distillation."
+description = "Slice a dense LLM into parallel tracks with cheap sparse cross-track replicas for low-sync distributed inference."
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.4",

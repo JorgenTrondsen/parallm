@@ -35,11 +35,11 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
-from pt_converter.dist.groups import build_groups
-from pt_converter.eval.fidelity import fidelity_step
-from pt_converter.model.pt_model import PTWrappedModel
-from pt_converter.train.data import (
+from parallm.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
+from parallm.dist.groups import build_groups
+from parallm.eval.fidelity import fidelity_step
+from parallm.model.pt_model import PTWrappedModel
+from parallm.train.data import (
     DEFAULT_PRESET,
     CalibrationDataConfig,
     PackedTokenStream,
@@ -47,8 +47,8 @@ from pt_converter.train.data import (
     preset_names,
     preset_sources,
 )
-from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_cross_head, load_manifest, load_track
+from parallm.train.teacher import HookedTeacher
+from parallm.utils.checkpoint import load_manifest, load_track
 
 
 def _log(rank: int, msg: str) -> None:
@@ -106,20 +106,6 @@ def main() -> int:
                         "semantics as training's --intra-window-mse), so they localize where "
                         "inside a window the free-running error grows at D>=2. Hooks the "
                         "teacher at every layer and adds one all-reduce per mid-window layer.")
-    p.add_argument("--report-chp", action="store_true",
-                   help="If a fresh cross-head estimator is attached, also report the per-layer "
-                        "predict accuracy chp = relMSE(ghat, ΣY) on eval data (the training metric, "
-                        "but de-noised over --chp-batches), alongside each layer's gate magnitude "
-                        "(how much the MLP relies on the predictor there).")
-    p.add_argument("--chp-batches", type=int, default=10,
-                   help="Number of eval batches for the --report-chp / --report-seam pass.")
-    p.add_argument("--report-seam", action="store_true",
-                   help="If ANY cross-head estimator (fresh OR stale) is attached, report the "
-                        "per-layer seam-fidelity decomposition: how far the actual injected MLP "
-                        "input lands from the dense teacher's true input X_teacher+Y_teacher, split "
-                        "into residual_drift / oracle_seam (perfect-substitute ceiling) / seam_total "
-                        "/ substitute_err / stale_ratio (see model.pt_model._accumulate_seam). The "
-                        "headroom for a better substitute is seam_total − oracle_seam.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -199,11 +185,6 @@ def main() -> int:
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
-    # Cross-head estimator sidecar (if trained): rebuild + attach so the seam
-    # forward is used in eval (else the trained gains are invisible).
-    _ch = load_cross_head(args.checkpoint_dir)
-    if _ch is not None:
-        student.cross_head = _ch.to(torch.cuda.current_device()).to(torch.bfloat16)
     wrap_student_with_fsdp(student, layout)
     student.eval()
 
@@ -289,86 +270,6 @@ def main() -> int:
                 tag = "      " if layer_idx in boundary_set else " (mid)"
             print(f"    layer {layer_idx:3d}{tag}: raw={raw:.6e}  rel={rel:.6e}")
         print()
-
-    # ----- Optional: per-layer predictor accuracy (chp) of the attached fresh
-    # estimator, plus each layer's gate magnitude. chp is identical on every rank
-    # (ΣY is all-reduced and the predictor is replicated), so rank 0 prints. -----
-    if args.report_chp and getattr(student, "cross_head", None) is not None \
-            and student.cross_head.backend in (
-                "fresh", "fresh_yself", "temporal", "oracle_lowrank", "stale_corr"):
-        nL = len(student.text_models[0].layers)
-        student._collect_chp = True
-        student._chp_sums = torch.zeros(nL, device=torch.cuda.current_device())
-        nb = 0
-        for batch in loader:
-            if nb >= args.chp_batches:
-                break
-            batch = {k: v.to(torch.cuda.current_device(), non_blocking=True) for k, v in batch.items()}
-            if batch["input_ids"].ndim == 1:
-                batch = {k: v.unsqueeze(0) for k, v in batch.items()}
-            with torch.no_grad():
-                student(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
-            nb += 1
-        student._collect_chp = False
-        chp = (student._chp_sums / max(1, nb)).cpu()
-        if rank == 0:
-            gate = student.cross_head.gate.detach().float()
-            gnorm = gate.norm(dim=1).cpu()
-            gabs = gate.abs().mean(dim=1).cpu()
-            print(f"===== Cross-head predictor accuracy over {nb} batches "
-                  f"(chp = relMSE(ghat, ΣY); lower = better prediction) =====")
-            print("    layer :   chp     gateL2   mean|gate|")
-            for li in range(nL):
-                print(f"    {li:5d} : {chp[li]:.4f}   {gnorm[li]:.4f}    {gabs[li]:.5f}")
-            print(f"  mean chp = {chp.mean():.4f}   sum over layers = {chp.sum():.4f}   "
-                  f"(≈ training 'chp'); mean gate L2 = {gnorm.mean():.4f}")
-            print()
-
-    # ----- Optional: per-layer SEAM-fidelity decomposition (both backends).
-    # Compares the actual injected MLP input to the dense teacher's true input
-    # X_teacher+Y_teacher. Needs the teacher's per-layer token-mixer output, so we
-    # re-hook the teacher at every layer with capture_token_mixer=True. Each metric
-    # is rank-identical after the in-model track-group reduce, so rank 0 prints. -----
-    if args.report_seam and getattr(student, "cross_head", None) is not None:
-        nL = len(student.text_models[0].layers)
-        teacher.capture_token_mixer = True
-        teacher.set_hook_indices(range(nL))
-        names = ["seam_total", "oracle_seam", "substitute_err", "residual_drift", "stale_ratio"]
-        dev = torch.cuda.current_device()
-        student._seam_sums = {n: torch.zeros(nL, device=dev) for n in names}
-        student._collect_seam = True
-        nb = 0
-        for batch in loader:
-            if nb >= args.chp_batches:
-                break
-            batch = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
-            if batch["input_ids"].ndim == 1:
-                batch = {k: v.unsqueeze(0) for k, v in batch.items()}
-            with torch.no_grad():
-                # Teacher first → populates last_token_mixer = {L: (X_t, Y_t)};
-                # need_logits=False skips the lm_head matmul.
-                teacher.forward(batch["input_ids"], attention_mask=batch.get("attention_mask"),
-                                need_logits=False)
-                student._seam_teacher = teacher.last_token_mixer
-                student(input_ids=batch["input_ids"], attention_mask=batch.get("attention_mask"))
-            nb += 1
-        student._collect_seam = False
-        student._seam_teacher = None
-        seam = {n: (student._seam_sums[n] / max(1, nb)).cpu() for n in names}
-        if rank == 0:
-            print(f"===== Cross-head seam fidelity over {nb} batches "
-                  f"(backend={student.cross_head.backend}; relMSE vs teacher X+Y) =====")
-            print("    layer : seam_total  oracle(ceil)  headroom  substit_err  resid_drift  stale_ratio")
-            for li in range(nL):
-                hr = seam["seam_total"][li] - seam["oracle_seam"][li]
-                print(f"    {li:5d} : {seam['seam_total'][li]:9.4f}  {seam['oracle_seam'][li]:9.4f}  "
-                      f"{hr:8.4f}  {seam['substitute_err'][li]:9.4f}  "
-                      f"{seam['residual_drift'][li]:9.4f}  {seam['stale_ratio'][li]:9.4f}")
-            mt, mo = seam["seam_total"].mean(), seam["oracle_seam"].mean()
-            print(f"  mean: seam_total={mt:.4f}  oracle_seam={mo:.4f}  "
-                  f"headroom(seam−oracle)={mt - mo:.4f}  substitute_err={seam['substitute_err'].mean():.4f}  "
-                  f"residual_drift={seam['residual_drift'].mean():.4f}  stale_ratio={seam['stale_ratio'].mean():.4f}")
-            print()
 
     teacher.remove_hooks()
     dist.destroy_process_group()

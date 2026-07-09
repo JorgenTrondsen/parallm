@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pt_converter.utils.max_tracks import max_tracks_for_config, valid_track_counts
+from parallm.utils.max_tracks import max_tracks_for_config, valid_track_counts
 
 
 def _fake_qwen3_5_cfg(**overrides):

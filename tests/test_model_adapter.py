@@ -12,16 +12,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-# Importing pt_converter triggers built-in adapter registration.
-import pt_converter  # noqa: F401
-from pt_converter.adapters import (
+# Importing parallm triggers built-in adapter registration.
+import parallm  # noqa: F401
+from parallm.adapters import (
     ModelAdapter,
     get_adapter_for_config,
     list_registered,
     register_model_adapter,
 )
-from pt_converter.slicer.base import Colwise, LayerSpec, Replicated
-from pt_converter.slicer.qwen3_5 import decoder_layer_specs, top_level_specs
+from parallm.slicer.base import Colwise, LayerSpec, Replicated
+from parallm.slicer.qwen3_5 import decoder_layer_specs, top_level_specs
 
 
 def test_qwen3_5_adapter_is_registered_at_import_time():
@@ -185,14 +185,14 @@ def test_slicer_engine_uses_adapter_layer_types(monkeypatch):
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-    from pt_converter.adapters import get_adapter_for_config as _real_resolver
-    from pt_converter.model.tracks.qwen3_5 import (
+    from parallm.adapters import get_adapter_for_config as _real_resolver
+    from parallm.model.tracks.qwen3_5 import (
         PTTrackTextModel,
         build_per_track_text_config,
     )
-    from pt_converter.slicer.convert import slice_model_to_tracks
-    from pt_converter.slicer.qwen3_5 import decoder_layer_specs as _real_layer_specs
-    from pt_converter.slicer.qwen3_5 import top_level_specs as _real_top_specs
+    from parallm.slicer.convert import slice_model_to_tracks
+    from parallm.slicer.qwen3_5 import decoder_layer_specs as _real_layer_specs
+    from parallm.slicer.qwen3_5 import top_level_specs as _real_top_specs
 
     # Build a tiny Qwen3.5 model whose config has layer_types entirely
     # "linear_attention" (8 layers).

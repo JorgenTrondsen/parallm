@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch import nn
 
-from pt_converter.train.sync_grads import (
+from parallm.train.sync_grads import (
     ReplicationCoordGroup,
     assert_replicated_consistent,
     sync_replicated_grads,
@@ -195,7 +195,7 @@ def _tiny_qwen3_5_config():
 
 def _make_single_rank_layout(n_tracks: int):
     """Construct a ProcessGroupLayout for a single-process test (no dist init)."""
-    from pt_converter.dist.groups import ProcessGroupLayout
+    from parallm.dist.groups import ProcessGroupLayout
 
     return ProcessGroupLayout(
         world_size=1,
@@ -219,10 +219,10 @@ def test_build_replication_plan_on_tiny_qwen3_5_n4():
     import torch.nn as nn
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-    from pt_converter.adapters import get_adapter_for_config
-    from pt_converter.model.pt_model import PTWrappedModel
-    from pt_converter.slicer.convert import slice_model_to_tracks
-    from pt_converter.train.sync_grads import build_replication_plan
+    from parallm.adapters import get_adapter_for_config
+    from parallm.model.pt_model import PTWrappedModel
+    from parallm.slicer.convert import slice_model_to_tracks
+    from parallm.train.sync_grads import build_replication_plan
 
     cfg = _tiny_qwen3_5_config()
     torch.manual_seed(7)
@@ -277,7 +277,7 @@ def test_asymmetric_layout_track_to_rank_lookup():
     track_to_rank and local_track_ids, and that a replication group spanning
     multiple ranks resolves to the right rank-set via the new lookup —
     matching what sync_grads.build_replication_plan does at line 143."""
-    from pt_converter.dist.groups import compute_contiguous_assignment
+    from parallm.dist.groups import compute_contiguous_assignment
 
     n_tracks = 16
     world_size = 8
@@ -333,8 +333,8 @@ def _build_tiny_student(seed: int):
     import torch.nn as nn
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-    from pt_converter.model.pt_model import PTWrappedModel
-    from pt_converter.slicer.convert import slice_model_to_tracks
+    from parallm.model.pt_model import PTWrappedModel
+    from parallm.slicer.convert import slice_model_to_tracks
 
     cfg = _tiny_qwen3_5_config()
     torch.manual_seed(seed)
@@ -371,8 +371,8 @@ def test_force_sync_keeps_replicas_identical():
     """Under force_sync (legacy), one backward+sync+step must keep every
     replicated parameter — including the full-attention head params — bit-
     identical across local tracks."""
-    from pt_converter.adapters import get_adapter_for_config
-    from pt_converter.train.sync_grads import (
+    from parallm.adapters import get_adapter_for_config
+    from parallm.train.sync_grads import (
         assert_replicated_consistent,
         build_replication_plan,
         sync_replicated_grads,
@@ -411,8 +411,8 @@ def test_default_diverges_attention_heads_but_keeps_norms_synced():
     """Default mode: one backward+sync+step must (a) keep the synced norms
     bit-identical and (b) let the full-attention k_proj copies DIVERGE across
     tracks (they are absent from the replication plan)."""
-    from pt_converter.adapters import get_adapter_for_config
-    from pt_converter.train.sync_grads import (
+    from parallm.adapters import get_adapter_for_config
+    from parallm.train.sync_grads import (
         assert_replicated_consistent,
         build_replication_plan,
         sync_replicated_grads,

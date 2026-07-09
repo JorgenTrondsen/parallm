@@ -21,9 +21,9 @@ import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoConfig
 
-from pt_converter.slicer.convert import slice_model_to_tracks
-from pt_converter.utils.checkpoint import save_tracks
-from pt_converter.utils.max_tracks import max_tracks_for_config
+from parallm.slicer.convert import slice_model_to_tracks
+from parallm.utils.checkpoint import save_tracks
+from parallm.utils.max_tracks import max_tracks_for_config
 
 
 def main() -> int:

@@ -10,7 +10,7 @@ Distributed pattern: every rank runs identical lm-eval code (same seed → same
 request ordering). The student's non-owner ranks emit zero placeholders but
 still execute the forward so cross-track SyncBoundary collectives match the
 owner rank; only rank 0 prints / saves results. See
-``src/pt_converter/eval/lm_eval_adapter.py``.
+``src/parallm/eval/lm_eval_adapter.py``.
 
 Single node, 8 GPUs, compare student vs teacher on the default task set:
 
@@ -38,17 +38,17 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from pt_converter.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
-from pt_converter.dist.groups import build_groups
-from pt_converter.eval.lm_eval_adapter import (
+from parallm.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
+from parallm.dist.groups import build_groups
+from parallm.eval.lm_eval_adapter import (
     PTLM,
     is_lm_head_owner,
     make_student_forward_fn,
     make_teacher_forward_fn,
 )
-from pt_converter.model.pt_model import PTWrappedModel
-from pt_converter.train.teacher import HookedTeacher
-from pt_converter.utils.checkpoint import load_cross_head, load_manifest, load_track
+from parallm.model.pt_model import PTWrappedModel
+from parallm.train.teacher import HookedTeacher
+from parallm.utils.checkpoint import load_cross_head, load_manifest, load_track
 
 
 def _log(rank: int, msg: str) -> None:

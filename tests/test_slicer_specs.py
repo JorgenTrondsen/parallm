@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from pt_converter.slicer.base import (
+from parallm.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,

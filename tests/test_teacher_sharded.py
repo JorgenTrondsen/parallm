@@ -23,7 +23,7 @@ torch.set_default_dtype(torch.float32)
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-from pt_converter.train.teacher import HookedTeacher
+from parallm.train.teacher import HookedTeacher
 
 HOOK_INDICES = [3, 7]
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from pt_converter.train.data import (
+from parallm.train.data import (
     DEFAULT_PRESET,
     CalibrationDataConfig,
     DataSourceSpec,

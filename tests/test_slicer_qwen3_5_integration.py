@@ -16,7 +16,7 @@ torch.set_default_dtype(torch.float32)
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
-from pt_converter.slicer.base import (
+from parallm.slicer.base import (
     Colwise,
     FusedSegmentColwise,
     GatedQColwise,
@@ -25,8 +25,8 @@ from pt_converter.slicer.base import (
     Replicated,
     Rowwise,
 )
-from pt_converter.slicer.convert import slice_model_to_tracks
-from pt_converter.slicer.qwen3_5 import decoder_layer_specs
+from parallm.slicer.convert import slice_model_to_tracks
+from parallm.slicer.qwen3_5 import decoder_layer_specs
 
 
 def _tiny_config():
