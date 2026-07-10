@@ -10,14 +10,13 @@ Track-count rule (KV-replicated max-parallelism):
          and linear_num_value_heads % N == 0
       4. intermediate_size % N == 0
 
-This is model-agnostic: each model_type registers a function that returns
-a `ConstraintSet` and we scan N downward from num_attention_heads to the
-first N that satisfies every constraint.
+This is model-agnostic: each family's `ModelAdapter` supplies a `constraints`
+callback returning a `ConstraintSet`, and we scan N downward from
+num_attention_heads to the first N that satisfies every constraint.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -33,17 +32,6 @@ class ConstraintSet:
     num_attention_heads: int
     num_key_value_heads: int
     divides: tuple[int, ...]  # extra dims N must divide (linear_num_*, intermediate_size, ...)
-
-
-_CONSTRAINT_PROVIDERS: dict[str, Callable[[object], ConstraintSet]] = {}
-
-
-def register_constraints(model_type: str):
-    def _wrap(fn: Callable[[object], ConstraintSet]):
-        _CONSTRAINT_PROVIDERS[model_type] = fn
-        return fn
-
-    return _wrap
 
 
 def _candidates_in_range(constraints: ConstraintSet) -> list[int]:
@@ -79,45 +67,20 @@ def valid_track_counts(config) -> list[int]:
 
 
 def _constraints_from_config(config) -> ConstraintSet:
-    model_type = getattr(config, "model_type", None)
-    if model_type in _CONSTRAINT_PROVIDERS:
-        return _CONSTRAINT_PROVIDERS[model_type](config)
-    text_cfg = getattr(config, "text_config", None)
-    if text_cfg is not None:
-        text_model_type = getattr(text_cfg, "model_type", None)
-        if text_model_type in _CONSTRAINT_PROVIDERS:
-            return _CONSTRAINT_PROVIDERS[text_model_type](text_cfg)
-    raise NotImplementedError(
-        f"No constraint provider registered for model_type={model_type!r}. "
-        f"Register one via @register_constraints in parallm.utils.max_tracks."
-    )
+    # The adapter registry is the single source of model knowledge: resolve the
+    # right adapter (by config.model_type, else text_config.model_type) and ask it
+    # for its `constraints`. Imported lazily to avoid an import cycle
+    # (`parallm.adapters` imports this module for `ConstraintSet`).
+    from parallm.adapters import get_adapter_for_config
 
-
-@register_constraints("qwen3_5_text")
-def _qwen3_5_constraints(cfg) -> ConstraintSet:
-    return ConstraintSet(
-        num_attention_heads=int(cfg.num_attention_heads),
-        num_key_value_heads=int(cfg.num_key_value_heads),
-        divides=(
-            int(cfg.linear_num_key_heads),
-            int(cfg.linear_num_value_heads),
-            int(cfg.intermediate_size),
-        ),
-    )
-
-
-@register_constraints("qwen3_5_moe_text")
-def _qwen3_5_moe_constraints(cfg) -> ConstraintSet:
-    # Same attention constraints as dense; MLP is MoE so N must divide the expert
-    # width and the shared-expert width. num_experts is replicated (router runs in
-    # full on every track) so it imposes no divisibility constraint.
-    return ConstraintSet(
-        num_attention_heads=int(cfg.num_attention_heads),
-        num_key_value_heads=int(cfg.num_key_value_heads),
-        divides=(
-            int(cfg.linear_num_key_heads),
-            int(cfg.linear_num_value_heads),
-            int(cfg.moe_intermediate_size),
-            int(cfg.shared_expert_intermediate_size),
-        ),
-    )
+    try:
+        adapter = get_adapter_for_config(config)
+    except KeyError as e:
+        raise NotImplementedError(str(e)) from e
+    if adapter.constraints is None:
+        raise NotImplementedError(
+            f"adapter {adapter.model_type!r} has no `constraints` for the max-tracks scan"
+        )
+    # Every adapter callback operates on the *text config*.
+    text_cfg = config if getattr(config, "model_type", None) == adapter.model_type else config.text_config
+    return adapter.constraints(text_cfg)

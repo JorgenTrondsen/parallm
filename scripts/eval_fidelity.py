@@ -35,7 +35,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from parallm.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
+from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
 from parallm.eval.fidelity import fidelity_step
 from parallm.model.pt_model import PTWrappedModel
@@ -185,7 +185,6 @@ def main() -> int:
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
-    wrap_student_with_fsdp(student, layout)
     student.eval()
 
     # ----- Data. PackedTokenStream is reused as-is; switching dataset is just

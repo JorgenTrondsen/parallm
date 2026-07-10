@@ -1,18 +1,11 @@
 """Unit tests for the in-loop downstream-selection scorer (eval/downstream.py).
 
-Only the pure pieces (no lm_eval, no GPUs): the metric aggregation that turns an
-lm-eval ``simple_evaluate`` dict into a single selection scalar, and the
-non-vocab-parallel passthrough of the logit gather.
+Only the pure piece (no lm_eval, no GPUs): the metric aggregation that turns an
+lm-eval ``simple_evaluate`` dict into a single selection scalar.
 """
-from types import SimpleNamespace
-
 import pytest
-import torch
 
-from parallm.eval.downstream import (
-    aggregate_downstream_score,
-    gather_full_logits,
-)
+from parallm.eval.downstream import aggregate_downstream_score
 
 
 def _results(**task_metrics):
@@ -57,18 +50,3 @@ def test_empty_or_none_results_is_zero():
     assert aggregate_downstream_score(None) == 0.0
     assert aggregate_downstream_score({}) == 0.0
     assert aggregate_downstream_score(_results(), ["arc_challenge"]) == 0.0
-
-
-def test_gather_full_logits_non_vocab_parallel_passthrough():
-    # A student without vocab parallelism returns its logits unchanged (the
-    # owner already produced full (B, T, V) logits).
-    student = SimpleNamespace(vocab_parallel=False, vp_world_size=1)
-    logits = torch.randn(2, 3, 5)
-    assert gather_full_logits(student, logits) is logits
-
-
-def test_gather_full_logits_single_shard_passthrough():
-    # vocab_parallel flagged but world_size == 1 (single shard == full vocab).
-    student = SimpleNamespace(vocab_parallel=True, vp_world_size=1)
-    logits = torch.randn(1, 4, 7)
-    assert gather_full_logits(student, logits) is logits

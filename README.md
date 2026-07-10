@@ -33,9 +33,9 @@ little resident HBM.
    account it implements is measured by `scripts/bench_stream_overlap.py`.)*
 
 Optional **healing/training** of very sparse copies can reuse the primitives left
-in `parallm.train` (`teacher`, `losses`, `data`, `sync_grads`) — note the
-project's own experiments found plain wanda replicas are training-free and
-co-training them was flat, so treat this as a skeleton, not a required step.
+in `parallm.train` (`teacher`, `losses`, `data`) — note the project's own
+experiments found plain wanda replicas are training-free and co-training them was
+flat, so treat this as a skeleton, not a required step.
 
 ## Install
 
@@ -106,10 +106,9 @@ src/parallm/
 │   ├── pt_model.py     # PTWrappedModel: per-rank lockstep forward over K tracks + SyncBoundary
 │   ├── sync.py         # SyncBoundary: the one cross-track all-reduce
 │   ├── replica.py      # the payload: wanda/qwanda copies + collect_input_norms + degrade_track_layers
-│   ├── vocab_parallel.py  # embed/lm_head/KL-CE sharded over vocab (training memory primitive)
 │   └── tracks/qwen3_5.py  # per-track Qwen3.5 decoder
 ├── eval/           # fidelity.py, downstream.py, lm_eval_adapter.py
-├── train/          # healing skeleton: teacher.py, losses.py, data.py, sync_grads.py
+├── train/          # healing skeleton: teacher.py, losses.py, data.py
 ├── dist/           # groups.py (track/rank layout), fsdp_setup.py
 └── utils/          # checkpoint.py (safetensors IO), max_tracks.py
 scripts/            # convert / eval_fidelity / eval_lm_harness / bench_stream_overlap

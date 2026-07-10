@@ -209,9 +209,8 @@ class PackedTokenStream(IterableDataset):
                 buf = buf[seq_len:]
                 input_ids = torch.tensor(chunk[:-1], dtype=torch.long)
                 # labels aligned with input_ids (HF convention): labels[i] == input_ids[i].
-                # Every CE/NLL consumer (losses.lm_cross_entropy, distill CE, fidelity NLL)
-                # does the next-token shift internally, so labels MUST NOT be pre-shifted
-                # here — pre-shifting double-shifts and scores each prediction against
-                # token p+2 (near-random ppl for any model).
+                # The fidelity NLL consumer does the next-token shift internally, so labels
+                # MUST NOT be pre-shifted here — pre-shifting double-shifts and scores each
+                # prediction against token p+2 (near-random ppl for any model).
                 labels = input_ids.clone()
                 yield {"input_ids": input_ids, "labels": labels, "attention_mask": torch.ones(seq_len, dtype=torch.long)}

@@ -25,8 +25,7 @@ class SlicerSpec(Protocol):
     unique per track (one singleton group per track). Replicated-style specs carry
     a ``sync`` flag: when ``sync`` is False they return singleton groups (the copies
     are free to *diverge* under training), unless ``force_sync=True`` overrides it
-    back to a single shared group (the legacy bit-identical behaviour). See
-    ``parallm.train.sync_grads.get_replication_groups`` for the dispatch.
+    back to a single shared group (the legacy bit-identical behaviour).
     """
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor: ...

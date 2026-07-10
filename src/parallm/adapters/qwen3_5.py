@@ -17,11 +17,24 @@ from parallm.model.tracks.qwen3_5 import (
     build_per_track_text_config,
 )
 from parallm.slicer.qwen3_5 import decoder_layer_specs, top_level_specs
+from parallm.utils.max_tracks import ConstraintSet
 
 
 def _qwen3_5_get_layer_types(text_cfg: Any) -> list[str]:
     # Qwen3.5 ships explicit hybrid layer_types in the config.
     return list(text_cfg.layer_types)
+
+
+def _qwen3_5_constraints(cfg: Any) -> ConstraintSet:
+    return ConstraintSet(
+        num_attention_heads=int(cfg.num_attention_heads),
+        num_key_value_heads=int(cfg.num_key_value_heads),
+        divides=(
+            int(cfg.linear_num_key_heads),
+            int(cfg.linear_num_value_heads),
+            int(cfg.intermediate_size),
+        ),
+    )
 
 
 QWEN3_5_ADAPTER = ModelAdapter(
@@ -41,6 +54,7 @@ QWEN3_5_ADAPTER = ModelAdapter(
         "post_attention_layernorm",
     ),
     full_text_model_cls=Qwen3_5TextModel,
+    constraints=_qwen3_5_constraints,
 )
 
 register_model_adapter(QWEN3_5_ADAPTER)

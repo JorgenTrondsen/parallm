@@ -16,10 +16,27 @@ from parallm.model.tracks.qwen3_5_moe import (
     build_per_track_text_config,
 )
 from parallm.slicer.qwen3_5_moe import moe_decoder_layer_specs, top_level_specs
+from parallm.utils.max_tracks import ConstraintSet
 
 
 def _qwen3_5_moe_get_layer_types(text_cfg: Any) -> list[str]:
     return list(text_cfg.layer_types)
+
+
+def _qwen3_5_moe_constraints(cfg: Any) -> ConstraintSet:
+    # Same attention constraints as dense; MLP is MoE so N must divide the expert
+    # width and the shared-expert width. num_experts is replicated (the router runs
+    # in full on every track) so it imposes no divisibility constraint.
+    return ConstraintSet(
+        num_attention_heads=int(cfg.num_attention_heads),
+        num_key_value_heads=int(cfg.num_key_value_heads),
+        divides=(
+            int(cfg.linear_num_key_heads),
+            int(cfg.linear_num_value_heads),
+            int(cfg.moe_intermediate_size),
+            int(cfg.shared_expert_intermediate_size),
+        ),
+    )
 
 
 QWEN3_5_MOE_ADAPTER = ModelAdapter(
@@ -38,6 +55,7 @@ QWEN3_5_MOE_ADAPTER = ModelAdapter(
         "post_attention_layernorm",
     ),
     full_text_model_cls=Qwen3_5MoeTextModel,
+    constraints=_qwen3_5_moe_constraints,
 )
 
 register_model_adapter(QWEN3_5_MOE_ADAPTER)

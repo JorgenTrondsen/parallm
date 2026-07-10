@@ -8,7 +8,6 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5DecoderLayer,
     Qwen3_5RMSNorm,
     Qwen3_5TextRotaryEmbedding,
-    create_causal_mask,
 )
 
 from parallm.model.tracks.base import PTTrackTextModelBase, apply_common_per_track_sizing
@@ -18,7 +17,6 @@ class PTTrackTextModel(PTTrackTextModelBase):
     DECODER_LAYER_CLS = Qwen3_5DecoderLayer
     RMSNORM_CLS = Qwen3_5RMSNorm
     ROTARY_CLS = Qwen3_5TextRotaryEmbedding
-    CREATE_CAUSAL_MASK = staticmethod(create_causal_mask)
 
 
 def build_per_track_text_config(text_config, n_tracks: int):

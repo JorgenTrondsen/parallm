@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from parallm.slicer.base import LayerSpec
+from parallm.utils.max_tracks import ConstraintSet
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,11 @@ class ModelAdapter:
     # calibration (its state_dict keys match the slicer's canonical `layers.*`
     # names). Optional so lightweight/test adapters can omit it.
     full_text_model_cls: type | None = None
+    # ----- Track-count constraints -----
+    # Divisibility rules for the KV-replicated max-tracks scan (see
+    # `parallm.utils.max_tracks`). Takes a *text config*, returns a `ConstraintSet`.
+    # Optional so lightweight/test adapters can omit it.
+    constraints: "Callable[[Any], ConstraintSet] | None" = None
 
 
 _REGISTRY: dict[str, ModelAdapter] = {}

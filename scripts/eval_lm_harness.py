@@ -38,7 +38,7 @@ import torch
 import torch.distributed as dist
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from parallm.dist.fsdp_setup import wrap_student_with_fsdp, wrap_teacher_with_fsdp
+from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
 from parallm.eval.lm_eval_adapter import (
     PTLM,
@@ -48,7 +48,7 @@ from parallm.eval.lm_eval_adapter import (
 )
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.teacher import HookedTeacher
-from parallm.utils.checkpoint import load_cross_head, load_manifest, load_track
+from parallm.utils.checkpoint import load_manifest, load_track
 
 
 def _log(rank: int, msg: str) -> None:
@@ -141,18 +141,10 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0,
                    help="lm-eval random/numpy/torch seed. Identical on every rank so request "
                         "ordering and fewshot sampling line up across ranks.")
-    p.add_argument("--sync-phase", choices=["boundary", "post-attn", "window-parallel"],
-                   default="boundary",
-                   help="Lever B: evaluate a post-attn-trained checkpoint in its DEPLOYED regime "
-                        "(the single per-block sync after attention). 'window-parallel' (Gate 2): "
-                        "all window attns on the window-entry state, one post-attn sync per window, "
-                        "all window MLPs on the synced state — for slices of a HEALED dense "
-                        "window-parallel model. MUST match how the checkpoint was trained, else "
-                        "the weights run in the wrong regime. Default 'boundary'.")
     p.add_argument("--sync-indices", default=None,
-                   help="Override the manifest sync schedule (comma-separated layer indices; "
-                        "window ENDS for window-parallel). Required when the checkpoint is a raw "
-                        "convert output, which carries no schedule.")
+                   help="Override the manifest sync schedule (comma-separated layer indices). "
+                        "Required when the checkpoint is a raw convert output, which carries no "
+                        "schedule.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -208,16 +200,6 @@ def main() -> int:
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)
         student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
-        # Cross-head estimator sidecar (if the checkpoint trained one): rebuild +
-        # attach so the seam forward is used in eval (else the trained gains vanish).
-        _ch = load_cross_head(args.checkpoint_dir)
-        if _ch is not None:
-            student.cross_head = _ch.to(torch.cuda.current_device()).to(torch.bfloat16)
-        # Lever B: evaluate post-attn-trained weights in their deployed regime.
-        if args.sync_phase != "boundary":
-            student.set_sync_phase(args.sync_phase)
-            _log(rank, f"[init] sync_phase={args.sync_phase} (lever B deployed regime)")
-        wrap_student_with_fsdp(student, layout)
         student.eval()
 
     if want_teacher:

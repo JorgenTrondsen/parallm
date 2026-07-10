@@ -48,9 +48,8 @@ def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
       - top-level: ``embed_tokens.weight``, ``norm.weight``, ``lm_head.weight``
       - per-layer: ``layers.{i}.<sub_key>``
 
-    This function is the model-agnostic spec resolver used by ``slice_model_to_tracks``
-    and by the training-time replication-group planner in
-    ``parallm.train.sync_grads``. It does NOT load or slice any weights.
+    This function is the model-agnostic spec resolver used by ``slice_model_to_tracks``.
+    It does NOT load or slice any weights.
     """
     out: dict[str, SlicerSpec] = {}
     for canonical, spec in adapter.top_level_specs(text_cfg).items():
