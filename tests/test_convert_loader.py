@@ -50,3 +50,33 @@ def test_stream_single_file_remaps_and_drops(tmp_path):
     # drop_lm_head excludes the head (used by the replica calibration loader)
     sd2 = stream_text_state_dict(str(tmp_path), drop_lm_head=True)
     assert "lm_head.weight" not in sd2
+
+
+def test_fuse_unfused_moe_experts():
+    """Per-expert 2-D Linears fuse into the slicer's 3-D slabs (NVFP4-checkpoint layout)."""
+    from parallm.slicer.loader import _fuse_moe_experts
+
+    E, I, H = 3, 4, 6
+    gate = [torch.randn(I, H) for _ in range(E)]
+    up = [torch.randn(I, H) for _ in range(E)]
+    down = [torch.randn(H, I) for _ in range(E)]
+    sd = {}
+    for e in range(E):
+        sd[f"layers.0.mlp.experts.{e}.gate_proj.weight"] = gate[e]
+        sd[f"layers.0.mlp.experts.{e}.up_proj.weight"] = up[e]
+        sd[f"layers.0.mlp.experts.{e}.down_proj.weight"] = down[e]
+    sd["layers.0.self_attn.q_proj.weight"] = torch.randn(8, H)  # untouched
+
+    out = _fuse_moe_experts(sd)
+    assert out["layers.0.mlp.experts.gate_up_proj"].shape == (E, 2 * I, H)
+    assert out["layers.0.mlp.experts.down_proj"].shape == (E, H, I)
+    # per expert the fused rows are [gate | up]
+    for e in range(E):
+        assert torch.equal(out["layers.0.mlp.experts.gate_up_proj"][e], torch.cat([gate[e], up[e]], dim=0))
+        assert torch.equal(out["layers.0.mlp.experts.down_proj"][e], down[e])
+    assert not any(".experts.0." in k for k in out)  # per-expert keys consumed
+    assert "layers.0.self_attn.q_proj.weight" in out  # non-expert keys preserved
+
+    # already-fused input is a no-op
+    fused = {"layers.0.mlp.experts.gate_up_proj": torch.randn(E, 2 * I, H)}
+    assert _fuse_moe_experts(dict(fused)).keys() == fused.keys()

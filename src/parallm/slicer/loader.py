@@ -59,9 +59,50 @@ def slicer_key(k: str) -> "str | None":
     return _TOP.get(k)
 
 
+# Some checkpoints store MoE experts UNFUSED (one 2-D Linear per expert, e.g. the
+# NVFP4 build's `experts.{e}.gate_proj/up_proj/down_proj`) rather than the fused 3-D
+# slabs the slicer expects. Detect those and fuse after dequant.
+_UNFUSED_EXPERT = re.compile(r"^layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+
+
+def _fuse_moe_experts(sd: "dict[str, torch.Tensor]") -> "dict[str, torch.Tensor]":
+    """Fuse per-expert 2-D Linears into the slicer's 3-D slabs, in place. Per expert:
+    ``gate_up_proj[e] = cat([gate_proj[e], up_proj[e]], 0)`` → ``experts.gate_up_proj
+    [E, 2I, H]``; ``down_proj`` stacked → ``experts.down_proj [E, H, I]``. No-op when
+    experts are already fused (the fused key has no ``.{e}.``)."""
+    groups: dict[int, dict[int, dict[str, torch.Tensor]]] = {}
+    consumed = []
+    for k, v in sd.items():
+        m = _UNFUSED_EXPERT.match(k)
+        if m:
+            li, e, proj = int(m.group(1)), int(m.group(2)), m.group(3)
+            groups.setdefault(li, {}).setdefault(e, {})[proj] = v
+            consumed.append(k)
+    if not groups:
+        return sd
+    for k in consumed:
+        del sd[k]
+    for li, experts in groups.items():
+        E = max(experts) + 1
+        n_slabs = sum(len(p) for p in experts.values())
+        if len(experts) != E or n_slabs != 3 * E:
+            raise ValueError(
+                f"layer {li}: expected {E} contiguous experts × 3 projs, "
+                f"got {len(experts)} experts / {n_slabs} slabs"
+            )
+        gate_up = torch.stack(
+            [torch.cat([experts[e]["gate_proj"], experts[e]["up_proj"]], dim=0) for e in range(E)], dim=0
+        )
+        down = torch.stack([experts[e]["down_proj"] for e in range(E)], dim=0)
+        sd[f"layers.{li}.mlp.experts.gate_up_proj"] = gate_up
+        sd[f"layers.{li}.mlp.experts.down_proj"] = down
+    return sd
+
+
 def stream_text_state_dict(hf_model: str, *, drop_lm_head: bool = False) -> "dict[str, torch.Tensor]":
     """Read the checkpoint's text weights → bf16 state_dict keyed for the slicer.
-    Dequantizes NVFP4/FP8, drops vision + MTP + scale siblings (+ lm_head if asked)."""
+    Dequantizes NVFP4/FP8, drops vision + MTP + scale siblings (+ lm_head if asked),
+    and fuses any unfused per-expert MoE Linears into the 3-D slabs."""
     idx = os.path.join(hf_model, "model.safetensors.index.json")
     if os.path.exists(idx):
         wm = json.load(open(idx))["weight_map"]
@@ -84,7 +125,7 @@ def stream_text_state_dict(hf_model: str, *, drop_lm_head: bool = False) -> "dic
                        for s in ("weight_scale", "weight_scale_2")
                        if f"{base}.{s}" in present}
                 sd[key] = dequant_weight(f.get_tensor(k), sib)
-    return sd
+    return _fuse_moe_experts(sd)
 
 
 class StateDictModel:
