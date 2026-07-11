@@ -17,7 +17,20 @@ from parallm.model.replica_pack import (
     pack_sparse_weight,
     save_replica_pool,
     unpack_sparse_weight,
+    unpack_sparse_weight_device,
 )
+
+
+def test_device_unpack_bit_exact():
+    torch.manual_seed(4)
+    w = torch.randn(32, 48, dtype=torch.bfloat16)
+    norms = torch.rand(48) + 0.1
+    for bits in (None, 4, 8):
+        p = pack_sparse_weight(w, 0.5, norms, bits=bits)
+        ref = unpack_sparse_weight(p, dtype=torch.bfloat16)
+        assert torch.equal(unpack_sparse_weight_device(p), ref), bits
+        out = torch.empty(32, 48, dtype=torch.bfloat16)
+        assert torch.equal(unpack_sparse_weight_device(p, out=out), ref), bits
 
 
 def test_wanda_pack_roundtrip_bit_exact():

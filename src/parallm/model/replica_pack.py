@@ -134,6 +134,37 @@ def unpack_sparse_weight(packed: dict, dtype: torch.dtype = torch.bfloat16) -> t
     return w
 
 
+def unpack_sparse_weight_device(packed: dict, dtype: torch.dtype = torch.bfloat16,
+                                out: "torch.Tensor | None" = None) -> torch.Tensor:
+    """``unpack_sparse_weight`` in pure torch ops on whatever device the packed
+    tensors live on (no numpy round-trip) — bit-exact to the CPU unpacker (the
+    same fp32 multiply + cast per element). ``out``: optional preallocated
+    ``(out_features, in_features)`` buffer of ``dtype`` (the engine's per-layer
+    scratch); ``shape``/``bits`` may stay on CPU to avoid device syncs."""
+    o, i = (int(x) for x in packed["shape"].tolist())
+    mb = packed["mask"]
+    shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=mb.device)
+    mask = (((mb.unsqueeze(-1) >> shifts) & 1).reshape(-1)[: o * i]
+            .to(torch.bool).reshape(o, i))
+    if out is None:
+        out = torch.empty(o, i, dtype=dtype, device=mb.device)
+    if "vals" in packed:
+        out.zero_()
+        out.masked_scatter_(mask, packed["vals"].to(dtype))
+        return out
+    bits = int(packed["bits"].item())
+    codes = packed["codes"]
+    if bits == 4:
+        codes = torch.stack(((codes >> 4) & 0xF, codes & 0xF), dim=-1).reshape(-1)
+        codes = codes[: int(mask.sum())]
+    signed = codes.to(torch.float32) - float(2 ** (bits - 1))
+    w = torch.zeros(o, i, dtype=torch.float32, device=mb.device)
+    w.masked_scatter_(mask, signed)  # row-major nonzero order == pack order
+    w *= packed["scale"].to(device=mb.device, dtype=torch.float32)[:, None]
+    out.copy_(w.to(dtype))
+    return out
+
+
 def _pack_nibbles(u4: torch.Tensor) -> torch.Tensor:
     """Pack a 1-D uint8 tensor of 4-bit values (0..15) two-per-byte."""
     a = u4.numpy().astype(np.uint8)

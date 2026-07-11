@@ -1,6 +1,6 @@
 # ParaLLM
 
-Slice a dense LLM into **parallel tracks** and give each track cheap **sparse
+Slice an LLM into **parallel tracks** and give each track cheap **sparse
 copies** of the others, so a distributed decode needs only a handful of
 cross-track syncs per token instead of one per layer.
 

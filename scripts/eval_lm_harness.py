@@ -145,6 +145,10 @@ def main() -> int:
                    help="Override the manifest sync schedule (comma-separated layer indices). "
                         "Required when the checkpoint is a raw convert output, which carries no "
                         "schedule.")
+    p.add_argument("--engine-replicas", default=None,
+                   help="Path to a packed replica pool: score the student through the "
+                        "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
+                        "of the plain PT forward — the deployed decode math.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -232,9 +236,17 @@ def main() -> int:
 
     all_results: dict[str, dict] = {}
     if want_student:
+        student_fwd = make_student_forward_fn(student)
+        if args.engine_replicas:
+            from parallm.engine import PackedShadow, make_engine_forward_fn
+
+            _log(rank, f"[init] loading packed pool {args.engine_replicas}…")
+            shadow = PackedShadow(args.engine_replicas, args.checkpoint_dir,
+                                  student, torch.cuda.current_device())
+            student_fwd = make_engine_forward_fn(student, shadow, sync_layers)
         all_results["student"] = _run_one_target(
             "student",
-            make_student_forward_fn(student),
+            student_fwd,
             is_lm_head_owner(student),
             tokenizer, tasks, args, rank,
         )
