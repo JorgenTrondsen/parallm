@@ -316,6 +316,47 @@ def test_streamed_ent_decode_matches_resident(tmp_path):
             assert torch.equal(got, ref), (li, rel)
 
 
+def test_draft_verify_matches_plain_greedy():
+    """Rail 5 — draft-verify ≡ plain decode: whatever the drafter proposes
+    (near-verifier or adversarial), the emitted ids must equal ``generate``'s
+    greedy lockstep decode token-for-token; only τ may change. Exercises the
+    k+1-token cached verify chunk (offset mask, GDN chunked continuation) and
+    the conv/recurrent rollback at every accept length, degraded copies in
+    the loop."""
+    from parallm.engine import generate_draft_verify
+
+    cfg, dense, pt = _build()
+    shadow = _degraded_shadow(dense, pt)
+    torch.manual_seed(5)
+    prompt = torch.randint(0, cfg.vocab_size, (1, 12))
+    NEW = 10
+    plain = generate(pt, shadow, prompt, SYNC, max_new_tokens=NEW)
+
+    def dense_propose(seq, kk):  # near-verifier drafter: mixed accept lengths
+        ids = seq
+        toks = []
+        with torch.no_grad():
+            for _ in range(kk):
+                lg = dense.lm_head(dense(input_ids=ids, use_cache=False).last_hidden_state)
+                t = lg[:, -1].float().argmax(-1)
+                toks.append(t)
+                ids = torch.cat([ids, t.view(1, 1)], dim=1)
+        return torch.cat(toks)
+
+    def bad_propose(seq, kk):    # adversarial: blocks degenerate to corrections
+        return torch.full((kk,), 1, dtype=torch.long)
+
+    for propose in (dense_propose, bad_propose):
+        for k in (3, 5):
+            timing: dict = {}
+            dv = generate_draft_verify(pt, shadow, prompt, SYNC, NEW, propose,
+                                       k=k, timing=timing)
+            assert dv.shape[1] >= NEW and timing["tokens"] == dv.shape[1]
+            assert torch.equal(dv[:, :NEW], plain), (propose.__name__, k)
+            # Every block pays 1 embed + 2 boundary all-reduces + 1 accept round.
+            assert timing["rounds"] == 3 + timing["blocks"] * 4
+
+
 def test_generate_reports_comm_rounds():
     cfg, dense, pt = _build()
     shadow = DenseShadow([list(tm.layers) for tm in pt.text_models])

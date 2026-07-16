@@ -49,6 +49,7 @@ runs/
 wandb/
 convert_out/
 train_out/
+serve_out/
 
 # HuggingFace cache
 .cache/

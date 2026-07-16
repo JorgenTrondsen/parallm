@@ -25,7 +25,7 @@ import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.groups import build_groups
-from parallm.engine import PackedShadow, generate
+from parallm.engine import PackedShadow, generate, generate_draft_verify
 from parallm.model.pt_model import PTWrappedModel
 from parallm.utils.checkpoint import load_manifest, load_track
 
@@ -59,6 +59,15 @@ def main() -> int:
     p.add_argument("--dec-chunks", type=int, default=4,
                    help="Decode launches per window (chunk c decodes while "
                         "chunk c+1's blobs copy — intra-window pipelining)")
+    p.add_argument("--draft-k", default="0",
+                   help="Block draft-verify decode: the head drafts k tokens "
+                        "(--draft-model), one lockstep verify chunk checks "
+                        "them — emitted ≡ plain greedy, syncs/token = "
+                        "boundaries/τ. 0 = plain per-token decode. Comma list "
+                        "sweeps in one process (weights load once): '0,16,32,48'")
+    p.add_argument("--draft-model", default=None,
+                   help="Same-tokenizer HF checkpoint for the drafter "
+                        "(loaded on the head rank only)")
     p.add_argument("--no-fused", action="store_true",
                    help="Disable the packed-GEMV kernel; decode via the dense "
                         "unpack path (the v1 baseline)")
@@ -138,6 +147,25 @@ def main() -> int:
     # only the head's embedding is real.
     tok = AutoTokenizer.from_pretrained(args.hf_model)
     input_ids = tok(args.prompt, return_tensors="pt").input_ids.to(device)
+
+    draft_ks = [int(x) for x in str(args.draft_k).split(",") if x.strip()]
+    draft_propose = None
+    if any(draft_ks):
+        if args.temperature > 0:
+            raise SystemExit("[error] draft-verify decode is greedy-only")
+        if rank == 0:
+            if not args.draft_model:
+                raise SystemExit("[error] --draft-k needs --draft-model")
+            from transformers import AutoModelForCausalLM
+
+            dm = AutoModelForCausalLM.from_pretrained(
+                args.draft_model, dtype=torch.bfloat16).to(device).eval()
+
+            @torch.no_grad()
+            def draft_propose(seq, k):
+                o = dm.generate(seq, max_new_tokens=k, min_new_tokens=k,
+                                do_sample=False, pad_token_id=tok.eos_token_id)
+                return o[0, -k:]
     load_peak = torch.cuda.max_memory_allocated(device)
     if rank == 0:
         print(f"[init] pool={shadow.meta.get('config')} prompt={input_ids.shape[1]} tokens "
@@ -145,19 +173,30 @@ def main() -> int:
               f"(load peak {load_peak/2**30:.2f} GB)", flush=True)
     torch.cuda.reset_peak_memory_stats(device)
 
-    timing: dict = {"profile": args.profile}
     prof_ctx = None
     if args.torch_profile:
         from torch.profiler import ProfilerActivity, profile as torch_profile
 
         prof_ctx = torch_profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
         prof_ctx.__enter__()
-    gen = generate(student, shadow, input_ids, sync,
-                   max_new_tokens=args.max_new_tokens,
-                   temperature=args.temperature,
-                   latency_s=args.latency_ms / 1e3, timing=timing,
-                   use_cuda_graphs=not args.no_cuda_graphs)
-    torch.cuda.synchronize()
+    results = []  # (ki, gen, timing) per sweep entry
+    for ki in draft_ks:
+        if shadow.ring is not None:
+            shadow.ring.copy_log.clear()  # stream stats reflect the last entry
+        timing = {"profile": args.profile}
+        if ki:
+            gen = generate_draft_verify(student, shadow, input_ids, sync,
+                                        max_new_tokens=args.max_new_tokens,
+                                        draft_propose=draft_propose, k=ki,
+                                        latency_s=args.latency_ms / 1e3, timing=timing)
+        else:
+            gen = generate(student, shadow, input_ids, sync,
+                           max_new_tokens=args.max_new_tokens,
+                           temperature=args.temperature,
+                           latency_s=args.latency_ms / 1e3, timing=timing,
+                           use_cuda_graphs=not args.no_cuda_graphs)
+        torch.cuda.synchronize()
+        results.append((ki, gen, timing))
     if prof_ctx is not None:
         prof_ctx.__exit__(None, None, None)
 
@@ -181,18 +220,38 @@ def main() -> int:
     dist.all_gather_object(ledgers, ledger)
 
     if student.lm_head is not None:
-        print("\n" + tok.decode(gen[0]), flush=True)
-        per_tok = timing["per_token_ms"]
-        n_chunks = 1 + len(per_tok)
-        rounds_per_chunk = timing["rounds"] / n_chunks
-        stall = rounds_per_chunk * args.latency_ms
-        mean = statistics.mean(per_tok) if per_tok else float("nan")
-        print(f"\n===== timing panel =====")
-        print(f"prefill: {timing['prefill_ms']:.1f} ms ({input_ids.shape[1]} tokens)")
-        print(f"decode:  mean {mean:.1f} ms/tok | p50 {statistics.median(per_tok):.1f} "
-              f"| {1e3/mean:.2f} tok/s")
-        print(f"rounds:  {rounds_per_chunk:.0f}/token × {args.latency_ms:.0f} ms "
-              f"= {stall:.0f} ms stall | compute+overhead {mean - stall:.1f} ms")
+        last_layer = manifest.num_layers - 1
+        S = len(set(sync) - {last_layer}) + 1  # boundaries per pass
+        for ki, gen, timing in results:
+            print("\n" + tok.decode(gen[0]), flush=True)
+            if ki:
+                pb = timing["per_block_ms"]
+                blocks, tokens_n = timing["blocks"], timing["tokens"]
+                n_chunks = 1 + blocks
+                tau = tokens_n / blocks
+                mean = sum(pb) / tokens_n  # ms per emitted token
+                rpb = (timing["rounds"] - (S + 1)) / blocks  # rounds per block
+                print(f"\n===== draft-verify panel =====")
+                print(f"prefill: {timing['prefill_ms']:.1f} ms ({input_ids.shape[1]} tokens)")
+                print(f"decode:  k={ki} blocks={blocks} tokens={tokens_n} "
+                      f"| τ={tau:.2f} tok/verify")
+                print(f"         mean {mean:.1f} ms/tok | {1e3 / mean:.2f} tok/s "
+                      f"| block mean {statistics.mean(pb):.1f} ms")
+                print(f"syncs:   {S}/pass → {S / tau:.2f}/token | rounds {rpb:.0f}/block "
+                      f"→ {rpb / tau:.2f}/token × {args.latency_ms:.0f} ms = "
+                      f"{rpb / tau * args.latency_ms:.1f} ms/tok stall")
+            else:
+                per_tok = timing["per_token_ms"]
+                n_chunks = 1 + len(per_tok)
+                rounds_per_chunk = timing["rounds"] / n_chunks
+                stall = rounds_per_chunk * args.latency_ms
+                mean = statistics.mean(per_tok) if per_tok else float("nan")
+                print(f"\n===== timing panel =====")
+                print(f"prefill: {timing['prefill_ms']:.1f} ms ({input_ids.shape[1]} tokens)")
+                print(f"decode:  mean {mean:.1f} ms/tok | p50 {statistics.median(per_tok):.1f} "
+                      f"| {1e3/mean:.2f} tok/s")
+                print(f"rounds:  {rounds_per_chunk:.0f}/token × {args.latency_ms:.0f} ms "
+                      f"= {stall:.0f} ms stall | compute+overhead {mean - stall:.1f} ms")
         print(f"HBM:     run peak {torch.cuda.max_memory_allocated(device)/2**30:.2f} GB "
               f"| steady {torch.cuda.memory_allocated(device)/2**30:.2f} GB")
         gb = 2**30
@@ -227,7 +286,8 @@ def main() -> int:
                 # stall (window 0 additionally gets the embed round).
                 added = statistics.mean(
                     sum(max(0.0, m - args.latency_ms) for _, m in p) for p in per_pass)
-                print(f"stream:  {sum(b for b, _ in per_pass[0])/2**30:.2f} GB/token "
+                print(f"stream:  {sum(b for b, _ in per_pass[0])/2**30:.2f} GB/"
+                      f"{'pass' if results[-1][0] else 'token'} "
                       f"over {nw} windows | copy mean {statistics.mean(ms):.1f} "
                       f"max {max(ms):.1f} ms | H2D {bw:.1f} GB/s | "
                       f"copy beyond one {args.latency_ms:.0f} ms stall each: "
@@ -252,7 +312,6 @@ def main() -> int:
             ka = prof_ctx.key_averages()
             cuda_us = sum(_dev_us(e) for e in ka)
             n_kernels = sum(e.count for e in ka if _dev_us(e) > 0)
-            n_chunks = 1 + len(timing["per_token_ms"])
             print(f"\n--- torch.profiler (whole run: prefill + {n_chunks - 1} decode fwds) ---")
             print(f"GPU busy: {cuda_us / 1e3:.0f} ms total ≈ "
                   f"{cuda_us / 1e3 / n_chunks:.1f} ms per forward pass")

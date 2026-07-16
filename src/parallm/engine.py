@@ -769,13 +769,18 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
     conv_w = _stacked(shadow, li, "linear_attn.conv1d.weight").reshape(N * C, K)
     xc = qkv.view(N, B, T, C).permute(1, 0, 3, 2).reshape(B, N * C, T)
     state = cache.conv.get(li) if cache is not None else None
-    if state is not None and T == 1:
+    logged = cache is not None and cache.log is not None
+    if state is not None and T == 1 and not logged:
         conv_update = m.causal_conv1d_update or m.torch_causal_conv1d_update
         xc = conv_update(xc, state, conv_w, None, gdn.activation)
     else:
         if state is not None:  # chunked continuation: prepend the conv context
             xc = torch.cat([state, xc], dim=-1)
-        if cache is not None:
+        if logged:
+            # Draft-verify: defer the commit — the rollback recuts the conv
+            # window from this raw pre-conv context at the accepted length.
+            cache.log.setdefault(li, {}).update(conv_ctx=xc, kc=K)
+        elif cache is not None:
             cache.conv[li] = nn.functional.pad(xc, (K - xc.shape[-1], 0))
         L = xc.shape[-1]
         if m.causal_conv1d_fn is not None:
@@ -801,14 +806,18 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
         q = q.repeat_interleave(Hv // Hk, dim=2)
         k = k.repeat_interleave(Hv // Hk, dim=2)
     rec = cache.rec.get(li) if cache is not None else None
-    if rec is not None and T == 1:
+    if rec is not None and T == 1 and not logged:
         fn = m.fused_recurrent_gated_delta_rule or m.torch_recurrent_gated_delta_rule
     else:
         fn = m.chunk_gated_delta_rule or m.torch_chunk_gated_delta_rule
     core, rec_out = fn(q, k, v, g=g, beta=beta, initial_state=rec,
-                       output_final_state=cache is not None,
+                       output_final_state=cache is not None and not logged,
                        use_qk_l2norm_in_kernel=True)
-    if cache is not None:
+    if logged:
+        # Draft-verify: ``rec`` keeps the pre-chunk state; the rollback
+        # replays these saved recurrence inputs over the accepted prefix.
+        cache.log.setdefault(li, {})["qkvgb"] = (q, k, v, g, beta)
+    elif cache is not None:
         cache.update_rec(li, rec_out)
     # Gated RMSNorm (per-track weight, NOT zero-centered), norm before gate —
     # the torch reference math of Qwen3_5RMSNormGated.
@@ -848,6 +857,10 @@ class BatchedShadowCache:
     kv: dict = None              # li -> (k, v) [N*B, kv_heads, s_max, d]
     conv: dict = None            # li -> [B, N*conv_dim, K], updated in place
     rec: dict = None             # li -> [N*B, Hv, dk, dv], updated in place
+    log: dict = None             # draft-verify verify chunk: li -> rollback
+                                 # record (raw conv context + recurrence inputs);
+                                 # while set, GDN state commits are DEFERRED to
+                                 # _rollback_gdn at the accepted prefix length
 
     def __post_init__(self):
         self.kv, self.conv, self.rec = {}, {}, {}
@@ -943,10 +956,10 @@ def replay_chunk(
     position_ids = pos.view(1, 1, -1).expand(4, B, -1)
     text_position_ids = position_ids[0]
     if past > 0:
-        # Cached decode: a single new token attends to everything cached — no
-        # mask needed. Chunked continuation (draft-verify) needs an offset
-        # mask that nothing builds yet.
-        assert T == 1, "chunked decode with past needs an offset causal mask"
+        # Cached continuation: no mask is built here — _batched_attn derives
+        # the offset-causal mask from the cache position (1-token decode and
+        # k+1-token draft-verify chunks alike), and the GDN layers prepend
+        # their cached conv/recurrent context.
         causal_mask = None
         linear_attn_mask = None
     else:
@@ -1160,4 +1173,118 @@ def generate(
     if timing is not None:
         timing["prefill_ms"] = prefill_ms
         timing["per_token_ms"] = per_token_ms
+    return torch.cat(out, dim=1)
+
+
+# --------------------------------------------------------------------------- #
+# Block draft-verify decode (see eval/draft_verify.py for the schedule math).
+# --------------------------------------------------------------------------- #
+def _rollback_gdn(cache: BatchedShadowCache, upto: int) -> None:
+    """Commit a logged verify chunk's GDN states at ``upto`` accepted chunk
+    tokens: the conv state is the raw pre-conv context window ending there;
+    the recurrent state is the chunk recurrence replayed over the accepted
+    prefix from the saved inputs (local, comm-free — the inputs came from
+    synced residuals). KV needs no data rollback: the write position rolls
+    back and the offset mask hides the stale tail until it is overwritten."""
+    m = _hf()
+    fn = m.chunk_gated_delta_rule or m.torch_chunk_gated_delta_rule
+    for li, d in cache.log.items():
+        kc = d["kc"]
+        cache.conv[li] = d["conv_ctx"][..., upto: kc + upto].contiguous()
+        q, k, v, g, beta = d["qkvgb"]
+        _core, rec_out = fn(q[:, :upto], k[:, :upto], v[:, :upto], g=g[:, :upto],
+                            beta=beta[:, :upto], initial_state=cache.rec.get(li),
+                            output_final_state=True, use_qk_l2norm_in_kernel=True)
+        cache.update_rec(li, rec_out)
+    cache.log = None
+
+
+@torch.no_grad()
+def generate_draft_verify(
+    student: PTWrappedModel,
+    shadow,
+    input_ids: torch.LongTensor,
+    sync_indices: Sequence[int],
+    max_new_tokens: int,
+    draft_propose,
+    k: int,
+    latency_s: float = 0.0,
+    timing: "dict | None" = None,
+) -> torch.LongTensor:
+    """Prefill + block draft-verify greedy decode: the head drafts ``k``
+    tokens locally (``draft_propose(seq (1, T), k) -> (k,)``; never called on
+    peers), then ONE lockstep verify chunk over the k+1 pending positions
+    stands in for k+1 per-token passes. Every emitted token is the verifier's
+    greedy choice given its prefix — emitted ≡ ``generate``'s plain decode by
+    construction; only τ = tokens/verify-event varies with the drafter.
+
+    Comm per block = the chunk's usual rounds (1 embed + boundary
+    all-reduces) + ONE tiny accept-count broadcast, which every rank needs to
+    roll its caches back to the accepted prefix. Peers decode zero-id chunks
+    exactly as in ``generate``. Returns emitted ids (1, >= max_new_tokens; the
+    final block may overshoot by < k — bought with the same verify event)."""
+    import torch.distributed as dist
+
+    assert k >= 1 and input_ids.shape[0] == 1, "draft-verify decode is B=1, k>=1"
+    caches = EngineCaches.build(
+        student, s_max=input_ids.shape[1] + max_new_tokens + k + 1)
+    head = student.lm_head is not None
+    device = input_ids.device
+    distributed = dist.is_available() and dist.is_initialized() \
+        and dist.get_world_size() > 1
+
+    t0 = time.perf_counter()
+    logits = replay_chunk(student, shadow, input_ids, sync_indices, caches,
+                          latency_s=latency_s, timing=timing)
+    prefill_ms = (time.perf_counter() - t0) * 1e3
+
+    tok = torch.zeros((1, 1), dtype=torch.long, device=device)
+    if head:
+        tok = logits[:, -1, :].float().argmax(dim=-1, keepdim=True)
+    seq = torch.cat([input_ids, tok], dim=1) if head else None
+    out = [tok]
+    tokens, blocks = 1, 0
+    per_block_ms: "list[float]" = []
+    accept_t = torch.zeros((), dtype=torch.long, device=device)
+
+    while tokens < max_new_tokens:
+        t0 = time.perf_counter()
+        if head:
+            proposals = draft_propose(seq, k).view(-1).to(device)
+            chunk = torch.cat([seq[:, -1:], proposals.view(1, -1)], dim=1)
+        else:
+            chunk = torch.zeros((1, k + 1), dtype=torch.long, device=device)
+        start_pos = caches.pos
+        caches.own.log, caches.shadow.log = {}, {}
+        logits = replay_chunk(student, shadow, chunk, sync_indices, caches,
+                              latency_s=latency_s, timing=timing)
+        if head:
+            # Chunk position j predicts sequence slot start_pos+j+1, so the
+            # argmaxes are the greedy targets for the k proposal slots plus
+            # the bonus/correction slot (the tag-era verify-step math).
+            targets = logits[0].float().argmax(-1)  # (k+1,)
+            accepted = int((targets[:k] == proposals).cumprod(0).sum())
+            accept_t.fill_(accepted)
+        if distributed:
+            dist.broadcast(accept_t, src=0)
+        _stall(latency_s, timing)  # the accept round rides the wire like a sync
+        a = int(accept_t)
+        _rollback_gdn(caches.own, a + 1)
+        _rollback_gdn(caches.shadow, a + 1)
+        caches.pos = start_pos + a + 1
+        if head:
+            emitted = targets[: a + 1].view(1, -1)
+            seq = torch.cat([seq, emitted], dim=1)
+        else:
+            emitted = torch.zeros((1, a + 1), dtype=torch.long, device=device)
+        out.append(emitted)
+        tokens += a + 1
+        blocks += 1
+        per_block_ms.append((time.perf_counter() - t0) * 1e3)
+
+    if timing is not None:
+        timing["prefill_ms"] = prefill_ms
+        timing["per_block_ms"] = per_block_ms
+        timing["blocks"] = blocks
+        timing["tokens"] = tokens
     return torch.cat(out, dim=1)

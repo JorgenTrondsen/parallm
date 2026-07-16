@@ -124,3 +124,24 @@ low-rank co-trained replicas, L+S decompositions — was refuted end-to-end. Tha
 code and its distillation trainer were removed in the parallm pivot; the full
 negative record lives in the project memory and in git at tag
 `pre-parallm-pivot`. Do not re-run any of it without a genuinely new idea.
+
+## 6. Draft-verify decode (the >27B / 100B-class arm) — 2026-07-16
+
+Where the pool cannot fit the node (100B+: 23–28 GB > 16 GB DRAM; a ≤1×track
+budget closes ALL weight-space copies by arithmetic — b/15 bits/param vs the
+~2.3 bits/param measured floor), the surviving lever is **amortized exact
+input**: block draft-verify IN TRACK MODE. A small same-tokenizer drafter
+(head rank only — zero bytes on track nodes) proposes k tokens; ONE lockstep
+verify chunk over the k+1 positions gives every layer real synced residuals;
+syncs/token = boundaries/τ. Engine: `generate_draft_verify`
+([engine.py](../src/parallm/engine.py)) — k+1-token cached chunks, GDN
+conv/recurrent rollback to the accepted prefix, one tiny accept broadcast per
+block; rails in `test_draft_verify_matches_plain_greedy`. Measured on the 27B
+(D=16 + q4mlp/q8mix pool): **1.17–1.54 syncs/token on prose, 0.24 on code
+(on-gen τ=16.33 @k32)**, streamed pool wire ÷ τ ⇒ 0.56 GB/token on code —
+27B streamed reopened for code-class decode. **τ is domain-dependent** (0.8B
+drafter vs dense 27B: prose 2.7 saturated by k=16; code 7→16, k-capped) —
+the drafter, not the schedule or the degraded verifier, is the binding lever;
+see `docs/draft_verify_sizing.md` for the full gates + the 100B pool-free d1b
+ledger and the two named engineering items (graphed verify windows, fast
+drafter loop).
