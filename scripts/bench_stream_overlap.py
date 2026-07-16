@@ -14,6 +14,15 @@ Law under test (per window): added_stall ~= max(0, W/BW - min(S, R/BW))
 where W = one window of replica bytes. Per pass the link cannot be beaten:
 added_pass >= max(0, POOL/BW - 4*S - compute).
 
+The engine's window-granular ring (2026-07-12) realizes the law with
+ring-windows >= 2: each window's refill budget is exactly one stall (window 0
+additionally gets the embed round), so added ~= Σ_w max(0, W/BW - S), and
+`--pool-codec ent` shrinks W by the codes-plane entropy ratio (~0.76 on
+qwanda:4 pools). Two caveats this bench under-models: (a) per-rank BW on a
+multi-GPU sim box is the SHARED host-link rate (~12.7 GB/s measured with 8
+concurrent ranks vs ~18-26 alone); (b) NCCL boundary all-reduces contend with
+the copies on the same fabric.
+
 Own-track weights (0.89 GB bf16) stay resident by default; --stream-own
 folds them into the streamed slabs (the negative-trade arm, for the record).
 

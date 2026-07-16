@@ -100,9 +100,14 @@ class _RelEntry:
     is exactly the track-then-row pack order.
 
     ``pin=False``: tensors live on ``device`` (resident mode). ``pin=True``:
-    tensors stay in pinned host DRAM and stream through a `_Ring` slot."""
+    tensors stay in pinned host DRAM and stream through a `_Ring` slot.
+    ``ent``: the entry's entropy-coded plane (blob/offsets/raw_len from the
+    repack artifact) replaces the pinned raw codes — the ring's pump copies
+    the blob and GPU-decodes it into the slot, ~21-26% fewer PCIe/DRAM bytes,
+    bit-identical decoded plane. Streamed-only."""
 
-    def __init__(self, packs: "list[dict]", device, pin: bool = False):
+    def __init__(self, packs: "list[dict]", device, pin: bool = False,
+                 ent: "dict | None" = None):
         import numpy as np
 
         shapes = {tuple(p["shape"].tolist()) for p in packs}
@@ -132,27 +137,30 @@ class _RelEntry:
         self.block_start = torch.from_numpy(starts.astype(np.int32)).to(device)
         track_nnz = bits.sum((1, 2))
 
+        self.blob = None
         if "vals" in packs[0]:
+            assert ent is None, "bf16 vals pools have no entropy-coded plane"
             self.bits = None
             self.vals = place(torch.cat([p["vals"] for p in packs]))
-            self.nnz = self.vals.numel()
+            self.nnz = self.values_numel = self.vals.numel()
+            self.values_dtype = self.vals.dtype
         else:
             self.bits = int(packs[0]["bits"].item())
             self.scale = place(torch.stack([p["scale"] for p in packs]).float())
-            if self.bits == 4:
-                per_track = [
-                    _unpack_nibbles_torch(p["codes"], int(track_nnz[k]))
-                    for k, p in enumerate(packs)
-                ]
-                flat = torch.cat(per_track)
-                self.nnz = flat.numel()
-                a = flat.numpy()
-                if a.size % 2:
-                    a = np.append(a, np.uint8(0))
-                self.codes = place(torch.from_numpy((a[0::2] << 4) | (a[1::2])))
+            self.nnz = int(track_nnz.sum())
+            self.values_dtype = torch.uint8
+            if ent is not None:
+                # Codes never materialize raw: the pinned blob is the DRAM
+                # copy, the decoded bytes exist only in the ring slot.
+                self.codes = None
+                self.values_numel = int(ent["raw_len"])
+                self.blob = ent["blob"].pin_memory()
+                self.blob_offsets = ent["offsets"]  # host-side; plans bake it
             else:
-                self.codes = place(torch.cat([p["codes"] for p in packs]))
-                self.nnz = self.codes.numel()
+                plane, nnz = assemble_codes(packs, track_nnz)
+                assert nnz == self.nnz, (nnz, self.nnz)
+                self.codes = place(plane)
+                self.values_numel = plane.numel()
 
     @property
     def values(self) -> torch.Tensor:
@@ -182,87 +190,334 @@ class _RelEntry:
         out.copy_(f32)
 
 
-class _Ring:
-    """Device ring for the streamed pool: ``n_slots`` per-layer slots whose
-    packed buffers are refilled from pinned host DRAM on a dedicated copy
-    stream, ``n_slots`` layers ahead of compute — the sync stalls (host sleeps
-    + NCCL waits + compute) are the hiding budget, exactly the
-    bench_stream_overlap law. Slot ``s`` only ever hosts layers ``≡ s (mod
-    n_slots)``, so its preallocated per-rel buffers take those layers' sizes."""
+def _ring_geometry(num_layers: int, n_slots: int, window_layers: int) -> int:
+    """Validate window-granular ring geometry; returns ``ring_windows``.
 
-    def __init__(self, shadow: "PackedShadow", n_slots: int, device):
+    The constraints are exactly what makes streamed slots CUDA-graph-safe:
+    slot ``li % n_slots`` must be the same device address every token
+    (``num_layers % n_slots == 0`` — otherwise the layer→slot map drifts
+    across passes), slots must partition into whole windows, and at least two
+    ring windows must exist: window w+1's leading shadow-MLP re-reads boundary
+    layer w, so one window's slot set frees a window LATE — at
+    ``ring_windows == 1`` a single captured window would need one slot to hold
+    two layers' data."""
+    if window_layers < 1 or n_slots % window_layers:
+        raise ValueError(
+            f"ring layers ({n_slots}) must be whole sync windows of {window_layers} layers")
+    rw = n_slots // window_layers
+    if rw < 2:
+        raise ValueError(
+            "the stream ring needs --ring-windows >= 2 (window w+1 re-reads boundary layer w)")
+    if num_layers % n_slots:
+        raise ValueError(
+            f"num_layers ({num_layers}) % ring layers ({n_slots}) != 0 — "
+            "the layer->slot map would drift across tokens (breaks CUDA-graphed slots)")
+    return rw
+
+
+class _Ring:
+    """Device ring for the streamed pool, window-granular so it composes with
+    CUDA-graphed windows: ``n_slots`` per-layer slots at FIXED device
+    addresses (slot = ``li % n_slots``, token-stable by ``_ring_geometry``),
+    refilled one whole sync window at a time from pinned host DRAM on a
+    dedicated copy stream. All host/event work happens in ``begin_window`` /
+    ``end_window`` — the eager boundary region of the replay, never inside a
+    capture — so a captured window bakes its layers' slot addresses and the
+    copies swap the contents between replays. The sync stalls are the hiding
+    budget, exactly the bench_stream_overlap law.
+
+    Slot-reuse hazard: window w+1's leading shadow-MLP re-reads boundary layer
+    w, so the refill for occurrence ``W`` must wait for window ``W-rw+1`` to
+    finish (its ``done`` event), and ``end_window(occ)`` may host-enqueue
+    pumps only up to occurrence ``occ+rw-1`` — the newest whose gating done
+    event exists. A ``wait_event`` on a never-recorded event is a silent
+    no-op, not an error: enqueuing one occurrence further is a data race."""
+
+    def __init__(self, shadow: "PackedShadow", n_slots: int, device,
+                 window_layers: int):
         self.shadow = shadow
         self.device = device
         self.n_slots = n_slots
+        self.rw = _ring_geometry(shadow.num_layers, n_slots, window_layers)
+        self.D = window_layers
+        self.n_windows = shadow.num_layers // window_layers
         self.copy_stream = torch.cuda.Stream(device)
+        self.ent = shadow.ent
         # Preallocate every slot's buffers for the layers it will host
         # (li ≡ slot mod n_slots), values sized to the max across those layers —
-        # no mid-flight growth, so no cross-stream reallocation hazard.
-        self.slots: "list[dict]" = []
+        # no mid-flight growth, so no cross-stream reallocation hazard. With the
+        # entropy-coded pool, values live in ONE uint8 arena so a single batched
+        # decode launch can write any mix of (slot, rel) planes by offset.
+        sizing: "list[dict]" = []  # slot -> rel -> [max values numel, dtype, e0]
         for s in range(n_slots):
-            slot: dict = {}
+            szs: dict = {}
             for li in range(s, shadow.num_layers, n_slots):
                 for rel in shadow.rels_at[li]:
                     e = shadow.entries[(li, rel)]
-                    b = slot.get(rel)
-                    if b is None:
-                        slot[rel] = {
-                            "mask": torch.empty_like(e.mask, device=device),
-                            "values": torch.empty_like(e.values, device=device),
-                        }
-                        if e.scale is not None:
-                            slot[rel]["scale"] = torch.empty_like(e.scale, device=device)
-                    elif b["values"].numel() < e.values.numel():
-                        b["values"] = torch.empty_like(e.values, device=device)
+                    cur = szs.get(rel)
+                    if cur is None:
+                        szs[rel] = [e.values_numel, e.values_dtype, e]
+                    elif cur[0] < e.values_numel:
+                        cur[0] = e.values_numel
+            sizing.append(szs)
+        if self.ent is not None:
+            total = sum(sz for szs in sizing for (sz, _d, _e) in szs.values())
+            self.arena = torch.empty(total, dtype=torch.uint8, device=device)
+        self.arena_off: "dict[tuple, int]" = {}  # (slot, rel) -> arena byte offset
+        self.slots: "list[dict]" = []
+        off = 0
+        for s in range(n_slots):
+            slot: dict = {}
+            for rel, (numel, dt, e0) in sizing[s].items():
+                slot[rel] = {"mask": torch.empty_like(e0.mask, device=device)}
+                if e0.scale is not None:
+                    slot[rel]["scale"] = torch.empty_like(e0.scale, device=device)
+                if self.ent is not None:
+                    self.arena_off[(s, rel)] = off
+                    slot[rel]["values"] = self.arena[off: off + numel]
+                    off += numel
+                else:
+                    slot[rel]["values"] = torch.empty(numel, dtype=dt, device=device)
             self.slots.append(slot)
-        self.ready: "dict[int, torch.cuda.Event]" = {}
-        self.free: "list[torch.cuda.Event | None]" = [None] * n_slots
-        self.next_copy = 0
-        self.active: dict = {}      # rel -> current layer's slot bufs
-        self._pending: "int | None" = None  # occurrence awaiting its free event
-        self.pump(n_slots)
+        if self.ent is not None:
+            self._build_ent_plans()
+        self.ready: "dict[int, torch.cuda.Event]" = {}  # occ -> refill complete
+        self.done: "dict[int, torch.cuda.Event]" = {}   # occ -> window compute complete
+        self.copy_log: "list[tuple]" = []  # (bytes, start_ev, end_ev) per occurrence
+        self.next_pump = 0
+        self.next_use = 0
+        self._pump_to(self.rw)  # initial fill: rw fresh slot sets, nothing to wait on
 
-    def pump(self, limit: int) -> None:
-        """Enqueue host→device slab copies up to occurrence ``limit``."""
-        while self.next_copy < limit:
-            occ = self.next_copy
-            li = occ % self.shadow.num_layers
-            slot = self.slots[occ % self.n_slots]
+    def _build_ent_plans(self) -> None:
+        """Static per-(window, chunk) decode plans: staging layout for the
+        chunk's blobs plus per-block indirection tables (staging word offset,
+        arena byte offset, symbol count) for ONE batched decode launch. Chunks
+        pipeline within a window — chunk c decodes while chunk c+1's blobs
+        copy — through two ping-pong staging buffers."""
+        import numpy as np
+
+        from parallm.entropy_codec import build_decode_lut
+
+        bb = self.ent["block_bytes"]
+        self.lut = torch.from_numpy(build_decode_lut(self.ent["lengths"])).to(self.device)
+        n_chunks = max(1, int(self.ent["dec_chunks"]))
+        self.ent_plans: "list[list[dict]]" = []
+        max_stage = 0
+        for w in range(self.n_windows):
+            entries = [(li, rel, self.shadow.entries[(li, rel)])
+                       for li in range(w * self.D, (w + 1) * self.D)
+                       for rel in self.shadow.rels_at[li]]
+            total = sum(e.blob.numel() for _, _, e in entries)
+            groups: "list[list]" = [[]]
+            acc = 0
+            for item in entries:  # contiguous split, balanced by blob bytes
+                if len(groups) < n_chunks and acc >= total * len(groups) / n_chunks:
+                    groups.append([])
+                groups[-1].append(item)
+                acc += item[2].blob.numel()
+            chunks = []
+            for group in groups:
+                woff, ooff, nsym, copies, base = [], [], [], [], 0
+                for li, rel, e in group:
+                    offs = e.blob_offsets.numpy().astype(np.int64)
+                    nb = len(offs) - 1
+                    woff.append(base // 4 + offs[:-1] // 4)  # blocks are 4B-aligned
+                    ooff.append(self.arena_off[(li % self.n_slots, rel)]
+                                + np.arange(nb, dtype=np.int64) * bb)
+                    nsym.append(np.minimum(
+                        bb, e.values_numel - np.arange(nb, dtype=np.int64) * bb
+                    ).astype(np.int32))
+                    copies.append((base, e.blob))
+                    base += e.blob.numel()  # blob keeps its own tail pad
+                chunks.append({
+                    "woff": torch.from_numpy(np.concatenate(woff)).to(self.device),
+                    "ooff": torch.from_numpy(np.concatenate(ooff)).to(self.device),
+                    "nsym": torch.from_numpy(np.concatenate(nsym)).to(self.device),
+                    "copies": copies, "bytes": base,
+                })
+                max_stage = max(max_stage, base)
+            self.ent_plans.append(chunks)
+        self.staging = [torch.empty(max_stage, dtype=torch.uint8, device=self.device)
+                        for _ in range(2)]
+        self.staging_u32 = [s.view(torch.uint32) for s in self.staging]
+        self.decode_stream = torch.cuda.Stream(self.device)
+        self.staging_free: "list[torch.cuda.Event | None]" = [None, None]
+        self.chunk_seq = 0
+
+    def slot_bufs(self, li: int, rel: str) -> dict:
+        """The fixed slot buffers for (li, rel) — a pure address function, safe
+        to call (and bake) inside a CUDA-graph capture."""
+        return self.slots[li % self.n_slots][rel]
+
+    def _pump_to(self, limit: int) -> None:
+        """Host-enqueue whole-window refills up to occurrence ``limit``
+        (exclusive): raw H2D copies on the copy stream, plus — entropy-coded
+        pool — chunked blob copies pipelined with batched decode launches on
+        the decode stream (chunk c decodes while chunk c+1 copies)."""
+        from parallm.entropy_codec import decode_batched_gpu
+
+        while self.next_pump < limit:
+            occ = self.next_pump
+            lo = (occ % self.n_windows) * self.D
+            # Slot set previously held occurrence occ-rw; its last reader is
+            # window occ-rw+1 (the boundary-layer re-read).
+            ev_done = self.done.pop(occ - self.rw + 1) if occ >= self.rw else None
+            nbytes = 0
             with torch.cuda.stream(self.copy_stream):
-                if self.free[occ % self.n_slots] is not None:
-                    self.copy_stream.wait_event(self.free[occ % self.n_slots])
-                for rel in self.shadow.rels_at[li]:
-                    e = self.shadow.entries[(li, rel)]
-                    bufs = slot[rel]
-                    bufs["mask"].copy_(e.mask, non_blocking=True)
-                    bufs["values"][: e.values.numel()].copy_(e.values, non_blocking=True)
-                    if e.scale is not None:
-                        bufs["scale"].copy_(e.scale, non_blocking=True)
-                ev = torch.cuda.Event()
-                ev.record(self.copy_stream)
-            self.ready[occ] = ev
-            self.next_copy += 1
+                if ev_done is not None:
+                    self.copy_stream.wait_event(ev_done)
+                t0 = torch.cuda.Event(enable_timing=True)
+                t0.record(self.copy_stream)
+            if self.ent is not None:
+                # Blobs FIRST: their decodes then hide under the mask/scale
+                # copies that follow on the copy stream (compute needs the
+                # mask/scale only at the window, not for decoding).
+                if ev_done is not None:  # decodes write the same slot arena
+                    self.decode_stream.wait_event(ev_done)
+                for chunk in self.ent_plans[occ % self.n_windows]:
+                    par = self.chunk_seq % 2
+                    self.chunk_seq += 1
+                    with torch.cuda.stream(self.copy_stream):
+                        if self.staging_free[par] is not None:
+                            self.copy_stream.wait_event(self.staging_free[par])
+                        stg = self.staging[par]
+                        for base, blob in chunk["copies"]:
+                            stg[base: base + blob.numel()].copy_(blob, non_blocking=True)
+                        ev_c = torch.cuda.Event()
+                        ev_c.record(self.copy_stream)
+                        nbytes += chunk["bytes"]
+                    with torch.cuda.stream(self.decode_stream):
+                        self.decode_stream.wait_event(ev_c)
+                        decode_batched_gpu(self.staging_u32[par], chunk["woff"],
+                                           chunk["ooff"], chunk["nsym"],
+                                           self.lut, self.arena,
+                                           self.ent["block_bytes"])
+                        ev_d = torch.cuda.Event()
+                        ev_d.record(self.decode_stream)
+                        self.staging_free[par] = ev_d
+            with torch.cuda.stream(self.copy_stream):
+                for li in range(lo, lo + self.D):
+                    slot = self.slots[li % self.n_slots]
+                    for rel in self.shadow.rels_at[li]:
+                        e = self.shadow.entries[(li, rel)]
+                        bufs = slot[rel]
+                        bufs["mask"].copy_(e.mask, non_blocking=True)
+                        nbytes += e.mask.nbytes
+                        if e.blob is None:  # raw plane; ent decodes instead
+                            bufs["values"][: e.values_numel].copy_(
+                                e.values, non_blocking=True)
+                            nbytes += e.values.nbytes
+                        if e.scale is not None:
+                            bufs["scale"].copy_(e.scale, non_blocking=True)
+                            nbytes += e.scale.nbytes
+            if self.ent is None:
+                with torch.cuda.stream(self.copy_stream):
+                    t1 = torch.cuda.Event(enable_timing=True)
+                    t1.record(self.copy_stream)
+            else:
+                with torch.cuda.stream(self.copy_stream):
+                    ev_ce = torch.cuda.Event()  # mask/scale copies complete
+                    ev_ce.record(self.copy_stream)
+                with torch.cuda.stream(self.decode_stream):
+                    self.decode_stream.wait_event(ev_ce)
+                    t1 = torch.cuda.Event(enable_timing=True)
+                    t1.record(self.decode_stream)  # implies copies AND decodes
+            self.ready[occ] = t1
+            if len(self.copy_log) < 4096:
+                self.copy_log.append((nbytes, t0, t1))
+            self.next_pump += 1
 
-    def consume(self, occ: int, li: int) -> None:
-        """Make layer ``li`` (occurrence ``occ``) computable, then release slots
-        back to the copy stream: publish the slot's packed buffers (``blinear``
-        reads them during the layer's ops, which are enqueued before the NEXT
-        consume), so the free event for occurrence ``occ`` records at consume
-        ``occ+1`` and the pump lookahead is shortened by one to match."""
-        torch.cuda.current_stream().wait_event(self.ready.pop(occ))
-        slot = self.slots[occ % self.n_slots]
-        self.active = {rel: slot[rel] for rel in self.shadow.rels_at[li]}
-        if self._pending is not None:
-            ev = torch.cuda.Event()
-            ev.record(torch.cuda.current_stream())
-            self.free[self._pending % self.n_slots] = ev
-        self._pending = occ
-        self.pump(occ + self.n_slots)
+    def begin_window(self) -> None:
+        """Eager, on the compute stream, just before the window runs/replays:
+        gate the window's kernels on its slot refill."""
+        torch.cuda.current_stream().wait_event(self.ready.pop(self.next_use))
+        self.next_use += 1
+
+    def end_window(self) -> None:
+        """Eager, right after the window's kernels are enqueued: record the
+        compute-done event a later refill of these slots waits on, then extend
+        the pump horizon to occurrence ``occ+rw-1``."""
+        occ = self.next_use - 1
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        self.done[occ] = ev
+        self._pump_to(occ + self.rw)
+
+    def copy_stats(self) -> "list[tuple[int, float]]":
+        """(bytes, ms) per pumped window occurrence. Synchronizes the device —
+        call after generation."""
+        torch.cuda.synchronize(self.device)
+        return [(b, t0.elapsed_time(t1)) for b, t0, t1 in self.copy_log]
+
+    def device_bytes(self) -> int:
+        """Device-resident ring footprint: slot buffers, plus the arena /
+        staging / LUT / decode-plan tables in ent mode (slot "values" alias
+        the arena and are not double counted)."""
+        total = sum(
+            t.nbytes for slot in self.slots for bufs in slot.values()
+            for k, t in bufs.items() if not (self.ent is not None and k == "values"))
+        if self.ent is not None:
+            total += self.arena.nbytes + sum(s.nbytes for s in self.staging) + self.lut.nbytes
+            total += sum(c[k].nbytes for w in self.ent_plans for c in w
+                         for k in ("woff", "ooff", "nsym"))
+        return total
+
+
+def _load_ent(path: str, dec_chunks: int):
+    """Load a repack_replicas_entropy.py artifact: the shared table + per
+    (layer, rel) blob/offsets/raw_len planes."""
+    from safetensors import safe_open
+
+    planes: dict = {}
+    lengths = None
+    with safe_open(path, framework="pt", device="cpu") as f:
+        meta = f.metadata() or {}
+        assert meta.get("codec") == "huff12", f"unknown pool codec: {meta}"
+        for key in f.keys():
+            parts = key.split("|")
+            if parts[0] == "__table__":
+                lengths = f.get_tensor(key).numpy()
+                continue
+            li, rel, field = int(parts[0]), parts[1], parts[2]
+            d = planes.setdefault((li, rel), {})
+            t = f.get_tensor(key)
+            d[field] = int(t.item()) if field == "raw_len" else t
+    ent = {"lengths": lengths, "block_bytes": int(meta["block_bytes"]),
+           "dec_chunks": dec_chunks}
+    return ent, planes
 
 
 def _unpack_nibbles_torch(packed: torch.Tensor, n: int) -> torch.Tensor:
     u = torch.stack(((packed >> 4) & 0xF, packed & 0xF), dim=-1).reshape(-1)
     return u[:n]
+
+
+def assemble_codes(packs: "list[dict]", track_nnz=None) -> "tuple[torch.Tensor, int]":
+    """The engine-order codes byte plane for one (layer, rel) across all N
+    tracks: per-track nibbles re-packed without the per-track pad (bits==4) or
+    the tracks' int8 codes concatenated. Returns ``(uint8 plane, nnz)``.
+
+    Single source of truth shared by ``_RelEntry`` and the entropy repacker —
+    the compressed artifact must encode EXACTLY the bytes the ring streams."""
+    import numpy as np
+
+    bits = int(packs[0]["bits"].item())
+    if bits == 4:
+        if track_nnz is None:
+            track_nnz = [
+                int(np.unpackbits(p["mask"].numpy()).sum()) for p in packs
+            ]
+        per_track = [
+            _unpack_nibbles_torch(p["codes"], int(track_nnz[k]))
+            for k, p in enumerate(packs)
+        ]
+        flat = torch.cat(per_track)
+        a = flat.numpy()
+        if a.size % 2:
+            a = np.append(a, np.uint8(0))
+        return torch.from_numpy((a[0::2] << 4) | (a[1::2])), flat.numel()
+    codes = torch.cat([p["codes"] for p in packs])
+    return codes, codes.numel()
 
 
 class PackedShadow:
@@ -277,13 +532,20 @@ class PackedShadow:
 
     def __init__(self, pool_path: str, tracks_dir: str, student: PTWrappedModel,
                  device, dtype: torch.dtype = torch.bfloat16,
-                 stream_ring_layers: "int | None" = None, fused: bool = False):
+                 stream_ring_layers: "int | None" = None, fused: bool = False,
+                 stream_window_layers: "int | None" = None,
+                 ent_path: "str | None" = None, dec_chunks: int = 4):
         import os
 
         from safetensors import safe_open
 
         from parallm.model.replica_pack import load_replica_pool
 
+        self.ent, ent_planes = None, {}
+        if ent_path is not None:
+            assert stream_ring_layers is not None, \
+                "the entropy-coded pool decodes into ring slots — streamed only"
+            self.ent, ent_planes = _load_ent(ent_path, dec_chunks)
         pool, self.meta = load_replica_pool(pool_path)
         self.n_tracks = max(k[0] for k in pool) + 1
         num_layers = max(k[1] for k in pool) + 1
@@ -308,7 +570,8 @@ class PackedShadow:
         for li, rels in self.rels_at.items():
             for rel in rels:
                 e = _RelEntry([pool[(t, li, rel)] for t in range(self.n_tracks)],
-                              device, pin=pin)
+                              device, pin=pin,
+                              ent=ent_planes[(li, rel)] if self.ent else None)
                 if fused:
                     assert e.shape[2] % 8 == 0, (rel, e.shape)  # byte-aligned rows
                 self.entries[(li, rel)] = e
@@ -346,16 +609,13 @@ class PackedShadow:
                 layer.eval()
                 track_layers.append(layer)
             self.grid.append(track_layers)
-        self._occ = 0
-        self.ring = (_Ring(self, stream_ring_layers, device)
-                     if stream_ring_layers is not None else None)
+        if stream_ring_layers is not None:
+            assert stream_window_layers, "streamed pool needs the sync-window size in layers"
+            self.ring = _Ring(self, stream_ring_layers, device, stream_window_layers)
+        else:
+            self.ring = None
 
     def layers(self, i: int) -> "list":
-        if self.ring is not None:
-            # Streamed: strictly sequential layer visits (the replay loop's order).
-            assert i == self._occ % self.num_layers, (i, self._occ)
-            self.ring.consume(self._occ, i)
-            self._occ += 1
         return [track[i] for track in self.grid]
 
     def blinear(self, li: int, rel: str, x: torch.Tensor,
@@ -378,10 +638,10 @@ class PackedShadow:
 
     # ---- packed-buffer plumbing (blinear reads through these) ----
     def active_bufs(self, li: int, rel: str) -> dict:
-        """The device-resident packed buffers for (li, rel): the ring's current
-        slot when streamed, else the entry's own tensors."""
+        """The device-resident packed buffers for (li, rel): the layer's fixed
+        ring slot when streamed, else the entry's own tensors."""
         if self.ring is not None:
-            return self.ring.active[rel]
+            return self.ring.slot_bufs(li, rel)
         e = self.entries[(li, rel)]
         bufs = {"mask": e.mask, "values": e.values}
         if e.scale is not None:
@@ -402,7 +662,7 @@ class PackedShadow:
         assert e.shape == self.scratch[rel].shape, (li, rel)
         if self._scratch_mark.get(rel) != li:
             bufs = self.active_bufs(li, rel)
-            e.unpack_from(bufs["mask"], bufs["values"][: e.values.numel()],
+            e.unpack_from(bufs["mask"], bufs["values"][: e.values_numel],
                           self.scratch[rel], self._f32.get(rel), bufs.get("scale"))
             self._scratch_mark[rel] = li
         return self.scratch[rel]
@@ -731,6 +991,10 @@ def replay_chunk(
     # The last boundary is the final layer, synced post-MLP for the head.
     boundaries = sorted(sync_set) + [last]
     K = len(student.text_models)
+    ring = getattr(shadow, "ring", None)
+    if ring is not None:  # the ring pumps whole windows — schedules must agree
+        assert boundaries == list(range(ring.D - 1, num_layers, ring.D)), \
+            (boundaries, ring.D)
 
     def seg_fn(w, carry, base, track_h):
         b = boundaries[w]
@@ -744,7 +1008,6 @@ def replay_chunk(
         for i in range(boundaries[w - 1] + 1 if w > 0 else 0, b + 1):
             mask = (linear_attn_mask
                     if tm0.config.layer_types[i] == "linear_attention" else causal_mask)
-            shadow.layers(i)  # ring prefetch / residency side effects
             # Own exact mixers on the carry (write own KV/GDN state), K-batched.
             y_own = mixer(own, i, carry, mask, own_cache)
             track_h = [th + y_own[k] for k, th in enumerate(track_h)]
@@ -788,6 +1051,8 @@ def replay_chunk(
         track_h = [h] * K        # base + own exact deltas since
 
     for w in range(len(boundaries)):
+        if ring is not None:
+            ring.begin_window()  # eager: gate this window's kernels on its refill
         if use_g:
             g = st["graphs"][w]
             if g is None:
@@ -801,6 +1066,8 @@ def replay_chunk(
             g.replay()
         else:
             carry, track_h = seg_fn(w, carry, base, track_h)
+        if ring is not None:
+            ring.end_window()  # eager: record done, extend the pump horizon
         if prof:
             t = _mark()
             win_ms.append((t - seg_t) * 1e3)
@@ -860,10 +1127,10 @@ def generate(
     # broadcast round; add a stop-flag round if interactive use ever needs it.
     caches = EngineCaches.build(student,
                                 s_max=input_ids.shape[1] + max_new_tokens)
+    # Graphs compose with the stream ring: slots sit at fixed addresses the
+    # captures bake, and all ring host/event work runs in the eager boundary
+    # region (geometry enforced at _Ring construction).
     graphs: "dict | None" = {} if use_cuda_graphs else None
-    if use_cuda_graphs:
-        assert getattr(shadow, "ring", None) is None, \
-            "CUDA graphs need --residency resident (the stream ring is eager)"
     per_token_ms: "list[float]" = []
 
     t0 = time.perf_counter()

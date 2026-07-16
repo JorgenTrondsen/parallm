@@ -58,6 +58,24 @@ the stalls**: a one-window ring (~626 MB) is as good as a full double buffer, cu
 resident HBM ~55% at +0 ms once a real multi-node sync costs ≥40 ms (measured,
 [bench_stream_overlap.py](../scripts/bench_stream_overlap.py)).
 
+Streaming is **window-granular and CUDA-graph-compatible** (2026-07-12): ring
+slots sit at fixed device addresses the captured windows bake, and all
+copy/event work runs in the eager boundary regions — streamed + graphed decode
+is bit-identical to resident (`--residency streamed`, rails in
+[tests/test_engine.py](../tests/test_engine.py)). On top of it, the codes plane
+(the only compressible one: int4 codes carry 2.97/4 bits, the bitmap is AT the
+entropy limit) can stream **entropy-coded** (`--pool-codec ent`,
+[entropy_codec.py](../src/parallm/entropy_codec.py) +
+[scripts/repack_replicas_entropy.py](../scripts/repack_replicas_entropy.py)):
+a pool-wide static Huffman table, GPU-decoded into the ring during the stalls
+(batched block-parallel triton decoder, ~26 GB/s on int4 pools — int8-heavy
+pools drop to ~13 GB/s, the LUT gather scatters), lossless ⇒ tokens stay
+bit-identical. Measured on the 9B `qwanda:4:0.5` floor pool (2.50 GB → 2.11 GB):
+per-window copies 49.7 → 40.8 ms on a 12.7 GB/s shared link. On a dedicated
+PCIe4 node (~26 GB/s) the ent window (~528 MB) ≈ the 20 ms stall budget —
+streaming is ~free at S=20 where raw (+4 ms/window) is not, and both are free
+at S≥25 or PCIe5.
+
 ## 3. Where it lives
 
 - **Convert:** [slicer/](../src/parallm/slicer/) + [scripts/convert.py](../scripts/convert.py) (one streaming converter for bf16 / NVFP4, dense / MoE) → per-track `safetensors` + manifest.
@@ -65,13 +83,36 @@ resident HBM ~55% at +0 ms once a real multi-node sync costs ≥40 ms (measured,
 - **Forward:** [model/pt_model.py](../src/parallm/model/pt_model.py) `PTWrappedModel` (lockstep window iteration + `SyncBoundary`).
 - **Eval:** [eval/fidelity.py](../src/parallm/eval/fidelity.py) (KL/ppl), [eval/downstream.py](../src/parallm/eval/downstream.py) + [eval/lm_eval_adapter.py](../src/parallm/eval/lm_eval_adapter.py). **Judge recovery by downstream retention** (arc_challenge / winogrande / piqa), not KL/ppl — the proxy hid a real failure once (KL ~85% while hard-reasoning was ~22–33%).
 
-## 4. What's next (not yet built)
+## 4. The inference engine (built)
 
-The **inference engine**: sglang GPU backend, tracks placed across nodes (~20 ms
-inter-node latency), lockstep decode that replays the sparse copies between syncs
-and streams the replica pool from host DRAM behind the sync stalls. Inference
-centralizes embed + lm_head on a head node; per track ≈ own bf16 blocks + a
-streamed replica ring + KV/state.
+[engine.py](../src/parallm/engine.py) + [scripts/serve_cli.py](../scripts/serve_cli.py):
+lockstep decode, track-as-batch forward, CUDA-graphed windows, simulated
+inter-node link (`--latency-ms`), streamed/entropy-coded pool residency (§2).
+27B decode ≈ 108 ms/tok at S=20 (5 rounds × 20 ms + ~8 ms) resident; streamed
+adds `Σ_w max(0, window_bytes/BW − S)` — on the shared-PCIe sim box BW is
+~12.7 GB/s/rank (pairs of GPUs share host links; a real one-rank-per-node
+deployment keeps the full link). Inference centralizes embed + lm_head on a
+head node; per track ≈ own bf16 blocks + a streamed replica ring + KV/state.
+
+**Node-envelope fit (measured 2026-07-13, 9B/N=16 ent-streamed, S=20).** The
+serve panel prints a per-rank HBM ledger. Against the deployment envelope of
+8 GB VRAM / 16 GB DRAM per node:
+
+| node | VRAM steady | breakdown | host DRAM |
+|---|---|---|---|
+| track node (1 track, projected from measured peers) | **4.04 GB** | 0.83 own blocks + 1.42 ring(ent) + 1.79 KV/graphs/act | 2.11 GB pinned |
+| head node (embed+lm_head add 3.79 GB) | **~7.8 GB** | tight; shed the head's own track via non-uniform `tracks_per_rank_list` if it overflows | 2.11 GB pinned |
+
+Speed on an uncontended link (world=1 arm; the engine realizes ~21–23 GB/s of
+the box's 25.9 GB/s PCIe4): ent copies 25.0 ms/window → **+19.8 ms/tok** at
+S=20 (raw: 27.3 ms → +29.3); at S=40 measured **+0.0 — fully hidden**; the
+crossover is S ≈ 25 ms, and full PCIe4 or PCIe5 puts ent at ≈ the S=20 stall
+already. Verdict: the 9B-class config fits the 8/16 node with ~2× VRAM
+headroom on track nodes, and stall-hiding follows the law exactly — free from
+S≥25 on this link, S=20 on full PCIe4/PCIe5. Anything above the ~2.1–2.5 GB
+pool class cannot hide at S=20/PCIe4: 27B (9.14 GB ent wire) adds ~+270 ms/tok
+and its own bf16 slice alone breaks 8 GB; GLM-class needs the MoE
+active-expert tier account (`docs/glm_sizing.md`).
 
 ## 5. The refuted program (recovering `D>1` quality without recomputation)
 
