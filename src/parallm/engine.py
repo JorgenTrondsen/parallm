@@ -781,7 +781,11 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
             # window from this raw pre-conv context at the accepted length.
             cache.log.setdefault(li, {}).update(conv_ctx=xc, kc=K)
         elif cache is not None:
-            cache.conv[li] = nn.functional.pad(xc, (K - xc.shape[-1], 0))
+            ctx = nn.functional.pad(xc, (K - xc.shape[-1], 0))
+            if li in cache.conv:
+                cache.conv[li].copy_(ctx)  # keep the address graphs captured
+            else:
+                cache.conv[li] = ctx
         L = xc.shape[-1]
         if m.causal_conv1d_fn is not None:
             xc = m.causal_conv1d_fn(x=xc, weight=conv_w, bias=None,
@@ -1009,18 +1013,32 @@ def replay_chunk(
         assert boundaries == list(range(ring.D - 1, num_layers, ring.D)), \
             (boundaries, ring.D)
 
+    # Single-track dense replay (the drafter path): own provider IS the shadow
+    # and there is exactly one exact track, so the carry chain alone computes
+    # the dense forward — skip the duplicate own-chain kernels (halves the
+    # per-step graph).
+    n1 = K == 1 and shadow.n_tracks == 1 and shadow is own
+
     def seg_fn(w, carry, base, track_h):
         b = boundaries[w]
         if w > 0:
             pb = boundaries[w - 1]
-            # Exact MLP reads the TRUE residual; shadow MLP advances the carry
-            # from it with degraded weights.
-            y_own = _batched_mlp(own, pb, base)
-            track_h = [base + y_own[k] for k in range(K)]
-            carry = base + _batched_mlp(shadow, pb, base).sum(0)
+            if n1:
+                carry = base + _batched_mlp(shadow, pb, base).sum(0)
+            else:
+                # Exact MLP reads the TRUE residual; shadow MLP advances the
+                # carry from it with degraded weights.
+                y_own = _batched_mlp(own, pb, base)
+                track_h = [base + y_own[k] for k in range(K)]
+                carry = base + _batched_mlp(shadow, pb, base).sum(0)
         for i in range(boundaries[w - 1] + 1 if w > 0 else 0, b + 1):
             mask = (linear_attn_mask
                     if tm0.config.layer_types[i] == "linear_attention" else causal_mask)
+            if n1:
+                carry = carry + mixer(shadow, i, carry, mask, shadow_cache).sum(0)
+                if i < b or b == last:
+                    carry = carry + _batched_mlp(shadow, i, carry).sum(0)
+                continue
             # Own exact mixers on the carry (write own KV/GDN state), K-batched.
             y_own = mixer(own, i, carry, mask, own_cache)
             track_h = [th + y_own[k] for k, th in enumerate(track_h)]
@@ -1030,19 +1048,21 @@ def replay_chunk(
                 y_own = _batched_mlp(own, i, carry_attn)
                 track_h = [th + y_own[k] for k, th in enumerate(track_h)]
                 carry = carry_attn + _batched_mlp(shadow, i, carry_attn).sum(0)
-        return carry, track_h
+        return (carry, [carry]) if n1 else (carry, track_h)
 
-    # CUDA-graph windows: cached 1-token decode only, one eager warmup step
-    # (allocations, JIT/autotune, cuBLAS workspaces) before capture.
-    use_g = (graphs is not None and caches is not None and past > 0 and T == 1
-             and h.is_cuda)
-    if use_g and not graphs.get("warm"):
-        graphs["warm"] = True
+    # CUDA-graph windows: cached decode at a FIXED chunk width — 1-token steps
+    # and, for draft-verify, the k+1-token verify chunk (``graphs["chunk_T"]``).
+    # One eager warmup step per width (allocations, JIT/autotune, cuBLAS
+    # workspaces, lazy KV/conv/rec buffers) before capture; statics per width.
+    use_g = (graphs is not None and caches is not None and past > 0
+             and (T == 1 or T == graphs.get("chunk_T")) and h.is_cuda)
+    if use_g and not graphs.get(("warm", T)):
+        graphs[("warm", T)] = True
         use_g = False
     if use_g:
-        st = graphs.get("static")
+        st = graphs.get(("static", T))
         if st is None:
-            st = graphs["static"] = {
+            st = graphs[("static", T)] = {
                 "carry": torch.empty_like(h), "base": torch.empty_like(h),
                 "track_h": [torch.empty_like(h) for _ in range(K)],
                 "cos": position_embeddings[0].clone(),
@@ -1188,15 +1208,27 @@ def _rollback_gdn(cache: BatchedShadowCache, upto: int) -> None:
     back and the offset mask hides the stale tail until it is overwritten."""
     m = _hf()
     fn = m.chunk_gated_delta_rule or m.torch_chunk_gated_delta_rule
-    for li, d in cache.log.items():
-        kc = d["kc"]
-        cache.conv[li] = d["conv_ctx"][..., upto: kc + upto].contiguous()
-        q, k, v, g, beta = d["qkvgb"]
-        _core, rec_out = fn(q[:, :upto], k[:, :upto], v[:, :upto], g=g[:, :upto],
-                            beta=beta[:, :upto], initial_state=cache.rec.get(li),
-                            output_final_state=True, use_qk_l2norm_in_kernel=True)
-        cache.update_rec(li, rec_out)
-    cache.log = None
+    if not cache.log:
+        return
+    lis = sorted(cache.log)
+    for li in lis:
+        d = cache.log[li]
+        # copy_ (never reassign): the verify-window graphs captured this
+        # buffer's address; the log entries likewise persist across blocks —
+        # each replay refreshes the same graph-pool tensors in place.
+        cache.conv[li].copy_(d["conv_ctx"][..., upto: d["kc"] + upto])
+    # ONE kernel replay for all logged layers: every GDN layer shares head
+    # geometry, so layers stack on the batch dim (per-layer eager calls were
+    # ~launch-bound: 2 caches x ~L layers per block).
+    parts = [cache.log[li]["qkvgb"] for li in lis]
+    q, k, v, g, beta = (torch.cat([p[j][:, :upto] for p in parts], dim=0)
+                        for j in range(5))
+    init = torch.cat([cache.rec[li] for li in lis], dim=0)
+    _core, rec_out = fn(q, k, v, g=g, beta=beta, initial_state=init,
+                        output_final_state=True, use_qk_l2norm_in_kernel=True)
+    nb = parts[0][0].shape[0]
+    for i, li in enumerate(lis):
+        cache.update_rec(li, rec_out[i * nb: (i + 1) * nb])
 
 
 @torch.no_grad()
@@ -1210,6 +1242,7 @@ def generate_draft_verify(
     k: int,
     latency_s: float = 0.0,
     timing: "dict | None" = None,
+    use_cuda_graphs: bool = False,
 ) -> torch.LongTensor:
     """Prefill + block draft-verify greedy decode: the head drafts ``k``
     tokens locally (``draft_propose(seq (1, T), k) -> (k,)``; never called on
@@ -1232,11 +1265,15 @@ def generate_draft_verify(
     device = input_ids.device
     distributed = dist.is_available() and dist.is_initialized() \
         and dist.get_world_size() > 1
+    graphs: "dict | None" = {"chunk_T": k + 1} if use_cuda_graphs else None
 
     t0 = time.perf_counter()
     logits = replay_chunk(student, shadow, input_ids, sync_indices, caches,
                           latency_s=latency_s, timing=timing)
     prefill_ms = (time.perf_counter() - t0) * 1e3
+    # Deferred-commit (draft-verify) mode from here on: entries persist across
+    # blocks — under graphs each replay refreshes the same logged tensors.
+    caches.own.log, caches.shadow.log = {}, {}
 
     tok = torch.zeros((1, 1), dtype=torch.long, device=device)
     if head:
@@ -1247,6 +1284,12 @@ def generate_draft_verify(
     per_block_ms: "list[float]" = []
     accept_t = torch.zeros((), dtype=torch.long, device=device)
 
+    prof = timing is not None and timing.get("profile") and input_ids.is_cuda
+
+    def _mark():
+        torch.cuda.synchronize()
+        return time.perf_counter()
+
     while tokens < max_new_tokens:
         t0 = time.perf_counter()
         if head:
@@ -1254,10 +1297,11 @@ def generate_draft_verify(
             chunk = torch.cat([seq[:, -1:], proposals.view(1, -1)], dim=1)
         else:
             chunk = torch.zeros((1, k + 1), dtype=torch.long, device=device)
+        if prof:
+            timing.setdefault("draft_ms", []).append((_mark() - t0) * 1e3)
         start_pos = caches.pos
-        caches.own.log, caches.shadow.log = {}, {}
         logits = replay_chunk(student, shadow, chunk, sync_indices, caches,
-                              latency_s=latency_s, timing=timing)
+                              latency_s=latency_s, timing=timing, graphs=graphs)
         if head:
             # Chunk position j predicts sequence slot start_pos+j+1, so the
             # argmaxes are the greedy targets for the k proposal slots plus
@@ -1267,10 +1311,17 @@ def generate_draft_verify(
             accept_t.fill_(accepted)
         if distributed:
             dist.broadcast(accept_t, src=0)
-        _stall(latency_s, timing)  # the accept round rides the wire like a sync
+        # No stall: the accept count flies while the head drafts the next
+        # block (~k drafter steps > one wire latency), so peers have rolled
+        # back before the next chunk's embed round lands — the embed stall
+        # is the only wire wait either side still pays between chunks.
         a = int(accept_t)
+        if prof:
+            tr = time.perf_counter()
         _rollback_gdn(caches.own, a + 1)
         _rollback_gdn(caches.shadow, a + 1)
+        if prof:
+            timing.setdefault("rollback_ms", []).append((_mark() - tr) * 1e3)
         caches.pos = start_pos + a + 1
         if head:
             emitted = targets[: a + 1].view(1, -1)
@@ -1281,6 +1332,8 @@ def generate_draft_verify(
         tokens += a + 1
         blocks += 1
         per_block_ms.append((time.perf_counter() - t0) * 1e3)
+        if timing is not None:
+            timing.setdefault("accepts", []).append(a)
 
     if timing is not None:
         timing["prefill_ms"] = prefill_ms

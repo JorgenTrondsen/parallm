@@ -48,19 +48,53 @@ does NOT depress τ; the drafter-target agreement does.** The record's
 τ 7.05–8.61 (0.8B→9B, k-capped) is code-class. Prose saturates by k=16 —
 pushing k buys nothing there; only a better/healed drafter moves prose τ.
 
-### Wall-clock decomposition (why 449 ms/tok, and the path down)
+### Wall-clock decomposition (why 449 ms/tok, and the fix — BUILT 2026-07-17)
 
-Per verify pass (`--profile`): 4 windows × ~235 ms EAGER verify compute
-(the ungraphed launch-overhead tax — plain decode pays 6.7 ms/tok compute
-only because its windows are CUDA-graphed; the graph machinery gates on
-T==1 today), + k×~28 ms drafting (0.8B on the HF loop), + 6×20 ms rounds.
-Named engineering items, in order of value:
-1. **Graph the verify windows** (fixed T=k+1 ⇒ static shapes; the GDN
-   rollback log needs static buffers) — removes ~900 ms/pass.
-2. **Drafter decode loop** — 28 ms/tok is launch-overhead-bound for a 0.8B;
-   a graphed/compiled drafter is ~3–8 ms.
-With both, at code-τ 14: ≈ (120 + ~100)/14 + 48×8/14 ≈ **43 ms/tok ≈ 2.5×
-the resident baseline**; at prose-τ 2.7: ~parity with the 107 ms baseline.
+torch.profiler corrected the first attribution: the dominant tax was NOT
+launch overhead but the packed-GEMV kernel putting chunk positions on the
+launch GRID — each of the k+1 verify positions re-read the ENTIRE pool
+(925 of ~1280 ms GPU-busy/pass at M=17; graphs can never remove busy time).
+The five fixes, all bit-exact plumbing (rails re-verified):
+1. **GEMV M-tiling** (`packed_gemv.py`): weight block decoded once, applied
+   to all chunk positions via a tl.dot tensor-core tile (BLOCK_O=16-32,
+   M_TILE 16-64, swept). Verify-chunk GEMV: 17×→**1.7× the M=1 cost** at
+   M=17, 2.1× at M=33. M=1 keeps the original body bit-identical.
+2. **CUDA-graphed verify windows** (T=k+1 statics keyed by width; conv
+   commits/rollback switched to `copy_` for address stability; the GDN log
+   persists across blocks — replays refresh the same graph-pool tensors).
+   Serial window compute 942 → 198 ms/pass (k=16). Graphed ≡ eager emitted
+   ids verified bit-identical on the 27B.
+3. **Engine-run drafter** (`serve_cli.py EngineDrafter`, `--draft-loop`):
+   the 0.8B through the engine's own graphed N=1 decode (SyncBoundary
+   no-ops, single-chain fast path in the layer walk since own ≡ shadow at
+   N=1): 28 → **5.2 ms/step**; catch-up = the graphed step replayed over
+   the ≤8 accepted tokens (longer catch-ups: one eager chunk, ~45 ms flat).
+   GDN snapshot/restore (~0.3 ms) replaces re-prefill; KV rolls back by
+   pointer. Extra bytes on track nodes: still zero.
+4. **Accept broadcast rides the draft time** (peers roll back while the
+   head drafts): rounds 6 → 5/block.
+5. **Batched rollback**: all logged GDN layers stack on the batch dim of
+   ONE chunk-kernel call per cache — 84 → 11 ms/block.
+
+### Measured after the fixes (same assets, standalone runs, 96 new tokens)
+
+| arm | ms/tok mean | ms/tok steady* | τ | syncs/tok | vs before |
+|---|---|---|---|---|---|
+| plain resident (baseline) | 106.4 | p50 101.6 | — | 4 | unchanged ✓ |
+| **resident prose k=8** | **95.9** | **86.5** | 2.46 | 1.62 | 449 (k16) |
+| **resident code k=32** | **36.7** | **25.8** | 16.33 | 0.24 | — |
+| **streamed+ent code k=32** | — | **70.6** | 16.33 | 0.24 | 213 |
+| streamed prose k=8 | — | 413.8 | 2.46 | 1.62 | copy-bound (9.14 GB/2.46 = 3.7 GB wire/tok — the drafter lever, not an engineering item) |
+
+*steady = excluding the two one-time warmup/capture blocks (any long
+generation amortizes them to zero). **The ≤100 ms/token target is met on
+both domains resident (draft-verify now BEATS the plain 107 ms baseline
+everywhere) and on code streamed — the 8/16-node arm.** Prose k=8 is the
+operating point (τ saturates by k=8; bigger k only pays draft time).
+Per-block decomposition at code k=32 (`--profile`): draft 211 ms
+(k×5.2 + catch-up), verify serial 345 + syncs 81, rollback 11.
+Sweep caveat: multi-k `--draft-k` lists in one process showed occasional
+cross-entry slowdowns; ledger numbers come from one-k-per-process runs.
 
 ### Streamed pool ÷ τ (the 27B-reopening arm)
 
@@ -72,16 +106,16 @@ tokens (measured this session — `serve_out/dv_streamed_*.log`):
 |---|---|---|---|---|
 | plain streamed, k=0 (prose) | 942 | 4 | 9.14 GB | 207 ms @ 11.0 GB/s (8-rank-contended link) |
 | dv streamed k=16 (prose, τ=3.41) | 636 | 1.17 | 2.68 GB | 207 ms |
-| **dv streamed k=32 (code, τ=16.33 on-gen)** | **213** | **0.24** | **0.56 GB** | 193 ms @ 11.8 GB/s |
+| dv streamed k=32 (code, τ=16.33 on-gen) | 213 → **70.6 steady post-fix** | **0.24** | **0.56 GB** | 195 ms @ 11.7 GB/s |
 
 On-gen τ (16.33) exceeds τ_TF (12.80@k32) — the deployed number is the
 better one, as the tag-era module predicted. Code-class decode puts the
 streamed 27B pool at 0.56 GB/token — far inside the ~2 GB/token wire
 envelope that closed plain-streamed 27B — **27B streamed on 8/16-class
-nodes is reopened for code-class decode**; prose (2.68 GB/token) rides on
-the drafter lever like everything else. Today's ms/tok still carries the
-eager-verify and 28 ms-drafter taxes (items 1–2 above); the copies
-themselves already hide behind the eager pass.
+nodes is reopened for code-class decode, now at 70.6 ms/token steady
+(14.2 tok/s), i.e. FASTER than the plain resident baseline while holding
+the pool in host DRAM** (track-node projection 12.30 GB vs 16.86 resident).
+Prose streamed stays copy-bound (pool/τ wire) — the drafter lever.
 
 ## The 100B-class ledger (pool-free d1b verify)
 
@@ -101,10 +135,13 @@ at 9B after healing): S ≈ L ≈ 64–80 boundaries/pass, pool = 0 bytes.
 - **Extra memory**: drafter on the head node only (track nodes: 0 bytes) or
   ≤1×track if replicated; KV/conv/rec rollback state is transient
   (≤ k+1-token chunk logs).
-- **Wall-clock envelope**: ms/tok ≈ (S+2)·20/τ + verify_compute/τ + k·d/τ.
-  At L=64, τ=14, graphed verify (~150 ms/pass est.), 8 ms drafter, k=48:
-  ≈ 94 + 11 + 27 ≈ **132 ms/tok ≈ 7.6 tok/s** on code-class decode; prose at
-  τ=3 ≈ 480 ms/tok — again, the drafter lever.
+- **Wall-clock envelope** (both engineering legs now BUILT and measured at
+  27B: graphed T=k+1 verify, 5.2 ms/step drafter, accept rides the draft):
+  ms/tok ≈ (S+1)·20/τ + verify_compute/τ + k·d/τ. At L=64, τ=14, graphed
+  verify (~150 ms/pass est.), k=48: ≈ 93 + 11 + 18 ≈ **122 ms/tok ≈ 8
+  tok/s** on code-class decode — rounds-dominated, so the remaining 100B
+  levers are τ (drafter) and S (schedule), not compute; prose at τ=3 ≈
+  450 ms/tok — again, the drafter lever.
 
 ## Verdicts
 
@@ -118,5 +155,10 @@ at 9B after healing): S ≈ L ≈ 64–80 boundaries/pass, pool = 0 bytes.
    tie — the same ~1e-3 class as the existing incremental≡full rail. The
    verify-pass forward is the SAME full-sequence path all recorded
    downstream numbers were scored on; per-token decode is the deviant.
-3. The ≤5 syncs/token goal: **met everywhere at 27B (1.2–1.5 worst-domain)**;
+3. The ≤5 syncs/token goal: **met everywhere at 27B (1.2–1.6 worst-domain)**;
    met on code at 100B-class d1b; open on prose pending the drafter lever.
+4. The ≤100 ms/token wall-clock target (2026-07-17): **met on both domains
+   resident (prose k=8 95.9/86.5, code k=32 36.7/25.8) and on code streamed
+   (70.6)** — draft-verify beats plain decode outright; streamed prose is
+   pool-wire physics (pool/τ), waiting on the same drafter lever as 100B
+   prose. All fixes bit-exact; plain-decode baseline reproduced unchanged.

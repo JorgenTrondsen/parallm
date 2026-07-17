@@ -353,8 +353,9 @@ def test_draft_verify_matches_plain_greedy():
                                        k=k, timing=timing)
             assert dv.shape[1] >= NEW and timing["tokens"] == dv.shape[1]
             assert torch.equal(dv[:, :NEW], plain), (propose.__name__, k)
-            # Every block pays 1 embed + 2 boundary all-reduces + 1 accept round.
-            assert timing["rounds"] == 3 + timing["blocks"] * 4
+            # Every block pays 1 embed + 2 boundary all-reduces; the accept
+            # broadcast rides the wire during drafting (no stall of its own).
+            assert timing["rounds"] == 3 + timing["blocks"] * 3
 
 
 def test_generate_reports_comm_rounds():

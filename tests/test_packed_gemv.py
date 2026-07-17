@@ -43,6 +43,37 @@ def test_kernel_matches_dense_path(bits):
 
 
 @cuda_only
+@pytest.mark.parametrize("bits", [None, 4, 8])
+def test_m_tiled_matches_per_row(bits):
+    """The M-tiled kernel (one weight-block load serving M_TILE chunk
+    positions) against the M=1 path row by row. The verify-chunk speed fix
+    must not change what a position computes."""
+    from parallm.engine import _RelEntry
+    from parallm.packed_gemv import packed_gemv
+
+    torch.manual_seed(2)
+    o, i = 48, 520
+    w = torch.randn(o, i, dtype=torch.bfloat16)
+    norms = torch.rand(i) + 0.1
+    p = pack_sparse_weight(w, 0.5, norms, bits=bits)
+    e = _RelEntry([p], "cuda")
+    kw = dict(mask=e.mask[0], values=e.values,
+              scale=e.scale[0] if e.scale is not None else None,
+              block_start=e.block_start[0], out_features=o, in_features=i,
+              bits=bits)
+
+    for M in (2, 17, 33):
+        x = torch.randn(M, i, dtype=torch.bfloat16, device="cuda")
+        tiled = packed_gemv(x, **kw)
+        per_row = torch.cat([packed_gemv(x[m:m + 1], **kw) for m in range(M)])
+        # tl.dot products are exact (bf16xbf16 in f32); only the accumulation
+        # tree differs from the M=1 path -> last-ulp class, same as the
+        # kernel-vs-dense rail above.
+        torch.testing.assert_close(tiled.float(), per_row.float(),
+                                   rtol=1e-2, atol=1e-2)
+
+
+@cuda_only
 def test_packed_linear_dense_fallback():
     """Kernel coverage at M past blinear's dense-fallback threshold."""
     from parallm.engine import _RelEntry

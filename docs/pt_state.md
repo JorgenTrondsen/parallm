@@ -145,3 +145,17 @@ the drafter, not the schedule or the degraded verifier, is the binding lever;
 see `docs/draft_verify_sizing.md` for the full gates + the 100B pool-free d1b
 ledger and the two named engineering items (graphed verify windows, fast
 drafter loop).
+
+**2026-07-17 wall-clock closed (≤100 ms/token):** resident 95.9/86.5-steady
+ms/token prose (k=8) and 36.7/25.8 code (k=32), streamed+ent code 70.6 —
+draft-verify now beats the plain 107 ms baseline on both domains resident and
+on code streamed. The profiler corrected the tax attribution: the packed GEMV
+had chunk positions on the launch grid, so each verify position re-read the
+whole pool (925 ms busy/pass); fixed by a tl.dot M-tile (1.7–2.1× the M=1
+cost, M=1 body bit-identical). Verify windows are CUDA-graphed at T=k+1
+(graphed ≡ eager emitted ids), the drafter runs through the engine itself at
+N=1 (`serve_cli.py EngineDrafter`, 5.2 ms/step, single-chain fast path), the
+accept broadcast rides the draft time (5 rounds/block), and the GDN rollback
+batches all layers into one kernel call. All bit-exact; 119 tests green.
+Streamed prose (414 ms/token) is pool-wire physics (pool/τ) — the drafter
+lever, same as 100B prose.

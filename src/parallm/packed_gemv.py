@@ -34,6 +34,10 @@ from __future__ import annotations
 import torch
 
 GEMV_BLOCK_I = 256  # bitmap block width; block_start layout depends on it
+# Chunk positions amortized per weight-block load (verify chunks are M=k+1;
+# M=1 keeps the original body). Swept on a 27B-sized plane: one m-block per
+# chunk beats splitting (M=33: 4.9 ms @64 vs 7.2 @32 vs 2.2 @M=1); env-overridable.
+GEMV_M_TILE = int(__import__("os").environ.get("PARALLM_GEMV_MT", "64"))
 
 
 def _kernel():
@@ -46,18 +50,20 @@ def _kernel():
         x_ptr, y_ptr, mask_ptr, val_ptr, scale_ptr, bstart_ptr,
         M, IN, OUT, NB, X_TSTRIDE,
         BITS: tl.constexpr, OFFSET: tl.constexpr,
-        BLOCK_I: tl.constexpr, BLOCK_O: tl.constexpr,
+        BLOCK_I: tl.constexpr, BLOCK_O: tl.constexpr, M_TILE: tl.constexpr,
     ):
         o_blocks = tl.cdiv(OUT, BLOCK_O)
         t = tl.program_id(0) // o_blocks
         rows = (tl.program_id(0) % o_blocks) * BLOCK_O + tl.arange(0, BLOCK_O)
-        m = tl.program_id(1)
+        m0 = tl.program_id(1) * M_TILE
+        ms = m0 + tl.arange(0, M_TILE)
+        m_ok = ms < M
         r_ok = rows < OUT
-        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        acc = tl.zeros((BLOCK_O, M_TILE), dtype=tl.float32)
         if BITS > 0:
             scale = tl.load(scale_ptr + t * OUT + rows, mask=r_ok, other=0.0)
         mask_base = mask_ptr + t * (OUT * (IN // 8))
-        x_base = x_ptr + t * X_TSTRIDE + m * IN
+        x_base = x_ptr + t * X_TSTRIDE
         NBY: tl.constexpr = BLOCK_I // 8
         for jb in range(0, IN, BLOCK_I):
             # Independent iterations: this block's value index comes from the
@@ -87,10 +93,27 @@ def _kernel():
                 w = w.to(tl.bfloat16).to(tl.float32)
             w = tl.where(on, w, 0.0)
             lanes = jb + tl.arange(0, BLOCK_I)
-            xb = tl.load(x_base + lanes, mask=lanes < IN, other=0.0).to(tl.float32)
-            xb = tl.reshape(xb, (NBY, 8))
-            acc += tl.sum(tl.sum(w * xb[None, :, :], axis=2), axis=1)
-        tl.store(y_ptr + (t * M + m) * OUT + rows, acc.to(tl.bfloat16), mask=r_ok)
+            if M_TILE == 1:
+                # The original M=1 body, kept verbatim: plain decode must stay
+                # bit-identical to the pre-tiling kernel (same reduction layout).
+                xb = tl.load(x_base + m0 * IN + lanes, mask=lanes < IN,
+                             other=0.0).to(tl.float32)
+                xb = tl.reshape(xb, (NBY, 8))
+                a1 = tl.sum(tl.sum(w * xb[None, :, :], axis=2), axis=1)
+                acc += a1[:, None]
+            else:
+                # The weight block is loaded/decoded ONCE and applied to all
+                # M_TILE chunk positions (pool traffic ÷ M_TILE — the verify
+                # chunk was paying a full pool read PER position), with the
+                # per-position FMAs on tensor cores: products are exact
+                # (bf16×bf16 in f32), only the accumulation tree differs.
+                xb = tl.load(x_base + ms[:, None] * IN + lanes[None, :],
+                             mask=m_ok[:, None] & (lanes < IN)[None, :],
+                             other=0.0)
+                acc = tl.dot(tl.reshape(w, (BLOCK_O, BLOCK_I)).to(tl.bfloat16),
+                             tl.trans(xb), acc)
+        tl.store(y_ptr + (t * M + ms)[None, :] * OUT + rows[:, None],
+                 acc.to(tl.bfloat16), mask=r_ok[:, None] & m_ok[None, :])
 
     return packed_gemv_kernel
 
@@ -107,13 +130,19 @@ def _launch(x, mask, values, scale, block_start, n_tracks, M, out_features,
 
     y = torch.empty(n_tracks, M, out_features, dtype=torch.bfloat16, device=x.device)
     nb = triton.cdiv(in_features, GEMV_BLOCK_I)
-    BLOCK_O = 2  # swept with num_warps/GEMV_BLOCK_I on the real 27B pool
-    grid = (n_tracks * triton.cdiv(out_features, BLOCK_O), M)
+    if M == 1:
+        mt, BLOCK_O, nw = 1, 2, 1   # swept on the real 27B pool (decode regime)
+    else:
+        # tl.dot needs a >=16-wide tile on every dim; (BLOCK_O, num_warps)
+        # swept per tile on a 27B-sized plane (bench_gemv_cfg)
+        mt = min(max(triton.next_power_of_2(M), 16), GEMV_M_TILE)
+        BLOCK_O, nw = {16: (32, 8), 32: (16, 4)}.get(mt, (32, 4))
+    grid = (n_tracks * triton.cdiv(out_features, BLOCK_O), triton.cdiv(M, mt))
     _packed_gemv_kernel[grid](
         x, y, mask, values, scale if scale is not None else values, block_start,
         M, in_features, out_features, nb, x_tstride,
         BITS=bits or 0, OFFSET=float(1 << (bits - 1)) if bits else 0.0,
-        BLOCK_I=GEMV_BLOCK_I, BLOCK_O=BLOCK_O, num_warps=1,
+        BLOCK_I=GEMV_BLOCK_I, BLOCK_O=BLOCK_O, M_TILE=mt, num_warps=nw,
     )
     return y
 
