@@ -58,6 +58,14 @@ _PRESETS: dict[str, list[DataSourceSpec]] = {
         DataSourceSpec("open-web-math/open-web-math", text_key="text", weight=0.15),
         DataSourceSpec("bigcode/the-stack-dedup", text_key="content", weight=0.15),  # gated; needs HF_TOKEN
     ],
+    # qwen-mix's shape with only UNGATED sources (verified streaming anonymously
+    # from this box 2026-07-18): the code slice is codeparrot-clean (Python-only —
+    # the-stack/starcoderdata are gated). The 27B d1b-heal default.
+    "open-mix": [
+        DataSourceSpec("DKYoon/SlimPajama-6B", text_key="text", weight=0.60),
+        DataSourceSpec("open-web-math/open-web-math", text_key="text", weight=0.15),
+        DataSourceSpec("codeparrot/codeparrot-clean", text_key="content", weight=0.25),
+    ],
 }
 
 DEFAULT_PRESET = "qwen-mix"

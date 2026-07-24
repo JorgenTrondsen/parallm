@@ -143,6 +143,74 @@ at 9B after healing): S ≈ L ≈ 64–80 boundaries/pass, pool = 0 bytes.
   levers are τ (drafter) and S (schedule), not compute; prose at τ=3 ≈
   450 ms/tok — again, the drafter lever.
 
+### Pool-free (tracks-only nodes) measured at 27B — 2026-07-17
+
+The 100B d1b arm run on today's assets: `--sync-indices 0..63` (64
+boundaries, post-attn placement) with `--replicas none` (serve_cli: shadow =
+the rank's OWN tracks, so the carry is per-rank — the trained-d1b semantics;
+pool never loaded). Same prompts across arms (τ is prompt-sensitive: the
+quicksort prompt reads τ 6.86 on the recorded D=16+pool arm, not 16.33).
+
+| arm (same prompts) | track-node HBM | τ | syncs/tok | ms/tok steady | output |
+|---|---|---|---|---|---|
+| D=16+pool, code k=32 (control) | 16.86 GB | 6.86 | 0.58 | 73.5 | ✓ |
+| d1+pool, code k=32 | 16.86 GB | **18.00** | 3.56 | 132.7 | ✓ (clean code) |
+| d1+pool, prose k=8 | 16.86 GB | 4.57 | 14.0 | 278.1 | ✓ (greedy loops) |
+| **d1 pool-free, code k=32** | **5.88 GB** | (13.62)* | — | (77.2)* | **✗ collapsed** |
+| d1 pool-free, prose k=8 | **5.88 GB** | (6.31)* | — | (196.1)* | **✗ collapsed** |
+
+*Collapsed-output τ is inflated by degeneracy ("1. 1. 1." is trivially
+draftable) — mechanics-only numbers, not quality-bearing.
+
+Three findings:
+1. **The wall-clock envelope is validated at L=64**: every d1 block costs
+   ~1300 ms of rounds (65×20) + only ~100–200 ms compute+draft, ÷ τ — at
+   code-class τ 13.6–18 that is 77–133 ms/tok, bracketing the ledger's
+   ≈122 est. Rounds-dominated, exactly as modeled; 64-window CUDA-graph
+   capture composes fine.
+2. **Track-only node = 5.88 GB** (5.71 params + 0.17 runtime) — the 27B/N=8
+   track node fits 8 GB VRAM at bf16 once the pool leaves. Head 12.59 GB.
+3. **Untrained slices under d1b COLLAPSE** (endoftext/"1 1 1" attractors,
+   both domains) while d1+pool on the same schedule emits clean code ⇒ the
+   one-sublayer own-carry staleness is fatal without healing — consistent
+   with the 9B record (d1b = 95% AFTER healing) and GLM Gate 0b. The 100B
+   pool-free ledger therefore **requires the d1b heal of the target's
+   slices** (training item), or the exact schedule (2 syncs/layer:
+   ~2600 ms/pass ÷ τ_dense ≈ 160+ ms/tok, quality ≡ dense by construction —
+   needs post-MLP boundary support in the engine walk).
+   Bonus: the truer d1 verifier LIFTS τ (6.86→18.00 code, →4.57 prose) —
+   verifier fidelity is a τ lever alongside the drafter.
+
+### Drafter-as-cross-track-anchor — REFUTED (Gate 1, 2026-07-17)
+
+The pool-free collapse's standing fix is a training heal. Tested a memory-cheap
+alternative: feed the non-sync layers the DRAFTER's hidden states (free in
+draft-verify, head node) as a global anchor for the missing cross-track content
+— an EXTERNAL dense model's full forward on the same tokens, genuinely outside
+the refuted estimator class (pt_state §5, all of which used the target's OWN
+partial/stale internals). Gate 1 = the staggered-xattn kill methodology: can a
+linear map of the drafter's hidden PREDICT the missing content a pool-free track
+lacks? (27B/N=8 vs 0.8B drafter, both
+reference streams from the SAME PT forward — h_full = all-8-tracks synced,
+h_own = track-0-alone; missing = h_full − h_own; 10 240 wikitext tokens,
+held-out R²).
+
+**Result: KILL.** Best-aligned drafter layer per target layer (max R² over all
+24 drafter layers — the mapping-artifact-proof upper bound) = mean **0.377**,
+full-attn-layer mean 0.366 — BOTH under the ~0.40 line where staggered-xattn
+(a STRONGER, same-model 35–40% signal) already made injection WORSE (remainder
+compounds). Proportional single-layer map = 0.318. The mechanism is a clean
+**depth decay**: R² 0.46–0.61 in early layers (near-embedding, universal) →
+collapses to ~0 by the deep layers (L47 0.16, L59 0.05, L63 0.08) — exactly
+where the residual feeds the lm_head and cross-track content matters most. The
+0.8B/1024-dim external model cannot linearly carry the target's deep, high-rank,
+model-specific cross-track content; the "orthogonal + volatile + high-rank" wall
+reasserts against an external anchor. No Gate 2 (predictiveness was decisive, as
+planned). Caveat: measured on prose; the depth-collapse is a representational-
+capacity wall, not domain-specific, so code is very unlikely to change it. **The
+pool-free 100B ledger still requires the d1b heal (or the exact schedule); the
+drafter is a τ/verifier lever, not a comms substitute.**
+
 ## Verdicts
 
 1. Track mode stands — no pipeline anywhere; the verify chunk is the same

@@ -145,6 +145,12 @@ def main() -> int:
                    help="Override the manifest sync schedule (comma-separated layer indices). "
                         "Required when the checkpoint is a raw convert output, which carries no "
                         "schedule.")
+    p.add_argument("--sync-phase", default=None, choices=["post-mlp", "post-attn", "exact"],
+                   help="Sync placement; DEFAULT reads it from the checkpoint's "
+                        "train_meta.json (else post-attn). Scoring a model at the wrong phase "
+                        "is a different network — a post-attn heal read as post-mlp measured "
+                        "0.553 vs its true 0.700. 'post-attn'=lever B (heal schedule); "
+                        "'post-mlp'=legacy walk; 'exact'=2 syncs/layer ≡ dense.")
     p.add_argument("--engine-replicas", default=None,
                    help="Path to a packed replica pool: score the student through the "
                         "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
@@ -160,12 +166,26 @@ def main() -> int:
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
 
+    # The manifest records the sync INDICES but not the PHASE, so the phase has to
+    # come from the training metadata that sits beside the weights.
+    if args.sync_phase is None:
+        meta = Path(args.checkpoint_dir) / "train_meta.json"
+        args.sync_phase = (
+            json.loads(meta.read_text()).get("args", {}).get("sync_phase", "post-attn")
+            if meta.exists() else "post-attn"
+        )
+        _resolved_from = "train_meta.json" if meta.exists() else "default"
+    else:
+        _resolved_from = "flag"
+
     manifest = load_manifest(args.checkpoint_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
     if args.sync_indices is not None:
         sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
     elif manifest.sync_layer_indices is not None:
         sync_layers = list(manifest.sync_layer_indices)
+    elif args.sync_phase == "exact":
+        sync_layers = list(range(manifest.num_layers))  # exact ignores the schedule
     else:
         raise SystemExit(
             "[error] checkpoint manifest has no sync_layer_indices — point "
@@ -175,7 +195,8 @@ def main() -> int:
     _log(
         rank,
         f"[init] target={args.target} world={layout.world_size} "
-        f"n_tracks={manifest.n_tracks} K={layout.tracks_per_rank}",
+        f"n_tracks={manifest.n_tracks} K={layout.tracks_per_rank} "
+        f"sync_phase={args.sync_phase} (from {_resolved_from})",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
@@ -203,7 +224,9 @@ def main() -> int:
         )
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)
-        student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
+        student.set_sync_phase(args.sync_phase)
+        # bf16 on the HOST first — see the same note in train_cli._build_student.
+        student = student.to(torch.bfloat16).to(torch.cuda.current_device())
         student.eval()
 
     if want_teacher:

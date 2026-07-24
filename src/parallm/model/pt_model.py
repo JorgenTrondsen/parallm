@@ -91,6 +91,19 @@ class PTWrappedModel(nn.Module):
         else:
             self.lm_head = None
 
+        # Sync placement phase (see `set_sync_phase`). "post-mlp" = the legacy
+        # after-layer boundary walk, bit-identical to the original forward.
+        self.sync_phase = "post-mlp"
+        # Optional HostResidentLayers: when set, the walk pages each decoder
+        # layer in from pinned host DRAM and drops it again (the streamed
+        # teacher). None = every layer stays resident, the normal path.
+        self.layer_stream = None
+        # Per-sublayer activation checkpointing for grad-carrying full forwards
+        # (the trainer's on-policy output objective backwards through the whole
+        # stack; without recompute the L-layer activation set OOMs at 27B
+        # training shapes). Eval / no_grad paths are unaffected.
+        self.use_checkpoint = False
+
     def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
         """Full input embedding (B, S, H), grad-connected, identical on every rank.
 
@@ -115,6 +128,18 @@ class PTWrappedModel(nn.Module):
                 )
         return self.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
 
+    def set_sync_phase(self, phase: str) -> None:
+        """Sync placement. ``"post-mlp"`` (default): the legacy after-layer
+        boundary walk. ``"post-attn"`` (lever B): the one per-window sync lands
+        after the boundary layer's token mixer (its MLP reads the TRUE
+        residual); the final layer keeps a post-MLP sync for the head; the d1b
+        schedule = every layer a boundary. ``"exact"``: sync after attention
+        AND after MLP of every layer — bit-identical to the dense forward by
+        construction (2 syncs/layer; the frozen-slice teacher's schedule)."""
+        if phase not in ("post-mlp", "post-attn", "exact"):
+            raise ValueError(f"sync_phase must be 'post-mlp', 'post-attn' or 'exact', got {phase!r}")
+        self.sync_phase = phase
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -122,6 +147,9 @@ class PTWrappedModel(nn.Module):
         position_ids: torch.LongTensor | None = None,
         return_sync_hiddens: bool = False,
         return_intra_window_hiddens: bool = False,
+        return_hidden_pre_lm_head: bool = False,
+        capture_post_attn: "set[int] | None" = None,
+        capture_post_mlp: "set[int] | None" = None,
     ):
         # Local import: keeps the engine model-family-agnostic at import time.
         from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
@@ -155,42 +183,155 @@ class PTWrappedModel(nn.Module):
         sync_hiddens: dict[int, torch.Tensor] | None = (
             {} if (return_sync_hiddens or return_intra_window_hiddens) else None
         )
-        block_start = h
-        per_track_h = [h for _ in self.text_models]
-        for layer_idx in range(len(tm0.layers)):
-            new_h: list[torch.Tensor] = []
-            for k, tm in enumerate(self.text_models):
-                mask = (
-                    linear_attn_mask
-                    if tm.config.layer_types[layer_idx] == "linear_attention"
-                    else causal_mask
-                )
-                new_h.append(
-                    tm.layers[layer_idx](
-                        per_track_h[k],
-                        position_embeddings=position_embeddings,
-                        attention_mask=mask,
-                        position_ids=text_position_ids,
-                        past_key_values=None,
-                        use_cache=False,
+        if self.sync_phase in ("post-attn", "exact"):
+            h = self._run_post_attn_stack(
+                h,
+                position_embeddings,
+                text_position_ids,
+                causal_mask,
+                linear_attn_mask,
+                sync_hiddens=sync_hiddens,
+                exact=self.sync_phase == "exact",
+                capture_post_attn=capture_post_attn,
+                capture_post_mlp=capture_post_mlp,
+            )
+        else:
+            block_start = h
+            per_track_h = [h for _ in self.text_models]
+            for layer_idx in range(len(tm0.layers)):
+                new_h: list[torch.Tensor] = []
+                for k, tm in enumerate(self.text_models):
+                    mask = (
+                        linear_attn_mask
+                        if tm.config.layer_types[layer_idx] == "linear_attention"
+                        else causal_mask
                     )
-                )
-            per_track_h = new_h
-            if layer_idx in sync_set:
-                h = self.sync_module(per_track_h, block_start)
-                if sync_hiddens is not None:
-                    sync_hiddens[layer_idx] = h
-                block_start = h
-                per_track_h = [h for _ in self.text_models]
-            elif return_intra_window_hiddens:
-                sync_hiddens[layer_idx] = self.sync_module(per_track_h, block_start)
+                    new_h.append(
+                        tm.layers[layer_idx](
+                            per_track_h[k],
+                            position_embeddings=position_embeddings,
+                            attention_mask=mask,
+                            position_ids=text_position_ids,
+                            past_key_values=None,
+                            use_cache=False,
+                        )
+                    )
+                per_track_h = new_h
+                if layer_idx in sync_set:
+                    h = self.sync_module(per_track_h, block_start)
+                    if sync_hiddens is not None:
+                        sync_hiddens[layer_idx] = h
+                    block_start = h
+                    per_track_h = [h for _ in self.text_models]
+                elif return_intra_window_hiddens:
+                    sync_hiddens[layer_idx] = self.sync_module(per_track_h, block_start)
 
         h = tm0.norm(h)
+        if return_hidden_pre_lm_head:
+            # The trainer's chunked KL applies lm_head itself — hand back the
+            # post-norm hidden so no (B, T, V) logits tensor materializes here.
+            return h, sync_hiddens
         # In-owner rank returns full (B, T, V) logits; peer ranks (lm_head=None)
         # return None — the legacy PTLM contract. Peers still run the full forward
         # so the SyncBoundary collective ordering stays matched across ranks.
         logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, sync_hiddens
+
+    def _run_post_attn_stack(
+        self,
+        h: torch.Tensor,
+        position_embeddings,
+        text_position_ids,
+        causal_mask,
+        linear_attn_mask,
+        sync_hiddens: "dict[int, torch.Tensor] | None" = None,
+        exact: bool = False,
+        capture_post_attn: "set[int] | None" = None,
+        capture_post_mlp: "set[int] | None" = None,
+    ) -> torch.Tensor:
+        """Phase-shifted sync walk — lever B (``exact=False``) and the exact
+        schedule (``exact=True``).
+
+        Lever B: the one fresh all-reduce per sync window lands POST-ATTENTION
+        at every boundary in ``self.sync_after_layers`` except the final layer
+        (that boundary layer's MLP reads the FULL synced residual and its delta
+        is then CARRIED un-summed), the final layer syncs post-MLP for the norm,
+        and non-boundary layers run fully partial. The all-reduce sums every
+        per-track delta accrued since the previous sync, so each delta is summed
+        exactly once; the sync COUNT equals the boundary schedule's. Reduces to
+        the d1b per-layer loop when every layer is a boundary.
+
+        Exact: sync after attention AND after MLP of every layer — every
+        sublayer reads the true residual, so the walk is the dense forward up
+        to fp summation order (the frozen-slice teacher path; 2 syncs/layer).
+
+        ``capture_post_attn`` / ``capture_post_mlp``: layer sets whose post-attn
+        (resp. post-MLP) synced state is stored into ``sync_hiddens`` — the
+        teacher-target contract (a boundary target is post-attn, a final /
+        mid-window target is post-MLP; a layer never needs both).
+        """
+        from parallm.model.seam import checkpointed_halves
+
+        L = len(self.text_models[0].layers)
+        last = L - 1
+        sync_attn_set = (
+            set(range(L)) if exact else set(self.sync_after_layers) - {last}
+        )
+        if sync_hiddens is None:
+            tap_attn = tap_mlp = ()
+        else:
+            tap_attn, tap_mlp = capture_post_attn or (), capture_post_mlp or ()
+        run_mixer, run_mlp = checkpointed_halves(
+            self.use_checkpoint and torch.is_grad_enabled(),
+            position_embeddings,
+            text_position_ids,
+        )
+
+        block_start = h
+        per_track_h = [h for _ in self.text_models]
+        for i in range(L):
+            # layer_types[i] is identical on every track, so the mixer mask is
+            # per-layer.
+            layer_mask = (
+                linear_attn_mask
+                if self.text_models[0].config.layer_types[i] == "linear_attention"
+                else causal_mask
+            )
+            if self.layer_stream is not None:
+                self.layer_stream.acquire(i)
+            h_attn = [run_mixer(tm.layers[i], per_track_h[k], layer_mask)
+                      for k, tm in enumerate(self.text_models)]
+            if i in sync_attn_set:
+                # Boundary: post-attention sync delivers the real cross-track
+                # content to this layer's MLP.
+                R = self.sync_module(h_attn, block_start)
+                if i in tap_attn:
+                    sync_hiddens[i] = R
+                block_start = R
+                new_h = [run_mlp(tm.layers[i], R) for tm in self.text_models]
+                if exact:
+                    # Second sync of the exact schedule: post-MLP, every layer.
+                    Hm = self.sync_module(new_h, R)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = Hm
+                    if i == last:
+                        h = Hm
+                    block_start = Hm
+                    per_track_h = [Hm for _ in self.text_models]
+                else:
+                    per_track_h = new_h
+            else:
+                # Own-carry (non-boundary) OR the final layer's post-MLP sync.
+                new_h = [run_mlp(tm.layers[i], h_attn[k]) for k, tm in enumerate(self.text_models)]
+                if i == last:
+                    h = self.sync_module(new_h, block_start)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = h
+                else:
+                    per_track_h = new_h
+            if self.layer_stream is not None:
+                self.layer_stream.release(i)
+        return h
 
     def load_track_state_dicts(
         self,
@@ -233,3 +374,77 @@ class PTWrappedModel(nn.Module):
                 raise RuntimeError(
                     f"load_track_state_dicts mismatch:\n  missing={missing_critical}\n  unexpected={unexpected}"
                 )
+
+
+class HostResidentLayers:
+    """Frozen decoder layers parked in pinned host DRAM, paged in one at a time.
+
+    The exact-schedule teacher forward is one ``no_grad`` walk over layers 0..L-1,
+    so only the current layer need be resident: the teacher's ~30 GB/rank at 122 B
+    becomes a 1–2 layer working set, which is what fits it beside the student.
+    Assign to ``PTWrappedModel.layer_stream``; the walk drives
+    ``acquire``/``release``. Source tensors are pinned, so the H2D is async.
+
+    On CUDA the copies ride a dedicated PREFETCH stream: while the compute stream
+    runs layer i, layer i+1's H2D overlaps it, hiding the transfer at the cost of
+    one extra resident layer. A per-layer event gates compute so it never reads a
+    half-copied layer, and ``record_stream`` stops the allocator recycling a layer
+    the compute stream still holds. On CPU (tests) the copies are synchronous —
+    one layer resident, no overlap.
+    """
+
+    def __init__(self, models, num_layers: int, device):
+        # Normalize: torch.cuda.current_device() hands back a bare int.
+        self.device = torch.device(device)
+        self._n = num_layers
+        self._params: list[list[torch.nn.Parameter]] = []
+        for i in range(num_layers):
+            ps = [p for m in models for p in m.layers[i].parameters()]
+            for p in ps:
+                # A trainable param would lose its storage before backward could
+                # read it — this is a frozen-teacher-only mechanism.
+                assert not p.requires_grad, "HostResidentLayers requires frozen params"
+                # Pinning is what makes the copies async; it also needs a CUDA
+                # context, so the CPU path (tests) just keeps its own copy.
+                p._host = (p.data.pin_memory() if self.device.type == "cuda"
+                           else p.data.clone())
+                p.data = torch.empty(0, dtype=p.dtype)
+            self._params.append(ps)
+        self._copy = torch.cuda.Stream(self.device) if self.device.type == "cuda" else None
+        self._inflight: set[int] = set()
+        self._done: dict[int, torch.cuda.Event] = {}
+
+    def _load(self, i: int) -> None:
+        """Issue layer i's H2D (on the copy stream if prefetching) and mark it."""
+        if self._copy is None:
+            for p in self._params[i]:
+                p.data = p._host.to(self.device, non_blocking=True)
+        else:
+            with torch.cuda.stream(self._copy):
+                for p in self._params[i]:
+                    p.data = p._host.to(self.device, non_blocking=True)
+                self._done[i] = torch.cuda.Event()
+                self._done[i].record(self._copy)
+        self._inflight.add(i)
+
+    def acquire(self, i: int) -> None:
+        if i not in self._inflight:
+            self._load(i)
+        if self._copy is not None:
+            compute = torch.cuda.current_stream()
+            compute.wait_event(self._done[i])  # don't read a half-copied layer
+            for p in self._params[i]:
+                p.data.record_stream(compute)  # copy-stream alloc, compute-stream use
+            if i + 1 < self._n and (i + 1) not in self._inflight:
+                self._load(i + 1)  # overlaps this layer's compute
+
+    def release(self, i: int) -> None:
+        self._inflight.discard(i)
+        self._done.pop(i, None)
+        for p in self._params[i]:
+            p.data = torch.empty(0, dtype=p.dtype, device=self.device)
+
+    @property
+    def host_bytes(self) -> int:
+        return sum(p._host.numel() * p._host.element_size()
+                   for ps in self._params for p in ps)

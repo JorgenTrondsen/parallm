@@ -25,7 +25,7 @@ import torch.distributed as dist
 from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.groups import build_groups
-from parallm.engine import PackedShadow, generate, generate_draft_verify
+from parallm.engine import DenseShadow, PackedShadow, generate, generate_draft_verify
 from parallm.model.pt_model import PTWrappedModel
 from parallm.utils.checkpoint import load_manifest, load_track
 
@@ -130,7 +130,10 @@ def main() -> int:
     p.add_argument("--tracks-dir", required=True)
     p.add_argument("--hf-model", required=True, help="Checkpoint dir (config + tokenizer only)")
     p.add_argument("--replicas", default=None,
-                   help="Packed pool (default <tracks-dir>/replicas.safetensors)")
+                   help="Packed pool (default <tracks-dir>/replicas.safetensors); "
+                        "'none' = pool-free — the carry advances on the rank's own "
+                        "tracks only (per-rank, the d1b semantics; pair with a "
+                        "per-layer --sync-indices schedule)")
     p.add_argument("--sync-indices", default=None,
                    help="Comma-separated boundary layer indices (falls back to the manifest)")
     p.add_argument("--latency-ms", type=float, default=0.0)
@@ -217,30 +220,39 @@ def main() -> int:
     # footprint transiently (the old 23.4 GB load peak on the 27B).
     student = student.to(torch.bfloat16).to(device).eval()
 
-    pool_path = args.replicas or os.path.join(args.tracks_dir, "replicas.safetensors")
-    ring_layers = window = None
-    if args.residency == "streamed":
-        num_layers = manifest.num_layers
-        bounds = sorted(set(sync) - {num_layers - 1}) + [num_layers - 1]
-        window = num_layers // len(bounds)
-        if bounds != list(range(window - 1, num_layers, window)):
-            raise SystemExit(f"[error] --residency streamed needs a uniform sync "
-                             f"schedule (window ring), got boundaries {bounds}")
-        ring_layers = args.ring_windows * window
-    ent_path = None
-    if args.pool_codec == "ent":
-        if args.residency != "streamed":
-            raise SystemExit("[error] --pool-codec ent requires --residency streamed")
-        ent_path = args.ent_file or os.path.join(args.tracks_dir,
-                                                 "replicas.ent.safetensors")
-    if rank == 0:
-        print(f"[init] loading packed pool {pool_path} ({args.residency}"
-              + (f", ring={ring_layers} layers" if ring_layers else "")
-              + (f", codec=ent {ent_path}" if ent_path else "") + ")…", flush=True)
-    shadow = PackedShadow(pool_path, args.tracks_dir, student, device,
-                          stream_ring_layers=ring_layers, fused=not args.no_fused,
-                          stream_window_layers=window,
-                          ent_path=ent_path, dec_chunks=args.dec_chunks)
+    if args.replicas == "none":
+        # Pool-free: the carry advances on the rank's OWN tracks only, so it is
+        # per-rank (the trained d1b semantics) — meant for per-layer boundary
+        # schedules, where the shadow chain never spans more than one sublayer.
+        if args.residency != "resident":
+            raise SystemExit("[error] --replicas none is resident-only (no pool to stream)")
+        shadow = DenseShadow([list(tm.layers) for tm in student.text_models])
+        shadow.meta["config"] = "none (pool-free: carry = own tracks)"
+    else:
+        pool_path = args.replicas or os.path.join(args.tracks_dir, "replicas.safetensors")
+        ring_layers = window = None
+        if args.residency == "streamed":
+            num_layers = manifest.num_layers
+            bounds = sorted(set(sync) - {num_layers - 1}) + [num_layers - 1]
+            window = num_layers // len(bounds)
+            if bounds != list(range(window - 1, num_layers, window)):
+                raise SystemExit(f"[error] --residency streamed needs a uniform sync "
+                                 f"schedule (window ring), got boundaries {bounds}")
+            ring_layers = args.ring_windows * window
+        ent_path = None
+        if args.pool_codec == "ent":
+            if args.residency != "streamed":
+                raise SystemExit("[error] --pool-codec ent requires --residency streamed")
+            ent_path = args.ent_file or os.path.join(args.tracks_dir,
+                                                     "replicas.ent.safetensors")
+        if rank == 0:
+            print(f"[init] loading packed pool {pool_path} ({args.residency}"
+                  + (f", ring={ring_layers} layers" if ring_layers else "")
+                  + (f", codec=ent {ent_path}" if ent_path else "") + ")…", flush=True)
+        shadow = PackedShadow(pool_path, args.tracks_dir, student, device,
+                              stream_ring_layers=ring_layers, fused=not args.no_fused,
+                              stream_window_layers=window,
+                              ent_path=ent_path, dec_chunks=args.dec_chunks)
 
     # Every rank tokenizes the same prompt (deterministic lockstep shapes);
     # only the head's embedding is real.

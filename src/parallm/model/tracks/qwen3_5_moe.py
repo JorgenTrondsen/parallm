@@ -31,4 +31,11 @@ def build_per_track_text_config(text_config, n_tracks: int):
         if val % n_tracks != 0:
             raise ValueError(f"{field} {val} not divisible by {n_tracks}")
         setattr(cfg, field, val // n_tracks)
+    # The standalone per-track experts default to `_experts_implementation=None`,
+    # which dispatches HF's REFERENCE forward: a Python for-loop over up to 256
+    # experts (~245k tiny GEMMs/opt-step at T=1024 → 334 s/step, GPU ~45% util).
+    # `grouped_mm` sorts tokens by expert and does one grouped GEMM per expert via
+    # torch._grouped_mm (available on this torch/CUDA) — same math, no per-token
+    # weight replication (unlike `batched_mm`, which would OOM the pool).
+    cfg._experts_implementation = "grouped_mm"
     return cfg

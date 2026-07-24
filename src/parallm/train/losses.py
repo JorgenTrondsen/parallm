@@ -2,8 +2,11 @@
 
 `block_mse`: at each sync boundary, MSE between the student's all-reduced hidden
 state and the teacher's hidden state at the same depth (padded positions masked
-out so it's a true per-token mean). Used by `eval/fidelity.py` to score how
-closely each track's synced hidden tracks the teacher. Returns a scalar tensor.
+out so it's a true per-token mean). The heal step's block-MSE tap
+(`train/distill.py`) and the fidelity score in `eval/fidelity.py`. The output
+objectives (KL / CE / logit-MSE) live in `train/distill.kl_ce_chunked`, which
+computes them per seq-chunk so full-vocab logits never materialize.
+Returns a scalar tensor.
 """
 from __future__ import annotations
 

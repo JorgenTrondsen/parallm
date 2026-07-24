@@ -29,6 +29,28 @@ import torch.distributed as dist
 from torch import nn
 
 
+class _AllReduceSum(torch.autograd.Function):
+    """All-reduce with the trainer's gradient semantics made explicit.
+
+    Backward is IDENTITY: the loss is replicated on every rank, so each rank's
+    local gradient of the boundary output is already the full dL/dy, and the
+    other ranks' partials are constants from this rank's graph perspective —
+    the record trainer's collective-free backward, without relying on torch's
+    deprecated not-implemented fallback for c10d ops. The clone keeps the
+    graph tensor un-mutated (in-place all_reduce would bump its version).
+    """
+
+    @staticmethod
+    def forward(ctx, t: torch.Tensor, group) -> torch.Tensor:
+        out = t.detach().clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        return g, None
+
+
 class SyncBoundary(nn.Module):
     """Local-sum then NCCL all-reduce on delta_t across track_group, then add back.
 
@@ -63,6 +85,9 @@ class SyncBoundary(nn.Module):
             partial = partial + (h - h_pre_block)
 
         if self.track_group is not None:
-            dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.track_group)
+            if partial.requires_grad:
+                partial = _AllReduceSum.apply(partial, self.track_group)
+            else:
+                dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.track_group)
 
         return h_pre_block + partial

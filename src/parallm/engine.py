@@ -78,6 +78,9 @@ class DenseShadow:
         self.grid = grid
         self.n_tracks = len(grid)
         self._stacked: dict = {}
+        # Interface parity with PackedShadow, whose callers read both.
+        self.meta: dict = {}
+        self.ring = None
 
     def layers(self, i: int) -> "list[nn.Module]":
         return [track[i] for track in self.grid]
