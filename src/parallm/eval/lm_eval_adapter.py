@@ -25,6 +25,7 @@ same adapter class drives both — only the ``model_fn`` differs.
 """
 from __future__ import annotations
 
+import contextlib
 from typing import Callable
 
 import torch
@@ -289,3 +290,77 @@ def make_teacher_forward_fn(teacher) -> ForwardFn:
 def is_lm_head_owner(student) -> bool:
     """Whether this rank's student instance owns the shared lm_head."""
     return getattr(student, "lm_head", None) is not None
+
+
+@contextlib.contextmanager
+def _tqdm_off():
+    """Force every tqdm bar off for the duration of the block.
+
+    lm-eval draws bars from places with incompatible knobs: ``build_all_requests``
+    calls bare ``tqdm(...)`` with no disable parameter at all, while
+    ``TemplateLM.loglikelihood`` and our own scoring loops pass ``disable=``
+    explicitly. Overriding the argument (not just its default — an explicit
+    ``disable=False`` would win over that) is the one thing that silences all of
+    them. The original ``__init__`` is restored on the way out.
+    """
+    from tqdm.std import tqdm as _tqdm
+
+    saved = _tqdm.__init__
+
+    def _disabled(self, *args, **kwargs):
+        saved(self, *args, **{**kwargs, "disable": True})
+
+    _tqdm.__init__ = _disabled
+    try:
+        yield
+    finally:
+        _tqdm.__init__ = saved
+
+
+def run_lm_eval(
+    forward_fn: ForwardFn,
+    tokenizer,
+    *,
+    tasks: list[str],
+    is_owner: bool,
+    limit: int | None = None,
+    batch_size: int = 8,
+    max_length: int = 4096,
+    num_fewshot: int | None = None,
+    seed: int = 0,
+    log_samples: bool = True,
+    quiet: bool = False,
+) -> "dict | None":
+    """One lm-eval pass over ``forward_fn``. Every rank must call this.
+
+    All four seeds are pinned to ``seed`` so each rank builds an identical
+    request stream in an identical order — that is what keeps the cross-track
+    ``SyncBoundary`` collectives inside the forward in lockstep.
+
+    Returns ``simple_evaluate``'s dict on global rank 0 and ``None`` on every
+    other rank (lm-eval gates the return on ``LOCAL_RANK == 0``), so callers
+    that act on the score collectively must broadcast it.
+    """
+    from lm_eval import simple_evaluate  # deferred: heavy import
+
+    lm = PTLM(
+        forward_fn=forward_fn,
+        tokenizer=tokenizer,
+        max_length=max_length,
+        batch_size=batch_size,
+        device=torch.cuda.current_device(),
+        is_owner_rank=is_owner,
+    )
+    with _tqdm_off() if quiet else contextlib.nullcontext():
+        return simple_evaluate(
+            model=lm,
+            tasks=tasks,
+            num_fewshot=num_fewshot,
+            limit=limit,
+            batch_size=batch_size,
+            log_samples=log_samples,
+            random_seed=seed,
+            numpy_random_seed=seed,
+            torch_random_seed=seed,
+            fewshot_random_seed=seed,
+        )

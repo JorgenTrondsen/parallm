@@ -46,7 +46,6 @@ from parallm.train.distill import (
     distill_step,
     freeze_slice_teacher,
     student_forcing_schedule,
-    validate_step,
 )
 from parallm.train.sync_grads import (
     assert_replicated_consistent,
@@ -210,10 +209,23 @@ def main() -> int:
     p.add_argument("--data-preset", default="open-mix", choices=preset_names())
     p.add_argument("--data-source", action="append", default=None,
                    help="NAME[:CONFIG[:TEXT_KEY[:WEIGHT]]] (repeatable; overrides --data-preset)")
-    p.add_argument("--val-dataset-name", default="Salesforce/wikitext")
-    p.add_argument("--val-dataset-config", default="wikitext-103-raw-v1")
-    p.add_argument("--val-split", default="validation")
-    p.add_argument("--val-batches", type=int, default=20)
+    # Eval: lm-evaluation-harness downstream macro, the checkpoint-selection
+    # metric. val_kl is deliberately gone — it has been observed to invert the
+    # downstream ranking outright, so selecting on it selects on noise.
+    p.add_argument("--eval-tasks", default="hellaswag,arc_easy,arc_challenge,winogrande,piqa",
+                   help="Comma-separated lm-eval tasks. The default five are the macro "
+                        "convention; changing them changes what 'macro' means, and the number "
+                        "stops being comparable to the recorded ledger.")
+    p.add_argument("--eval-limit", type=int, default=200,
+                   help="Requests per task. 200 matches every standalone eval in the project "
+                        "history (noise ~±0.015); lower it only for smokes.")
+    p.add_argument("--eval-batch-size", type=int, default=8,
+                   help="Requests per forward. The owner rank holds a (B, T, V) bf16 logits "
+                        "tensor on top of the resident optimizer state and teacher — this is "
+                        "the knob to drop if the first eval OOMs.")
+    p.add_argument("--eval-max-length", type=int, default=2048)
+    p.add_argument("--eval-num-fewshot", type=int, default=None,
+                   help="Override fewshot count for all tasks (default: each task's standard).")
     # Cadence.
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-every", type=int, default=0)
@@ -265,16 +277,7 @@ def main() -> int:
     train_loader = torch.utils.data.DataLoader(
         PackedTokenStream(tokenizer, data_cfg), batch_size=args.batch_size
     )
-    val_cfg = CalibrationDataConfig.single(
-        args.val_dataset_name, args.val_dataset_config, split=args.val_split,
-        seq_len=args.seq_len, seed=args.seed,
-    )
-    val_batches: list[dict] = []
-    for i, b in enumerate(torch.utils.data.DataLoader(
-            PackedTokenStream(tokenizer, val_cfg), batch_size=args.batch_size)):
-        if i >= args.val_batches:
-            break
-        val_batches.append({k: v.to(torch.cuda.current_device()) for k, v in b.items()})
+    eval_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
 
     student = _build_student(text_cfg, manifest, layout, args.checkpoint_dir,
                              sync_layers, args.sync_phase)
@@ -284,13 +287,13 @@ def main() -> int:
     if args.teacher_stream:
         teacher_model, streamer = _build_teacher_streamed(
             text_cfg, manifest, layout, teacher_dir, sync_layers)
-        teacher = teacher_val = freeze_slice_teacher(teacher_model)
+        teacher = freeze_slice_teacher(teacher_model)
         _log(rank, f"[init] teacher layers streamed from pinned host DRAM: "
                    f"{streamer.host_bytes / 2**30:.2f} GiB/rank off-device")
     else:
         teacher_model = _build_student(text_cfg, manifest, layout, teacher_dir,
                                        sync_layers, "exact")
-        teacher = teacher_val = freeze_slice_teacher(teacher_model)
+        teacher = freeze_slice_teacher(teacher_model)
 
     # Freeze the dense-copy pieces; tie the teacher's to the student's frozen
     # storage (2×2.54 GB back on rank 0 at 27B).
@@ -413,21 +416,49 @@ def main() -> int:
         kl_ce_chunk_size=args.kl_ce_chunk_size,
     )
     out_dir = Path(args.out_dir)
-    best_kl = float("inf")
+    best_macro = float("-inf")
     step = 0
     accum = 0
     t0 = time.perf_counter()
     train_iter = iter(train_loader)
 
-    def run_validation() -> float:
+    def run_eval(tag: str) -> float:
+        """The lm-evaluation-harness downstream macro on the live student.
+
+        Same code path as ``scripts/eval_lm_harness.py``, and the student is
+        scored at the schedule it trains on, so the in-loop number is directly
+        comparable to a standalone run on the saved slices.
+        """
+        # Lazy: lm_eval is the optional [eval] extra, so a train-only install
+        # still imports this script.
+        from parallm.eval.downstream import macro_metrics
+        from parallm.eval.lm_eval_adapter import (
+            is_lm_head_owner, make_student_forward_fn, run_lm_eval,
+        )
+
         student.eval()
-        with torch.no_grad():
-            kls = [validate_step(student, teacher_val, lm_head, vb,
-                                 kl_temperature=args.kl_temperature,
-                                 chunk_size=args.kl_ce_chunk_size)["kl"].item()
-                   for vb in val_batches]
+        # simple_evaluate reseeds the global torch/numpy/random RNGs identically
+        # on every rank; the train stream is an already-constructed seeded
+        # interleave and student-forcing draws from a per-step local RNG, so
+        # neither is perturbed.
+        results = run_lm_eval(
+            make_student_forward_fn(student), tokenizer,
+            tasks=eval_tasks, is_owner=is_lm_head_owner(student),
+            limit=args.eval_limit, batch_size=args.eval_batch_size,
+            max_length=args.eval_max_length, num_fewshot=args.eval_num_fewshot,
+            seed=args.seed, log_samples=False,
+            quiet=True,  # the training log gets the numbers, not progress bars
+        )
         student.train()
-        return sum(kls) / max(1, len(kls))
+        per_task = macro_metrics(results)  # populated on rank 0 only
+        score = sum(per_task.values()) / len(per_task) if per_task else 0.0
+        # _save_checkpoint is collective and ends in dist.barrier(), so a
+        # rank-local "improved?" would hang the run — broadcast rank 0's number.
+        t = torch.tensor([score], dtype=torch.float64, device=torch.cuda.current_device())
+        dist.broadcast(t, src=0)
+        _log(rank, f"{tag} macro={t.item():.4f} "
+                   + " ".join(f"{k}={v:.4f}" for k, v in per_task.items()))
+        return t.item()
 
     while step < args.max_steps:
         batch = next(train_iter)
@@ -483,13 +514,12 @@ def main() -> int:
 
         step += 1
         if args.eval_every and step % args.eval_every == 0:
-            val_kl = run_validation()
-            _log(rank, f"[val] step {step} val_kl={val_kl:.4f} (best {best_kl:.4f})")
-            if val_kl < best_kl:
-                best_kl = val_kl
+            macro = run_eval(f"[eval] step {step}")
+            if macro > best_macro:
+                best_macro = macro
                 if not args.no_save:
                     _save_checkpoint(student, manifest, layout, out_dir / args.best_name,
-                                     {"step": step, "val_kl": val_kl,
+                                     {"step": step, "macro": macro,
                                       "sync_layer_indices": sync_layers,
                                       "sync_phase": args.sync_phase,
                                       "args": vars(args)}, rank)
@@ -499,11 +529,10 @@ def main() -> int:
                              {"step": step, "sync_layer_indices": sync_layers,
                               "sync_phase": args.sync_phase, "args": vars(args)}, rank)
 
-    val_kl = run_validation()
-    _log(rank, f"[final] step {step} val_kl={val_kl:.4f} best={best_kl:.4f}")
-    if val_kl < best_kl and not args.no_save:
+    macro = run_eval(f"[final] step {step}")
+    if macro > best_macro and not args.no_save:
         _save_checkpoint(student, manifest, layout, out_dir / args.best_name,
-                         {"step": step, "val_kl": val_kl,
+                         {"step": step, "macro": macro,
                           "sync_layer_indices": sync_layers,
                           "sync_phase": args.sync_phase, "args": vars(args)}, rank)
     dist.destroy_process_group()

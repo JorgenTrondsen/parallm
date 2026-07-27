@@ -40,11 +40,12 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
+from parallm.eval.downstream import macro_score
 from parallm.eval.lm_eval_adapter import (
-    PTLM,
     is_lm_head_owner,
     make_student_forward_fn,
     make_teacher_forward_fn,
+    run_lm_eval,
 )
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.teacher import HookedTeacher
@@ -66,29 +67,18 @@ def _run_one_target(
     rank: int,
 ) -> dict:
     """Single lm-eval pass over the configured task list. Returns the raw
-    ``simple_evaluate`` dict (or ``None`` on edge cases)."""
-    lm = PTLM(
-        forward_fn=forward_fn,
-        tokenizer=tokenizer,
-        max_length=args.max_length,
-        batch_size=args.batch_size,
-        device=torch.cuda.current_device(),
-        is_owner_rank=is_owner,
-    )
-    # Defer import: heavy module, only used here.
-    from lm_eval import simple_evaluate
-
+    ``simple_evaluate`` dict (or ``None`` off rank 0)."""
     _log(rank, f"[eval] running lm-eval on target={target}…")
-    return simple_evaluate(
-        model=lm,
+    return run_lm_eval(
+        forward_fn,
+        tokenizer,
         tasks=tasks,
-        num_fewshot=args.num_fewshot,
+        is_owner=is_owner,
         limit=args.limit,
         batch_size=args.batch_size,
-        random_seed=args.seed,
-        numpy_random_seed=args.seed,
-        torch_random_seed=args.seed,
-        fewshot_random_seed=args.seed,
+        max_length=args.max_length,
+        num_fewshot=args.num_fewshot,
+        seed=args.seed,
     )
 
 
@@ -286,6 +276,7 @@ def main() -> int:
         for tgt, results in all_results.items():
             print(f"===== lm-evaluation-harness ({tgt}) =====")
             print(_format_results(results))
+            print(f"  macro={macro_score(results):.4f}")
             print()
         if args.output_json:
             Path(args.output_json).write_text(

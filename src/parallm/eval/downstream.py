@@ -1,18 +1,24 @@
-"""Downstream (lm-eval) scoring helpers for the student.
+"""Downstream (lm-eval) scoring for the student.
 
-``make_student_forward_fn`` adapts a ``PTWrappedModel`` to the ``PTLM`` forward
-contract (owner rank returns full logits, peers ``None``); ``scripts/eval_lm_harness.py``
-uses it to score downstream retention. ``aggregate_downstream_score`` collapses an
-lm-eval ``simple_evaluate`` results dict into a single scalar (acc_norm→acc, mean
-over tasks) — pure dict arithmetic, unit-testable on CPU without the ``[eval]``
-extra or a GPU.
+Collapses an lm-eval ``simple_evaluate`` results dict into the program's reported
+numbers. Pure dict arithmetic, so it is unit-testable on CPU without the
+``[eval]`` extra or a GPU — keep this module free of top-level ``torch`` /
+``lm_eval`` imports.
 """
 from __future__ import annotations
 
+# The program's downstream convention: acc_norm where the task reports a
+# length-normalized accuracy, plain acc otherwise. NOT a global acc_norm→acc
+# priority — arc_easy/arc_challenge report acc_norm too, and taking it would
+# give a different number than every result recorded in logs/.
+MACRO_TASK_METRIC = {
+    "hellaswag": "acc_norm", "piqa": "acc_norm",
+    "arc_easy": "acc", "arc_challenge": "acc", "winogrande": "acc",
+}
 
-def _pick_metric(metrics: dict, names: "list[str]") -> "float | None":
-    """First metric in ``names`` present in ``metrics`` (ignoring lm-eval's
-    ``,filter`` key suffix, e.g. ``"acc_norm,none"``)."""
+
+def _pick(metrics: dict, *names: str) -> "float | None":
+    """First of ``names`` present, ignoring lm-eval's ``,<filter>`` key suffix."""
     for name in names:
         for key, val in metrics.items():
             if key.split(",")[0] == name and isinstance(val, (int, float)):
@@ -20,43 +26,25 @@ def _pick_metric(metrics: dict, names: "list[str]") -> "float | None":
     return None
 
 
-def aggregate_downstream_score(
-    results: "dict | None",
-    tasks: "list[str] | None" = None,
-    metric_priority: "tuple[str, ...]" = ("acc_norm", "acc"),
-) -> float:
-    """Mean accuracy across ``tasks`` from an lm-eval ``simple_evaluate`` dict.
+def macro_metrics(results: "dict | None") -> "dict[str, float]":
+    """Each task's convention metric, keyed by task name.
 
-    For each task we take ``acc_norm`` if present else ``acc`` (lm-eval keys carry
-    a ``,filter`` suffix that we strip). Tasks absent from the results — or with no
-    matching metric — are skipped. Returns 0.0 when nothing scored. Higher is
-    better. Pure dict arithmetic, so it is unit-testable without GPUs or lm_eval.
+    ``results`` is ``None`` on every rank but global rank 0 (``simple_evaluate``
+    returns nothing elsewhere), which yields ``{}``.
     """
     table = (results or {}).get("results", {})
-    if tasks is None:
-        tasks = list(table.keys())
-    scores = []
-    for task in tasks:
-        metrics = table.get(task)
-        if not metrics:
-            continue
-        val = _pick_metric(metrics, list(metric_priority))
-        if val is not None:
-            scores.append(val)
-    return sum(scores) / len(scores) if scores else 0.0
+    picked = {
+        task: _pick(m, MACRO_TASK_METRIC.get(task, "acc"), "acc_norm")
+        for task, m in table.items()
+    }
+    return {task: val for task, val in picked.items() if val is not None}
 
 
-def make_student_forward_fn(student):
-    """``ForwardFn`` for ``PTLM``: the owner rank produces full ``(B, T, V)``
-    logits, peers return ``None`` (the legacy ``PTLM`` contract). The cross-track
-    ``SyncBoundary`` collectives inside the forward fire on every rank, so the run
-    stays in lockstep regardless.
+def macro_score(results: "dict | None") -> float:
+    """Mean of ``macro_metrics`` — the number checkpoints are selected on.
+
+    Averages over whatever tasks scored, so a subset run reports that subset's
+    macro; 0.0 when nothing scored. Higher is better.
     """
-
-    def _fn(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> "torch.Tensor | None":
-        logits, _ = student(
-            input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=False,
-        )
-        return logits
-
-    return _fn
+    vals = macro_metrics(results).values()
+    return sum(vals) / len(vals) if vals else 0.0
