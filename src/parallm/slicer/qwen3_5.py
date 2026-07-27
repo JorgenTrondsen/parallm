@@ -17,8 +17,8 @@ from typing import Any
 
 from parallm.slicer.base import (
     Colwise,
-    FusedSegmentColwise,
     GatedQColwise,
+    GDNFusedQKV,
     KVReplicatedColwise,
     LayerSpec,
     OwnerOnly,
@@ -56,31 +56,31 @@ def full_attention_specs(text_cfg: Any) -> LayerSpec:
 def linear_attention_specs(text_cfg: Any) -> LayerSpec:
     """GatedDeltaNet linear-attention slicing.
 
-    in_proj_qkv fuses [Q | K | V] in its out_features. Slicing must split
-    each segment colwise independently so each track's slice still has the
-    layout [Q_slice | K_slice | V_slice] that the forward expects.
+    in_proj_qkv fuses [Q | K | V] in its out_features. `GDNFusedQKV` splits it by
+    *value* head (the parallel unit) and hands each track the k-heads its v-heads
+    read, so each track's slice keeps the [Q_slice | K_slice | V_slice] layout the
+    forward expects — including when the k-heads don't divide across tracks.
 
     conv1d is depthwise (groups=conv_dim), so slicing along the channel dim
     yields a self-consistent sub-conv. We slice along the same fused-segment
     layout because the conv operates on the in_proj_qkv output.
     """
-    num_k_heads = int(text_cfg.linear_num_key_heads)
+    qkv = GDNFusedQKV(
+        num_k_heads=int(text_cfg.linear_num_key_heads),
+        num_v_heads=int(text_cfg.linear_num_value_heads),
+        head_k_dim=int(text_cfg.linear_key_head_dim),
+        head_v_dim=int(text_cfg.linear_value_head_dim),
+    )
     num_v_heads = int(text_cfg.linear_num_value_heads)
-    head_k_dim = int(text_cfg.linear_key_head_dim)
-    head_v_dim = int(text_cfg.linear_value_head_dim)
-    key_dim = num_k_heads * head_k_dim
-    value_dim = num_v_heads * head_v_dim
-
-    qkv_segments = (key_dim, key_dim, value_dim)
 
     return {
-        "in_proj_qkv.weight": FusedSegmentColwise(segments=qkv_segments),
+        "in_proj_qkv.weight": qkv,
         "in_proj_z.weight": Colwise(),  # out = value_dim
         "in_proj_b.weight": Colwise(),  # out = num_v_heads
         "in_proj_a.weight": Colwise(),  # out = num_v_heads
         # conv1d.weight shape: (conv_dim, 1, kernel_size) since groups=conv_dim.
-        # We slice along the channel dim (0) using the same Q|K|V segment layout.
-        "conv1d.weight": FusedSegmentColwise(segments=qkv_segments, dim=0),
+        # We slice along the channel dim (0) using the same Q|K|V head layout.
+        "conv1d.weight": qkv,
         "A_log": PerHead(num_heads=num_v_heads),
         "dt_bias": PerHead(num_heads=num_v_heads),
         "out_proj.weight": Rowwise(),  # cols = value_dim
@@ -89,11 +89,14 @@ def linear_attention_specs(text_cfg: Any) -> LayerSpec:
     }
 
 
-def mlp_specs(_text_cfg: Any) -> LayerSpec:
+def mlp_specs(text_cfg: Any) -> LayerSpec:
+    # `pad_full_size` lets intermediate_size not divide n_tracks (27B: 17408 over
+    # 24 tracks). Zero-padding a SwiGLU lane is exact: silu(0)*up = 0.
+    inter = int(text_cfg.intermediate_size)
     return {
-        "gate_proj.weight": Colwise(),
-        "up_proj.weight": Colwise(),
-        "down_proj.weight": Rowwise(),
+        "gate_proj.weight": Colwise(pad_full_size=inter),
+        "up_proj.weight": Colwise(pad_full_size=inter),
+        "down_proj.weight": Rowwise(pad_full_size=inter),
     }
 
 

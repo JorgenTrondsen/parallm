@@ -26,14 +26,14 @@ def _qwen3_5_get_layer_types(text_cfg: Any) -> list[str]:
 
 
 def _qwen3_5_constraints(cfg: Any) -> ConstraintSet:
+    # `linear_num_key_heads` and `intermediate_size` are deliberately absent:
+    # `GDNFusedQKV` replicates k-heads and `Colwise(pad_full_size=...)` zero-pads
+    # the MLP, both exactly, so neither has to divide N. Only the GDN value heads
+    # (the parallel unit) do. This is what lets the 27B reach its N=24 ceiling.
     return ConstraintSet(
         num_attention_heads=int(cfg.num_attention_heads),
         num_key_value_heads=int(cfg.num_key_value_heads),
-        divides=(
-            int(cfg.linear_num_key_heads),
-            int(cfg.linear_num_value_heads),
-            int(cfg.intermediate_size),
-        ),
+        divides=(int(cfg.linear_num_value_heads),),
     )
 
 

@@ -99,6 +99,10 @@ def main() -> int:
                         "schedule-independent, so this evaluates an arbitrary (non-uniform / "
                         "depth-tapered) sync schedule on the SAME slice with NO re-slice. Both the "
                         "student SyncBoundary placement and the teacher block_mse hooks follow it.")
+    p.add_argument("--sync-phase", default=None, choices=["post-mlp", "post-attn", "exact"],
+                   help="Where in a layer the sync fires. Default: leave the model's own "
+                        "('post-mlp'). 'exact' = 2 syncs/layer, which is exactly equivalent "
+                        "to dense — use it to verify a fresh convert (expect ~zero KL).")
     p.add_argument("--intra-window-taps", action="store_true",
                    help="Also report block_mse/relmse at EVERY layer, not just the sync "
                         "boundaries. Mid-window rows are loss-only synced reconstructions "
@@ -182,6 +186,8 @@ def main() -> int:
         sync_after_layers=sync_layers,
         track_group=layout.track_group,
     )
+    if args.sync_phase is not None:
+        student.set_sync_phase(args.sync_phase)
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
     student = student.to(torch.cuda.current_device()).to(torch.bfloat16)

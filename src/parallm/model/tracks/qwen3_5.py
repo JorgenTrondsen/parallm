@@ -21,7 +21,7 @@ class PTTrackTextModel(PTTrackTextModelBase):
 
 def build_per_track_text_config(text_config, n_tracks: int):
     cfg = apply_common_per_track_sizing(text_config, n_tracks)
-    if cfg.intermediate_size % n_tracks != 0:
-        raise ValueError(f"intermediate_size {cfg.intermediate_size} not divisible by {n_tracks}")
-    cfg.intermediate_size //= n_tracks
+    # Ceil: a width that doesn't divide is zero-padded by the slicer's
+    # `Colwise(pad_full_size=...)` (exact for SwiGLU).
+    cfg.intermediate_size = -(-cfg.intermediate_size // n_tracks)
     return cfg

@@ -21,7 +21,7 @@ from transformers import AutoConfig
 from parallm.slicer.convert import slice_model_to_tracks
 from parallm.slicer.loader import StateDictModel, stream_text_state_dict
 from parallm.utils.checkpoint import save_tracks
-from parallm.utils.max_tracks import max_tracks_for_config
+from parallm.utils.max_tracks import valid_track_counts
 
 
 def main() -> int:
@@ -33,10 +33,12 @@ def main() -> int:
 
     cfg = AutoConfig.from_pretrained(args.hf_model)
     tcfg = getattr(cfg, "text_config", cfg)  # VLM sub-config, else the config itself
-    max_n = max_tracks_for_config(tcfg)
-    n = args.n_tracks if args.n_tracks is not None else max_n
-    if n > max_n:
-        print(f"[error] n_tracks={n} exceeds max-tracks={max_n} for this model", file=sys.stderr)
+    valid = valid_track_counts(tcfg)  # descending; valid[0] == max-tracks
+    n = args.n_tracks if args.n_tracks is not None else valid[0]
+    if n not in valid:
+        # Check the whole set, not just the upper bound — an invalid smaller N
+        # would otherwise only fail deep in the slicer, after the full stream.
+        print(f"[error] n_tracks={n} invalid for this model; valid: {valid}", file=sys.stderr)
         return 2
 
     print(f"[info] streaming text weights to bf16 (n_tracks={n}); dropping vision + MTP…", flush=True)

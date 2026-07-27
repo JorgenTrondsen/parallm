@@ -60,6 +60,7 @@ def test_qwen3_5_adapter_layer_specs_match_direct_call():
         linear_num_value_heads=4,
         linear_key_head_dim=16,
         linear_value_head_dim=16,
+        intermediate_size=64,
     )
 
     adapter = get_adapter_for_config(SimpleNamespace(model_type="qwen3_5_text"))

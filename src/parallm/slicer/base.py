@@ -35,6 +35,30 @@ class SlicerSpec(Protocol):
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]: ...
 
 
+def _even_chunk(size: int, n_tracks: int, pad_full_size: int | None, label: str) -> int:
+    """Per-track chunk along a split dim. Without `pad_full_size` the dim must
+    divide evenly; with it the chunk rounds *up* and short slices are zero-filled."""
+    if pad_full_size is None:
+        if size % n_tracks != 0:
+            raise ValueError(f"{label}: dim size {size} not divisible by n_tracks {n_tracks}")
+        return size // n_tracks
+    if size != pad_full_size:
+        raise ValueError(f"{label}: expected dim size {pad_full_size}, got {size}")
+    return -(-size // n_tracks)
+
+
+def _chunk_slice(weight: torch.Tensor, dim: int, track_idx: int, chunk: int) -> torch.Tensor:
+    """Track `track_idx`'s `chunk`-wide slab along `dim`, zero-padded if it runs past the end."""
+    size = weight.shape[dim]
+    start = min(track_idx * chunk, size)
+    got = weight.narrow(dim, start, min(chunk, size - start))
+    if got.shape[dim] == chunk:
+        return got.contiguous()
+    tail = list(got.shape)
+    tail[dim] = chunk - got.shape[dim]
+    return torch.cat([got, got.new_zeros(tail)], dim=dim).contiguous()
+
+
 @dataclass(frozen=True)
 class Colwise:
     """Split the output dimension (dim 0 of nn.Linear.weight) evenly across tracks.
@@ -42,23 +66,29 @@ class Colwise:
     Sums back via `torch.cat` along dim 0. The output activations of each
     track represent a *disjoint subset* of output features; the next op
     (typically a row-parallel op) must consume them appropriately.
+
+    ``pad_full_size`` (the dense size along ``dim``) lifts the divisibility
+    requirement: slices round up and the overhang is zero. For a SwiGLU MLP that
+    is exact — a zero row in gate_proj gives silu(0)*up = 0, so the padded lane
+    contributes exactly 0.0 to the down_proj sum.
     """
 
     dim: int = 0  # output dim of nn.Linear weight is 0
+    pad_full_size: int | None = None
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
-        size = weight.shape[self.dim]
-        if size % n_tracks != 0:
-            raise ValueError(f"Colwise: dim {self.dim} size {size} not divisible by n_tracks {n_tracks}")
-        chunk = size // n_tracks
-        return weight.narrow(self.dim, track_idx * chunk, chunk).contiguous()
+        chunk = _even_chunk(weight.shape[self.dim], n_tracks, self.pad_full_size, "Colwise")
+        return _chunk_slice(weight, self.dim, track_idx, chunk)
 
     def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
-        return torch.cat(slices, dim=self.dim).contiguous()
+        out = torch.cat(slices, dim=self.dim)
+        if self.pad_full_size is not None:
+            out = out.narrow(self.dim, 0, self.pad_full_size)
+        return out.contiguous()
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         out = list(full_shape)
-        out[self.dim] = out[self.dim] // n_tracks
+        out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Colwise")
         return tuple(out)
 
 
@@ -67,24 +97,26 @@ class Rowwise:
     """Split the input dimension (dim 1 of nn.Linear.weight) evenly across tracks.
 
     Each track's slice produces a *partial sum* of the output; the all-reduce
-    at the next sync point completes the addition.
+    at the next sync point completes the addition. ``pad_full_size`` works as in
+    `Colwise` (zero input columns contribute nothing to the partial sum).
     """
 
     dim: int = 1  # input dim of nn.Linear weight is 1
+    pad_full_size: int | None = None
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
-        size = weight.shape[self.dim]
-        if size % n_tracks != 0:
-            raise ValueError(f"Rowwise: dim {self.dim} size {size} not divisible by n_tracks {n_tracks}")
-        chunk = size // n_tracks
-        return weight.narrow(self.dim, track_idx * chunk, chunk).contiguous()
+        chunk = _even_chunk(weight.shape[self.dim], n_tracks, self.pad_full_size, "Rowwise")
+        return _chunk_slice(weight, self.dim, track_idx, chunk)
 
     def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
-        return torch.cat(slices, dim=self.dim).contiguous()
+        out = torch.cat(slices, dim=self.dim)
+        if self.pad_full_size is not None:
+            out = out.narrow(self.dim, 0, self.pad_full_size)
+        return out.contiguous()
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         out = list(full_shape)
-        out[self.dim] = out[self.dim] // n_tracks
+        out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Rowwise")
         return tuple(out)
 
 
@@ -237,6 +269,97 @@ class FusedSegmentColwise:
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         out = list(full_shape)
         out[self.dim] = out[self.dim] // n_tracks
+        return tuple(out)
+
+
+@dataclass(frozen=True)
+class GDNFusedQKV:
+    """Slice a GatedDeltaNet `[Q (key_dim) | K (key_dim) | V (value_dim)]` slab by *value* head.
+
+    GDN is GQA-shaped over its value heads: `ratio = num_v_heads // num_k_heads`
+    v-heads share one k-head, and the forward repeat-interleaves q/k by that ratio.
+    The parallel unit is therefore the v-head — track `t` owns v-heads
+    `[t*vpt, (t+1)*vpt)` and needs whichever k-heads those v-heads read
+    (`k = v // ratio`).
+
+    Two regimes, both exact:
+
+      - `num_k_heads % n_tracks == 0`: each track's k-heads are one contiguous
+        block, emitted **compactly** (`num_k_heads // n_tracks` of them, dense
+        ratio preserved). Byte-identical to a plain per-segment colwise split.
+      - otherwise: the block straddles k-heads unevenly (e.g. 16 k / 48 v over 24
+        tracks gives 1 or 2 k-heads depending on the track), and per-track shapes
+        must stay uniform for the batched forward. So every track gets ONE k-head
+        copy per v-head — per-track ratio 1, which the forward handles natively
+        (it only repeat-interleaves when the ratio exceeds 1). Costs a `ratio`x
+        replication of Q/K.
+
+    Deliberately has no ``replication_groups``: a track's slab always carries its
+    own unique V segment, so no two tracks hold an identical tensor. Duplicated
+    k-heads are free to diverge under training, like full-attention `k_proj`.
+    """
+
+    num_k_heads: int
+    num_v_heads: int
+    head_k_dim: int
+    head_v_dim: int
+    dim: int = 0
+
+    def _k_head_indices(self, track_idx: int, n_tracks: int) -> list[int]:
+        if self.num_v_heads % n_tracks != 0:
+            raise ValueError(
+                f"GDNFusedQKV: num_v_heads {self.num_v_heads} not divisible by n_tracks {n_tracks}"
+            )
+        if self.num_k_heads % n_tracks == 0:
+            per_track = self.num_k_heads // n_tracks
+            return list(range(track_idx * per_track, (track_idx + 1) * per_track))
+        vpt = self.num_v_heads // n_tracks
+        ratio = self.num_v_heads // self.num_k_heads
+        return [(track_idx * vpt + j) // ratio for j in range(vpt)]
+
+    def _dims(self) -> tuple[int, int]:
+        return self.num_k_heads * self.head_k_dim, self.num_v_heads * self.head_v_dim
+
+    def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
+        key_dim, value_dim = self._dims()
+        if weight.shape[self.dim] != 2 * key_dim + value_dim:
+            raise ValueError(
+                f"GDNFusedQKV: expected dim {self.dim} = {2 * key_dim + value_dim}, "
+                f"got {weight.shape[self.dim]}"
+            )
+        k_idx = self._k_head_indices(track_idx, n_tracks)
+        v_chunk = (self.num_v_heads // n_tracks) * self.head_v_dim
+        parts = [
+            weight.narrow(self.dim, base + i * self.head_k_dim, self.head_k_dim)
+            for base in (0, key_dim)
+            for i in k_idx
+        ]
+        parts.append(weight.narrow(self.dim, 2 * key_dim + track_idx * v_chunk, v_chunk))
+        return torch.cat(parts, dim=self.dim).contiguous()
+
+    def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
+        # Q/K are de-duplicated (a k-head may be held by several tracks); V concatenates.
+        n_tracks = len(slices)
+        v_chunk = (self.num_v_heads // n_tracks) * self.head_v_dim
+        q: dict[int, torch.Tensor] = {}
+        k: dict[int, torch.Tensor] = {}
+        v: list[torch.Tensor] = []
+        for t, s in enumerate(slices):
+            k_idx = self._k_head_indices(t, n_tracks)
+            n_k = len(k_idx)
+            for j, i in enumerate(k_idx):
+                q[i] = s.narrow(self.dim, j * self.head_k_dim, self.head_k_dim)
+                k[i] = s.narrow(self.dim, (n_k + j) * self.head_k_dim, self.head_k_dim)
+            v.append(s.narrow(self.dim, 2 * n_k * self.head_k_dim, v_chunk))
+        order = sorted(q)
+        return torch.cat([q[i] for i in order] + [k[i] for i in order] + v, dim=self.dim).contiguous()
+
+    def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
+        out = list(full_shape)
+        n_k = len(self._k_head_indices(0, n_tracks))
+        out[self.dim] = (
+            2 * n_k * self.head_k_dim + (self.num_v_heads // n_tracks) * self.head_v_dim
+        )
         return tuple(out)
 
 

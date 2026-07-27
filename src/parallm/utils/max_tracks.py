@@ -6,13 +6,18 @@ Track-count rule (KV-replicated max-parallelism):
       1. num_attention_heads % N == 0      (each track gets >=1 q-head)
       2. N % num_key_value_heads == 0      (kv-groups split evenly across tracks,
                                             with replication within a group)
-      3. linear_num_key_heads % N == 0
-         and linear_num_value_heads % N == 0
-      4. intermediate_size % N == 0
+      3. every dim in `divides` is divisible by N
 
 This is model-agnostic: each family's `ModelAdapter` supplies a `constraints`
 callback returning a `ConstraintSet`, and we scan N downward from
 num_attention_heads to the first N that satisfies every constraint.
+
+A dim only belongs in `divides` when the slicer has no exact way around it.
+Where a spec can replicate (`GDNFusedQKV` on the GDN key heads) or zero-pad
+(`Colwise(pad_full_size=...)` on an MLP width) the dim imposes no constraint —
+which is how Qwen3.5-27B reaches N=24 despite 16 GDN key heads and an
+intermediate_size of 17408. Note this makes N=24, not 8, that model's *default*
+track count when `convert.py` is run without `--n-tracks`.
 """
 from __future__ import annotations
 

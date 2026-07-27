@@ -31,7 +31,10 @@ def apply_common_per_track_sizing(text_config, n_tracks: int):
       - num_attention_heads //= n_tracks (each track holds >=1 q-head)
       - num_key_value_heads = 1 (one replicated kv-head per kv-group; dense num_kv
         must satisfy `n_tracks % num_kv == 0`)
-      - linear_num_*_heads //= n_tracks (SSM heads divide, no replication)
+      - linear_num_value_heads //= n_tracks (the GDN parallel unit)
+      - linear_num_key_heads //= n_tracks when it divides, else one k-head per
+        v-head (per-track ratio 1). Mirrors `slicer.base.GDNFusedQKV`, which does
+        the matching weight-side replication — keep the two in step.
 
     Also forces SDPA: the per-track full-attention layers are built standalone (no
     PreTrainedModel to resolve a backend), so eager would materialize a full (T, T)
@@ -46,14 +49,15 @@ def apply_common_per_track_sizing(text_config, n_tracks: int):
             f"n_tracks {n_tracks} must be a multiple of num_key_value_heads {cfg.num_key_value_heads} "
             f"(KV-replicated rule)"
         )
-    if cfg.linear_num_key_heads % n_tracks != 0:
-        raise ValueError(f"linear_num_key_heads {cfg.linear_num_key_heads} not divisible by {n_tracks}")
     if cfg.linear_num_value_heads % n_tracks != 0:
         raise ValueError(f"linear_num_value_heads {cfg.linear_num_value_heads} not divisible by {n_tracks}")
     cfg.num_attention_heads //= n_tracks
     cfg.num_key_value_heads = 1
-    cfg.linear_num_key_heads //= n_tracks
+    divides_k = cfg.linear_num_key_heads % n_tracks == 0
     cfg.linear_num_value_heads //= n_tracks
+    cfg.linear_num_key_heads = (
+        cfg.linear_num_key_heads // n_tracks if divides_k else cfg.linear_num_value_heads
+    )
     cfg._attn_implementation = "sdpa"
     return cfg
 
