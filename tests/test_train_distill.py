@@ -7,21 +7,23 @@ Rail 2 — N=1 parity: every phase walk must reduce to the dense forward when
 the SyncBoundary is a no-op.
 
 Rail 3 — zero-loss identity: distill_step(student == teacher slices, N=1)
-must read block_mse ≈ 0 and KL ≈ 0 (any target-phase misalignment between the
-teacher captures and the student taps breaks this instantly).
+must read block_mse ≈ 0 (any target-phase misalignment between the teacher
+captures and the student taps breaks this instantly).
 
-Rail 4 — chunked KL/CE/logit-MSE ≡ direct full-logits computation (values and
-the gradient w.r.t. the hidden state).
+Rail 4 — chunked CE ≡ direct full-logits computation (value and the gradient
+w.r.t. the hidden state).
 
-Rail 5 — sf=1.0 chain ≡ deployed forward: at student_forcing_prob=1.0 the TF
-block loop's per-tap relMSEs must equal the free-running post-attn forward's
-(the tag-era "the sf-1.0 chain IS the deployed forward" property).
+NOTE: the old rail 5 (sf=1.0 chain ≡ deployed forward) went with student
+forcing when it was removed 2026-07-30 — the block loop is now always
+teacher-forced, so there is no free-running variant of it left to compare.
+That check has no replacement here; `git log` has it.
 
 Rail 6 — gradients flow to every track's layer params through the step, at both
 the d1b and a fixed-D=2 (gapped) schedule.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -37,29 +39,14 @@ from parallm.train.distill import (
     DistillConfig,
     distill_step,
     freeze_slice_teacher,
-    kl_ce_chunked,
+    ce_chunked,
     teacher_forward,
-    validate_step,
 )
 from parallm.train.losses import block_mse
 
 
-# Unchunked reference objectives for rail 4 — the whole point of kl_ce_chunked is
+# Unchunked reference objective for rail 4 — the whole point of ce_chunked is
 # that it never materializes these (B, T, V) logits, so they live only here.
-def logit_kl(student_logits, teacher_logits, attention_mask, temperature=1.0):
-    s_logp = F.log_softmax(student_logits.float() / temperature, dim=-1)
-    t_logp = F.log_softmax(teacher_logits.float() / temperature, dim=-1)
-    per_token = (t_logp.exp() * (t_logp - s_logp)).sum(dim=-1) * attention_mask
-    return per_token.sum() / attention_mask.sum().clamp(min=1) * temperature**2
-
-
-def logit_mse(student_logits, teacher_logits, attention_mask):
-    d = student_logits.float() - teacher_logits.float()
-    d = d - d.mean(dim=-1, keepdim=True)  # centered: drop the softmax-free direction
-    per_token = d.pow(2).mean(dim=-1) * attention_mask
-    return per_token.sum() / attention_mask.sum().clamp(min=1)
-
-
 def lm_cross_entropy(logits, labels, ignore_index=-100):
     shift = logits[:, :-1, :]
     return F.cross_entropy(shift.reshape(-1, shift.size(-1)).float(),
@@ -87,7 +74,7 @@ def _tiny_config(n_layers: int = 8):
     )
 
 
-def _build(n_tracks: int, sync_after=None, n_layers: int = 8):
+def _build(n_tracks: int, sync_after=None, n_layers: int = 8, fuse_size: int = 1):
     cfg = _tiny_config(n_layers)
     torch.manual_seed(42)
     dense = Qwen3_5TextModel(cfg)
@@ -105,6 +92,7 @@ def _build(n_tracks: int, sync_after=None, n_layers: int = 8):
         local_track_ids=tuple(range(n_tracks)),
         sync_after_layers=list(sync_after) if sync_after is not None else manifest.sync_layer_indices,
         track_group=None,
+        fuse_size=fuse_size,
     )
     pt.eval()
     pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
@@ -161,84 +149,30 @@ def test_distill_step_zero_loss_identity_n1():
     teacher_pt.load_track_state_dicts({0: tracks[0]}, strict=False)
     teacher = freeze_slice_teacher(teacher_pt)
 
-    dcfg = DistillConfig(sync_layer_indices=tuple(range(8)), lambda_logit_mse=0.05)
+    dcfg = DistillConfig(sync_layer_indices=tuple(range(8)))
     batch = _batch(cfg)
-    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg, student_forcing_prob=0.0)
+    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg)
     assert losses["block_mse"].item() < 1e-8, f"block_mse {losses['block_mse'].item()} not ~0 at N=1"
-    assert losses["kl"].item() < 1e-6, f"kl {losses['kl'].item()} not ~0 at N=1"
     assert torch.isfinite(losses["ce"]), "ce not finite"
 
 
-def test_kl_ce_chunked_matches_direct():
+def test_ce_chunked_matches_direct():
     torch.manual_seed(0)
     B, T, H, V = 2, 13, 8, 31
     lm_head = nn.Linear(H, V, bias=False)
     lm_head.weight.requires_grad_(False)
     hidden = torch.randn(B, T, H, requires_grad=True)
-    t_hidden = torch.randn(B, T, H)
     labels = torch.randint(0, V, (B, T))
-    mask = torch.ones((B, T), dtype=torch.long)
-    lam_kl, lam_ce, lam_lm, temp = 0.7, 0.3, 0.11, 2.0
+    lam_ce = 0.3
 
-    kl, ce, lm, grad_h = kl_ce_chunked(
-        hidden, t_hidden, lm_head, labels, mask,
-        lambda_kl=lam_kl, lambda_ce=lam_ce, lambda_logit_mse=lam_lm,
-        kl_temperature=temp, chunk_size=5,
-    )
+    ce, grad_h = ce_chunked(hidden, lm_head, labels, lambda_ce=lam_ce, chunk_size=5)
 
     s_logits = lm_head(hidden)
-    t_logits = lm_head(t_hidden)
-    kl_ref = logit_kl(s_logits, t_logits, mask, temperature=temp)
     ce_ref = lm_cross_entropy(s_logits, labels)
-    lm_ref = logit_mse(s_logits, t_logits, mask)
-    assert torch.allclose(kl, kl_ref, atol=1e-5), (kl.item(), kl_ref.item())
     assert torch.allclose(ce, ce_ref, atol=1e-5), (ce.item(), ce_ref.item())
-    assert torch.allclose(lm, lm_ref, atol=1e-5), (lm.item(), lm_ref.item())
 
-    (lam_kl * kl_ref + lam_ce * ce_ref + lam_lm * lm_ref).backward()
-    assert torch.allclose(grad_h, hidden.grad, atol=1e-6), \
-        f"chunked grad drifts by {(grad_h - hidden.grad).abs().max().item()}"
-
-
-def test_sf1_chain_matches_free_running_n4():
-    cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=list(range(8)))
-    pt.set_sync_phase("post-attn")
-    pt.train()
-    teacher_pt = PTWrappedModel(
-        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
-        sync_after_layers=list(range(8)), track_group=None,
-    )
-    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
-    teacher = freeze_slice_teacher(teacher_pt)
-
-    # No clamp so the per-tap values are the raw relMSEs on both sides.
-    dcfg = DistillConfig(
-        sync_layer_indices=tuple(range(8)), lambda_kl=0.0, lambda_ce=0.0,
-        block_mse_clamp=None,
-    )
-    batch = _batch(cfg)
-    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg, student_forcing_prob=1.0)
-
-    # Reference: the deployed (free-running) post-attn forward's synced states
-    # vs the same teacher targets (same capture contract on both sides).
-    post_attn, post_mlp = set(range(7)), {7}
-    pt.eval()
-    with torch.no_grad():
-        _, fr_taps = pt(
-            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
-            return_sync_hiddens=True,
-            capture_post_attn=post_attn, capture_post_mlp=post_mlp,
-        )
-        _, t_caps = teacher_forward(
-            teacher, batch["input_ids"], batch["attention_mask"],
-            post_attn_layers=post_attn, post_mlp_layers=post_mlp,
-        )
-    assert len(fr_taps) == 8, f"expected a tap per layer, got {sorted(fr_taps)}"
-    for i in sorted(fr_taps):
-        ref = block_mse(fr_taps[i], t_caps[i], attention_mask=batch["attention_mask"],
-                        normalize=True).item()
-        got = losses["layer_relmse"][i]
-        assert abs(got - ref) < 1e-5, f"layer {i}: sf=1.0 chain {got} != free-running {ref}"
+    (lam_ce * ce_ref).backward()
+    assert torch.allclose(grad_h, hidden.grad, atol=1e-5)
 
 
 def test_distill_step_grads_flow_n4():
@@ -252,10 +186,9 @@ def test_distill_step_grads_flow_n4():
     teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
     teacher = freeze_slice_teacher(teacher_pt)
 
-    dcfg = DistillConfig(sync_layer_indices=tuple(range(8)), lambda_logit_mse=0.05)
+    dcfg = DistillConfig(sync_layer_indices=tuple(range(8)))
     batch = _batch(cfg)
-    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg, student_forcing_prob=0.25,
-                          forcing_seed=(1, 2))
+    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg)
     assert torch.isfinite(losses["total"])
     for k, tm in enumerate(pt.text_models):
         got = sum(1 for p_ in tm.layers.parameters() if p_.grad is not None and p_.grad.abs().sum() > 0)
@@ -263,14 +196,11 @@ def test_distill_step_grads_flow_n4():
     # Teacher stayed frozen and untouched.
     assert all(not p_.requires_grad for p_ in teacher.parameters())
 
-    val = validate_step(pt, teacher, pt.lm_head, batch)
-    assert torch.isfinite(val["kl"]) and torch.isfinite(val["ce"])
-
 
 def test_distill_step_fixed_d2_schedule_n4():
     """The fixed-D=2 re-heal: student BUILT at the gapped schedule (own-carry at
     layers 0,2,4,6), checkpointing on. Grads must reach every track through both
-    the own-carry TF loop and the free-running KL forward."""
+    the own-carry TF loop and the free-running CE forward."""
     sched = [1, 3, 5, 7]
     cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=sched)
     pt.set_sync_phase("post-attn")
@@ -283,13 +213,11 @@ def test_distill_step_fixed_d2_schedule_n4():
     teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
     teacher = freeze_slice_teacher(teacher_pt)
 
-    dcfg = DistillConfig(sync_layer_indices=tuple(sched), lambda_logit_mse=0.05,
-                         block_mse_clamp=None)
+    dcfg = DistillConfig(sync_layer_indices=tuple(sched), block_mse_clamp=None)
     batch = _batch(cfg)
-    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg,
-                          student_forcing_prob=0.25, forcing_seed=(1, 2))
+    losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg)
     assert torch.isfinite(losses["total"])
-    assert losses["block_mse"].item() > 0 and losses["kl"].item() > 0
+    assert losses["block_mse"].item() > 0 and losses["ce"].item() > 0
     for k, tm in enumerate(pt.text_models):
         got = sum(1 for p_ in tm.layers.parameters()
                   if p_.grad is not None and p_.grad.abs().sum() > 0)

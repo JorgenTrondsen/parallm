@@ -34,17 +34,64 @@ class SlicerSpec(Protocol):
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]: ...
 
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor: ...
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]: ...
+
+
+def align_chunk(chunk: int, align: int = 64) -> int:
+    """Round a zero-padded per-track slab up to a tensor-core-friendly multiple.
+
+    Measured on the 27B (bf16, M=2048, K=5120): a **726**-wide GEMM — `ceil(17408/24)`
+    — runs at 101 TFLOP/s, while the **768**-wide one that does 5.8% MORE work runs
+    at 160. Since the extra lanes are zeros (exact for SwiGLU), rounding up is free
+    quality and ~1.5x on the dense model's dominant GEMM.
+
+    Skipped when the rounding would inflate the slab by more than 1/8 — that only
+    happens at tiny (test-sized) widths, where there is no tensor-core win anyway.
+    """
+    up = -(-chunk // align) * align
+    return up if up * 8 <= chunk * 9 else chunk
+
 
 def _even_chunk(size: int, n_tracks: int, pad_full_size: int | None, label: str) -> int:
     """Per-track chunk along a split dim. Without `pad_full_size` the dim must
-    divide evenly; with it the chunk rounds *up* and short slices are zero-filled."""
+    divide evenly; with it the chunk rounds *up* (and to a GEMM-friendly multiple)
+    and short slices are zero-filled."""
     if pad_full_size is None:
         if size % n_tracks != 0:
             raise ValueError(f"{label}: dim size {size} not divisible by n_tracks {n_tracks}")
         return size // n_tracks
     if size != pad_full_size:
         raise ValueError(f"{label}: expected dim size {pad_full_size}, got {size}")
-    return -(-size // n_tracks)
+    return align_chunk(-(-size // n_tracks))
+
+
+def _cat_merge(slices: list[torch.Tensor], dim: int, chunk: int | None = None) -> torch.Tensor:
+    """Concatenate F consecutive tracks' slabs into one F-wide track's slab.
+
+    The inverse of slicing across a *group* rather than across all N tracks: with
+    `fuse_size == tracks_per_rank` the group's members share their sublayer input,
+    so one wide track computing the concatenated weights is the same function as F
+    narrow tracks summing their deltas — and it issues 1/F the kernels.
+
+    ``chunk`` (the padded per-track width) is passed by the specs that zero-pad, so
+    a slab converted under an older/narrower rule is widened BEFORE the cat. That
+    matters: padding the merged slab at the end instead would shift members 1..F-1
+    off their own lane boundaries, and the split back to F shards would corrupt them.
+    """
+    if chunk is not None:
+        slices = [_chunk_slice(s, dim, 0, chunk) for s in slices]
+    return torch.cat(slices, dim=dim).contiguous()
+
+
+def _chunk_split(merged: torch.Tensor, dim: int, fuse: int) -> list[torch.Tensor]:
+    """Inverse of `_cat_merge`: the F equal slabs a merged track was built from."""
+    if merged.shape[dim] % fuse:
+        raise ValueError(
+            f"split: dim {dim} size {merged.shape[dim]} not divisible by fuse {fuse}"
+        )
+    return [c.contiguous() for c in torch.chunk(merged, fuse, dim=dim)]
 
 
 def _chunk_slice(weight: torch.Tensor, dim: int, track_idx: int, chunk: int) -> torch.Tensor:
@@ -91,6 +138,17 @@ class Colwise:
         out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Colwise")
         return tuple(out)
 
+    def _merge_chunk(self, n_tracks: int) -> int | None:
+        if self.pad_full_size is None:
+            return None
+        return _even_chunk(self.pad_full_size, n_tracks, self.pad_full_size, "Colwise")
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        return _cat_merge(slices, self.dim, self._merge_chunk(n_tracks))
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        return _chunk_split(merged, self.dim, fuse)
+
 
 @dataclass(frozen=True)
 class Rowwise:
@@ -119,6 +177,17 @@ class Rowwise:
         out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Rowwise")
         return tuple(out)
 
+    def _merge_chunk(self, n_tracks: int) -> int | None:
+        if self.pad_full_size is None:
+            return None
+        return _even_chunk(self.pad_full_size, n_tracks, self.pad_full_size, "Rowwise")
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        return _cat_merge(slices, self.dim, self._merge_chunk(n_tracks))
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        return _chunk_split(merged, self.dim, fuse)
+
 
 @dataclass(frozen=True)
 class PerHead:
@@ -143,6 +212,12 @@ class PerHead:
         out = list(full_shape)
         out[self.dim] = out[self.dim] // n_tracks
         return tuple(out)
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        return _cat_merge(slices, self.dim)
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        return _chunk_split(merged, self.dim, fuse)
 
 
 @dataclass(frozen=True)
@@ -175,6 +250,34 @@ class Replicated:
             return [list(range(n_tracks))]
         # Diverge: each copy trains independently.
         return [[t] for t in range(n_tracks)]
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        if self.sync:
+            # `sync_replicated_grads` keeps these bit-identical, so one copy IS the
+            # group. Assert rather than trust: a drifted copy here would be
+            # silently averaged away by the merge.
+            for s in slices[1:]:
+                if not torch.equal(s, slices[0]):
+                    raise ValueError(
+                        "Replicated(sync=True).merge: copies differ, so they cannot "
+                        "be collapsed to one. Was sync_replicated_grads skipped?"
+                    )
+            return slices[0].detach().clone()
+        # Diverged copies (q_norm/k_norm): stack into a leading per-member dim.
+        # Exact only because these are per-head RMSNorm weights applied to a
+        # (..., heads, head_dim) tensor, where [F, head_dim] broadcasts per head —
+        # verified against a per-head loop. A `sync=False` param that is NOT
+        # applied per-head cannot be merged this way.
+        return torch.stack([s.detach() for s in slices], dim=0).contiguous()
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        if self.sync:
+            return [merged.detach().clone() for _ in range(fuse)]
+        if merged.shape[0] != fuse:
+            raise ValueError(
+                f"Replicated(sync=False).split: leading dim {merged.shape[0]} != fuse {fuse}"
+            )
+        return [merged[i].contiguous() for i in range(fuse)]
 
 
 @dataclass(frozen=True)
@@ -211,6 +314,21 @@ class OwnerOnly:
         # The param lives on exactly one track. No gradient sync needed.
         # `force_sync` is accepted for signature uniformity and ignored.
         return [[self.owner_track]]
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # Only the group containing the owner holds this at all; the caller skips
+        # keys absent from a group's shards, so a present slice is the owner's.
+        for s in slices:
+            if s is not None:
+                return s.detach().clone()
+        raise ValueError("OwnerOnly.merge got no non-None slices")
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        # Back to the owner's shard only; peers omit the key. Groups are aligned
+        # runs of `fuse` starting at a multiple of `fuse` (PTWrappedModel enforces
+        # it), so the owner's position within its group is owner_track % fuse.
+        own = self.owner_track % fuse
+        return [merged.detach().clone() if i == own else None for i in range(fuse)]
 
 
 @dataclass(frozen=True)
@@ -270,6 +388,28 @@ class FusedSegmentColwise:
         out = list(full_shape)
         out[self.dim] = out[self.dim] // n_tracks
         return tuple(out)
+
+    def _per_track_segments(self, n_tracks: int) -> list[int]:
+        return [s // n_tracks for s in self.segments]
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # A plain cat would give [QKV_0 | QKV_1 | ...]; the wide track's forward
+        # wants [Q_all | K_all | V_all], so merge segment-wise.
+        segs = self._per_track_segments(n_tracks)
+        parts = [torch.split(s, segs, dim=self.dim) for s in slices]
+        return torch.cat(
+            [torch.cat([p[i] for p in parts], dim=self.dim) for i in range(len(segs))],
+            dim=self.dim,
+        ).contiguous()
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        segs = self._per_track_segments(n_tracks)
+        wide = torch.split(merged, [s * fuse for s in segs], dim=self.dim)
+        per_seg = [torch.chunk(w, fuse, dim=self.dim) for w in wide]
+        return [
+            torch.cat([per_seg[i][t] for i in range(len(segs))], dim=self.dim).contiguous()
+            for t in range(fuse)
+        ]
 
 
 @dataclass(frozen=True)
@@ -362,6 +502,32 @@ class GDNFusedQKV:
         )
         return tuple(out)
 
+    def _per_track_segments(self, n_tracks: int) -> list[int]:
+        n_k = len(self._k_head_indices(0, n_tracks))
+        k = n_k * self.head_k_dim
+        return [k, k, (self.num_v_heads // n_tracks) * self.head_v_dim]
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # Segment-wise, like FusedSegmentColwise: the merged track's forward splits
+        # its slab as [Q | K | V], so the F members' Q's must be adjacent. The
+        # k-head COPIES ride along unchanged — the merged track has one k-head per
+        # v-head (ratio 1), which is what each member already had.
+        segs = self._per_track_segments(n_tracks)
+        parts = [torch.split(s, segs, dim=self.dim) for s in slices]
+        return torch.cat(
+            [torch.cat([p[i] for p in parts], dim=self.dim) for i in range(3)],
+            dim=self.dim,
+        ).contiguous()
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        segs = self._per_track_segments(n_tracks)
+        wide = torch.split(merged, [s * fuse for s in segs], dim=self.dim)
+        per_seg = [torch.chunk(w, fuse, dim=self.dim) for w in wide]
+        return [
+            torch.cat([per_seg[i][t] for i in range(3)], dim=self.dim).contiguous()
+            for t in range(fuse)
+        ]
+
 
 @dataclass(frozen=True)
 class KVReplicatedColwise:
@@ -445,6 +611,14 @@ class KVReplicatedColwise:
         # Diverge: every track's KV head trains independently.
         return [[t] for t in range(n_tracks)]
 
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # The merged track gets one kv-head per q-head (num_key_value_heads = F,
+        # ratio 1), each member keeping its own — possibly already diverged — copy.
+        return _cat_merge(slices, self.dim)
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        return _chunk_split(merged, self.dim, fuse)
+
 
 @dataclass(frozen=True)
 class GatedQColwise:
@@ -484,6 +658,14 @@ class GatedQColwise:
         out = list(full_shape)
         out[self.dim] = (self.num_heads // n_tracks) * 2 * self.head_dim
         return tuple(out)
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # Head-major ([q|gate] per head), so a plain cat already lands the merged
+        # track's heads in order — the view+chunk in forward() sees F*2*head_dim.
+        return _cat_merge(slices, self.dim)
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        return _chunk_split(merged, self.dim, fuse)
 
 
 # Mapping from a fully-qualified parameter sub-path inside a decoder layer to

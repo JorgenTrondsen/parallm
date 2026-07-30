@@ -49,7 +49,7 @@ from parallm.eval.lm_eval_adapter import (
 )
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.teacher import HookedTeacher
-from parallm.utils.checkpoint import load_manifest, load_track
+from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
 
 
 def _log(rank: int, msg: str) -> None:
@@ -141,6 +141,11 @@ def main() -> int:
                         "is a different network — a post-attn heal read as post-mlp measured "
                         "0.553 vs its true 0.700. 'post-attn'=lever B (heal schedule); "
                         "'post-mlp'=legacy walk; 'exact'=2 syncs/layer ≡ dense.")
+    p.add_argument("--fuse-tracks", type=int, default=None,
+                   help="F rank-local tracks pool their partials at every non-sync sublayer "
+                        "(N/F-track behaviour on N shards). DEFAULT reads it from the "
+                        "checkpoint's train_meta.json (else 1) — same trap as --sync-phase: "
+                        "scoring a fused model unfused is a different network.")
     p.add_argument("--engine-replicas", default=None,
                    help="Path to a packed replica pool: score the student through the "
                         "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
@@ -156,17 +161,17 @@ def main() -> int:
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
 
-    # The manifest records the sync INDICES but not the PHASE, so the phase has to
-    # come from the training metadata that sits beside the weights.
+    # The manifest records the sync INDICES but not the PHASE or the track
+    # fusion, so both come from the training metadata beside the weights.
     if args.sync_phase is None:
-        meta = Path(args.checkpoint_dir) / "train_meta.json"
-        args.sync_phase = (
-            json.loads(meta.read_text()).get("args", {}).get("sync_phase", "post-attn")
-            if meta.exists() else "post-attn"
-        )
-        _resolved_from = "train_meta.json" if meta.exists() else "default"
+        args.sync_phase, _resolved_from = train_meta_arg(
+            args.checkpoint_dir, "sync_phase", "post-attn")
     else:
         _resolved_from = "flag"
+    if args.fuse_tracks is None:
+        args.fuse_tracks, _fuse_from = train_meta_arg(args.checkpoint_dir, "fuse_tracks", 1)
+    else:
+        _fuse_from = "flag"
 
     manifest = load_manifest(args.checkpoint_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
@@ -186,7 +191,8 @@ def main() -> int:
         rank,
         f"[init] target={args.target} world={layout.world_size} "
         f"n_tracks={manifest.n_tracks} K={layout.tracks_per_rank} "
-        f"sync_phase={args.sync_phase} (from {_resolved_from})",
+        f"sync_phase={args.sync_phase} (from {_resolved_from}) "
+        f"fuse={args.fuse_tracks} (from {_fuse_from})",
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
@@ -211,6 +217,7 @@ def main() -> int:
             local_track_ids=layout.local_track_ids,
             sync_after_layers=sync_layers,
             track_group=layout.track_group,
+            fuse_size=args.fuse_tracks,
         )
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)

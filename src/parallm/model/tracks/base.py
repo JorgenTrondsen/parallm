@@ -24,7 +24,7 @@ from parallm.model.sync import SyncBoundary
 from parallm.model.pt_model import PTTrackTextModelConfig
 
 
-def apply_common_per_track_sizing(text_config, n_tracks: int):
+def apply_common_per_track_sizing(text_config, n_tracks: int, fuse_size: int = 1):
     """Deep-copy `text_config` and apply the KV-replicated *attention* sizing shared
     by every family. Callers then divide their own MLP-width fields.
 
@@ -35,6 +35,12 @@ def apply_common_per_track_sizing(text_config, n_tracks: int):
       - linear_num_key_heads //= n_tracks when it divides, else one k-head per
         v-head (per-track ratio 1). Mirrors `slicer.base.GDNFusedQKV`, which does
         the matching weight-side replication — keep the two in step.
+
+    ``fuse_size`` > 1 sizes a MERGED track: F consecutive tracks' slabs concatenated
+    into one F-wide track (see `parallm.model.merge`). Every divided field is scaled
+    back up by F, so this is the N-track slicing with F of them glued together — NOT
+    the N/F-track slicing, which would replicate GDN k-heads and pad the MLP
+    differently and so would not match the shards on disk.
 
     Also forces SDPA: the per-track full-attention layers are built standalone (no
     PreTrainedModel to resolve a backend), so eager would materialize a full (T, T)
@@ -58,6 +64,11 @@ def apply_common_per_track_sizing(text_config, n_tracks: int):
     cfg.linear_num_key_heads = (
         cfg.linear_num_key_heads // n_tracks if divides_k else cfg.linear_num_value_heads
     )
+    if fuse_size > 1:
+        cfg.num_attention_heads *= fuse_size
+        cfg.num_key_value_heads *= fuse_size  # one kv-head per q-head: ratio 1
+        cfg.linear_num_value_heads *= fuse_size
+        cfg.linear_num_key_heads *= fuse_size
     cfg._attn_implementation = "sdpa"
     return cfg
 

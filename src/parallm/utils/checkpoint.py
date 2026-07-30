@@ -73,6 +73,21 @@ def load_track_keys(
     return out
 
 
+def train_meta_arg(checkpoint_dir: str | Path, name: str, default):
+    """A training flag recorded beside the weights: ``(value, source)``.
+
+    The manifest carries the sync INDICES but not the rest of the forward's
+    shape (phase, track fusion), so eval has to recover those from the trainer's
+    `train_meta.json` or it scores a different network than the one that trained
+    — the post-attn heal read back as post-mlp measured 0.553 against its true
+    0.700. Callers log the source.
+    """
+    meta = Path(checkpoint_dir) / "train_meta.json"
+    if not meta.exists():
+        return default, "default"
+    return json.loads(meta.read_text()).get("args", {}).get(name, default), "train_meta.json"
+
+
 def load_manifest(checkpoint_dir: str | Path) -> PTManifest:
     data = json.loads((Path(checkpoint_dir) / "manifest.json").read_text())
     # The cadence descriptors `sync_block_depth` / `sync_schedule` were dropped

@@ -48,7 +48,7 @@ from parallm.train.data import (
     preset_sources,
 )
 from parallm.train.teacher import HookedTeacher
-from parallm.utils.checkpoint import load_manifest, load_track
+from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
 
 
 def _log(rank: int, msg: str) -> None:
@@ -103,6 +103,10 @@ def main() -> int:
                    help="Where in a layer the sync fires. Default: leave the model's own "
                         "('post-mlp'). 'exact' = 2 syncs/layer, which is exactly equivalent "
                         "to dense — use it to verify a fresh convert (expect ~zero KL).")
+    p.add_argument("--fuse-tracks", type=int, default=None,
+                   help="F rank-local tracks pool their partials at every non-sync sublayer "
+                        "(N/F-track behaviour on N shards). Default: read from the "
+                        "checkpoint's train_meta.json, else 1.")
     p.add_argument("--intra-window-taps", action="store_true",
                    help="Also report block_mse/relmse at EVERY layer, not just the sync "
                         "boundaries. Mid-window rows are loss-only synced reconstructions "
@@ -138,10 +142,15 @@ def main() -> int:
             "output carries none — the schedule is placed at train time). Pass "
             "--sync-indices, or point --checkpoint-dir at a trained checkpoint."
         )
+    if args.fuse_tracks is None:
+        args.fuse_tracks, _fuse_from = train_meta_arg(args.checkpoint_dir, "fuse_tracks", 1)
+    else:
+        _fuse_from = "flag"
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
-        f"K={layout.tracks_per_rank} num_layers={manifest.num_layers}",
+        f"K={layout.tracks_per_rank} num_layers={manifest.num_layers} "
+        f"fuse={args.fuse_tracks} (from {_fuse_from})",
     )
     _log(rank, f"[init] sync schedule: {len(sync_layers)} syncs at {sync_layers}"
                + ("  (OVERRIDE)" if args.sync_indices is not None else ""))
@@ -185,6 +194,7 @@ def main() -> int:
         local_track_ids=layout.local_track_ids,
         sync_after_layers=sync_layers,
         track_group=layout.track_group,
+        fuse_size=args.fuse_tracks,
     )
     if args.sync_phase is not None:
         student.set_sync_phase(args.sync_phase)

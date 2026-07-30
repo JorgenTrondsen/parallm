@@ -24,7 +24,13 @@ class PTTrackTextModel(PTTrackTextModelBase):
     ROTARY_CLS = Qwen3_5MoeTextRotaryEmbedding
 
 
-def build_per_track_text_config(text_config, n_tracks: int):
+def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
+    if fuse_size > 1:
+        # The merged-track speedup (parallm.model.merge) targets the dense 27B's
+        # K=3 launch/elementwise cost. The MoE MLP is expert-group-bound, not
+        # track-bound, so merging buys ~nothing there and the expert slabs' merge
+        # rule is unverified — refuse rather than guess.
+        raise ValueError("fuse_size > 1 (merged tracks) is not supported for qwen3_5_moe")
     cfg = apply_common_per_track_sizing(text_config, n_tracks)
     for field in ("moe_intermediate_size", "shared_expert_intermediate_size"):
         val = getattr(cfg, field)

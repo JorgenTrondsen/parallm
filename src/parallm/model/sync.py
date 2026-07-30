@@ -21,6 +21,11 @@ single-process testing (no track_group) it degenerates to a pure local sum.
 
 The N=1 single-track case is a full no-op, which is the dense-parity
 correctness gate: PTWrappedModel(N=1) must equal the dense forward.
+
+`fuse_size` adds a second, collective-free tier BETWEEN syncs: F rank-local
+tracks pool their partials at every sublayer, so a group computes as one
+F-wide track and the model behaves as N/F tracks between global syncs while
+the checkpoint stays N shards. Off (F=1) by default.
 """
 from __future__ import annotations
 
@@ -59,12 +64,58 @@ class SyncBoundary(nn.Module):
                      Pass None for single-process (in-process multi-track) testing.
         n_tracks: total number of tracks in the model. The N=1 case short-circuits
                   to a no-op for dense parity.
+        fuse_size: F rank-local tracks that pool their partials between global
+                   syncs (see `fuse`). 1 = off, today's behaviour.
     """
 
-    def __init__(self, track_group: "dist.ProcessGroup | None" = None, n_tracks: int = 1):
+    def __init__(
+        self,
+        track_group: "dist.ProcessGroup | None" = None,
+        n_tracks: int = 1,
+        fuse_size: int = 1,
+    ):
         super().__init__()
         self.track_group = track_group
         self.n_tracks = n_tracks
+        self.fuse_size = fuse_size
+
+    def fuse(
+        self,
+        h_list: "list[torch.Tensor]",
+        h_pre_list: "list[torch.Tensor]",
+    ) -> "list[torch.Tensor]":
+        """Rank-local group sum: each run of F consecutive tracks adopts its
+        COMBINED delta, so between global syncs the group computes as one F-wide
+        track (an N/F-track model on the same slices).
+
+        ``h_pre_list[i]`` is track i's input to the sublayer just run; within a
+        group those are identical (the previous fuse handed every member the same
+        tensor), so ``h_pre_list[g]`` is the group's common pre-state. Members
+        come back as the SAME tensor object, which keeps every per-track loop
+        downstream unchanged.
+
+        Purely local — no collective — so groups must not straddle ranks;
+        `PTWrappedModel` validates that.
+        """
+        if self.fuse_size <= 1:
+            return h_list
+        out: list[torch.Tensor] = []
+        for g in range(0, len(h_list), self.fuse_size):
+            grp = h_list[g : g + self.fuse_size]
+            p = h_pre_list[g]
+            fused = p + sum((h - p for h in grp[1:]), grp[0] - p)
+            out.extend([fused] * len(grp))
+        return out
+
+    def leaders(self, h_list: "list[torch.Tensor]") -> "list[torch.Tensor]":
+        """One representative per fused group, for feeding a global sync.
+
+        Post-`fuse` the F members of a group are the same tensor, each already
+        carrying the group's whole delta — summing all F would count every delta
+        F times. Fusing BEFORE the boundary is what makes this exact: the members'
+        shared pre-state is folded into one leader delta, not F copies of it.
+        """
+        return h_list if self.fuse_size <= 1 else h_list[:: self.fuse_size]
 
     def forward(
         self,

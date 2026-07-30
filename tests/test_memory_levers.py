@@ -97,8 +97,7 @@ def _run(in_backward: bool):
         for p in trainable:
             p.register_post_accumulate_grad_hook(hook)
 
-    distill_step(pt, teacher, pt.lm_head, _batch(cfg), dcfg,
-                 student_forcing_prob=0.0, forcing_seed=(1, 2))
+    distill_step(pt, teacher, pt.lm_head, _batch(cfg), dcfg)
 
     if in_backward:
         assert all(p.grad is None for p in trainable), "in-backward left grads resident"

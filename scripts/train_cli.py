@@ -11,7 +11,6 @@ Stage-1 d1b heal of the 27B (every layer a boundary):
         --hf-model <Qwen3.6-27B-NVFP4 snapshot dir> \\
         --checkpoint-dir convert_out/qwen3_6_27b_n8 \\
         --out-dir train_out/d1b_heal \\
-        --student-forcing-prob 0.25 --lambda-logit-mse 0.05 \\
         --max-steps 4001 --eval-every 500 > train_out/d1b_heal.log 2>&1 &
 
 Progressive-D curriculum: warm-start ``--checkpoint-dir train_out/d1b_heal/best``
@@ -45,7 +44,6 @@ from parallm.train.distill import (
     DistillConfig,
     distill_step,
     freeze_slice_teacher,
-    student_forcing_schedule,
 )
 from parallm.train.sync_grads import (
     assert_replicated_consistent,
@@ -61,15 +59,39 @@ def _log(rank: int, msg: str) -> None:
         print(msg, flush=True)
 
 
-def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_phase: str):
+def _load_states(text_cfg, layout, ckpt_dir: str, merge_group: int):
+    """This rank's per-(logical-)track state dicts, merged when merge_group > 1.
+
+    Merged: logical track `t` is shards `[t*F, (t+1)*F)` of the on-disk convert,
+    concatenated into one F-wide track — same function as fusing them, 1/F the
+    kernels (see `parallm.model.merge`)."""
+    if merge_group == 1:
+        return {tid: load_track(ckpt_dir, tid) for tid in layout.local_track_ids}
+    from parallm.model.merge import merge_track_states
+
+    n_shards = layout.n_tracks * merge_group
+    shards = {
+        s: load_track(ckpt_dir, s)
+        for tid in layout.local_track_ids
+        for s in range(tid * merge_group, (tid + 1) * merge_group)
+    }
+    return merge_track_states(
+        get_adapter_for_config(text_cfg), text_cfg, n_shards, shards, merge_group
+    )
+
+
+def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_phase: str,
+                   fuse_size: int = 1, merge_group: int = 1):
     model = PTWrappedModel(
         text_config=text_cfg,
-        n_tracks=manifest.n_tracks,
+        n_tracks=layout.n_tracks,
         local_track_ids=layout.local_track_ids,
         sync_after_layers=list(sync_layers),
         track_group=layout.track_group,
+        fuse_size=fuse_size,
+        merge_group=merge_group,
     )
-    states = {tid: load_track(ckpt_dir, tid) for tid in layout.local_track_ids}
+    states = _load_states(text_cfg, layout, ckpt_dir, merge_group)
     model.load_track_state_dicts(states, strict=True)
     model.set_sync_phase(sync_phase)
     # bf16 on the HOST first: the module is built in fp32 and the bf16 track weights
@@ -78,21 +100,27 @@ def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_
     return model.to(torch.bfloat16).to(torch.cuda.current_device())
 
 
-def _build_teacher_streamed(text_cfg, manifest, layout, ckpt_dir: str, sync_layers):
+def _build_teacher_streamed(text_cfg, manifest, layout, ckpt_dir: str, sync_layers,
+                            merge_group: int = 1):
     """Frozen exact-schedule teacher with its decoder layers paged from pinned
     host DRAM (``HostResidentLayers``): only the layers move off-device, which is
-    what lets the teacher coexist with the student on a 40 GB card at 122 B."""
+    what lets the teacher coexist with the student on a 40 GB card at 122 B.
+
+    Merges alongside the student: at the `exact` schedule every sublayer syncs, so
+    the merged group's members never diverge and one wide track is the same
+    forward. The teacher is a large share of the step, so this is half the win."""
     from parallm.model.pt_model import HostResidentLayers
 
     model = PTWrappedModel(
         text_config=text_cfg,
-        n_tracks=manifest.n_tracks,
+        n_tracks=layout.n_tracks,
         local_track_ids=layout.local_track_ids,
         sync_after_layers=list(sync_layers),
         track_group=layout.track_group,
+        merge_group=merge_group,
     )
     model.load_track_state_dicts(
-        {tid: load_track(ckpt_dir, tid) for tid in layout.local_track_ids}, strict=True
+        _load_states(text_cfg, layout, ckpt_dir, merge_group), strict=True
     )
     model.set_sync_phase("exact")
     model = model.to(torch.bfloat16)  # still on the host
@@ -125,18 +153,34 @@ def _extract_track_state(student: PTWrappedModel, k: int) -> dict[str, torch.Ten
 
 
 def _save_checkpoint(student, manifest, layout, out_dir: Path, meta: dict, rank: int):
-    """Weights-only per-track save: each rank writes its own tracks."""
+    """Weights-only per-track save: each rank writes its own tracks.
+
+    Merged tracks are split back to `merge_group` shards, so what lands on disk is
+    always an ordinary `manifest.n_tracks`-shard checkpoint — eval and serve never
+    see the merged representation."""
     from safetensors.torch import save_file as save_safetensors
 
+    F = getattr(student, "merge_group", 1)
     out_dir.mkdir(parents=True, exist_ok=True)
     for k, tid in enumerate(layout.local_track_ids):
-        path = out_dir / f"track_{tid}.safetensors"
-        # Unlink first: a best/ overwrite otherwise holds old+new (~108 GB at
-        # 27B) transiently, which busts the 191 GB home quota. The ckpt is a
-        # re-creatable training artifact, so the seconds-wide corruption window
-        # is acceptable.
-        path.unlink(missing_ok=True)
-        save_safetensors(_extract_track_state(student, k), str(path))
+        merged = _extract_track_state(student, k)
+        if F == 1:
+            shards = {tid: merged}
+        else:
+            from parallm.model.merge import split_track_state
+
+            shards = split_track_state(
+                student._adapter, student.text_config, manifest.n_tracks,
+                merged, F, tid * F,
+            )
+        for sid, sd in shards.items():
+            path = out_dir / f"track_{sid}.safetensors"
+            # Unlink first: a best/ overwrite otherwise holds old+new (~108 GB at
+            # 27B) transiently, which busts the 191 GB home quota. The ckpt is a
+            # re-creatable training artifact, so the seconds-wide corruption window
+            # is acceptable.
+            path.unlink(missing_ok=True)
+            save_safetensors(sd, str(path))
     if rank == 0:
         # The saved manifest self-describes the trained schedule so eval picks
         # it up without --sync-indices.
@@ -170,6 +214,17 @@ def main() -> int:
                    help="Comma-separated boundary layers (default: every layer = the d1b schedule)")
     p.add_argument("--sync-phase", default="post-attn", choices=["post-attn"],
                    help="Only lever B is built — the program's schedule")
+    p.add_argument("--fuse-tracks", type=int, default=1,
+                   help="F rank-local tracks pool their partials at every non-sync "
+                        "sublayer, so a group computes as one F-wide track between "
+                        "syncs (an N/F-track model on N shards). Groups must sit whole "
+                        "on a rank: n_tracks/world_size must be a multiple of F. When "
+                        "F == tracks/rank the group is merged into one wide track "
+                        "instead (same function, ~2x faster).")
+    p.add_argument("--no-merge-fused", action="store_true",
+                   help="Sum F narrow tracks' deltas instead of merging their slabs "
+                        "into one wide track. Same function, ~2x slower — for A/B'ing "
+                        "the merge on real weights.")
     p.add_argument("--intra-window-mse", action="store_true",
                    help="Loss-only synced taps at non-boundary layers (the D>1 curriculum wants this)")
     # Recipe constants (the 9B-record defaults).
@@ -192,14 +247,9 @@ def main() -> int:
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lambda-block", type=float, default=1.0)
-    p.add_argument("--lambda-kl", type=float, default=1.0)
-    p.add_argument("--lambda-ce", type=float, default=0.5)
-    p.add_argument("--lambda-logit-mse", type=float, default=0.05)
-    p.add_argument("--kl-temperature", type=float, default=1.0)
+    p.add_argument("--lambda-ce", type=float, default=1.0)
     p.add_argument("--block-mse-clamp", type=float, default=10.0)
-    p.add_argument("--kl-ce-chunk-size", type=int, default=256)
-    p.add_argument("--student-forcing-prob", type=float, default=0.25)
-    p.add_argument("--student-forcing-warmup", type=int, default=0)
+    p.add_argument("--ce-chunk-size", type=int, default=256)
     p.add_argument("--train-embeddings", action="store_true",
                    help="Unfreeze embed_tokens (lm_head stays frozen — the replicated loss "
                         "requires an identical head on every rank)")
@@ -249,7 +299,23 @@ def main() -> int:
     torch.manual_seed(args.seed)
 
     manifest = load_manifest(args.checkpoint_dir)
-    layout = build_groups(n_tracks=manifest.n_tracks)
+    # When a fusion group is a rank's WHOLE track set, the group is arithmetically
+    # one F-wide track, so merge the slabs instead of summing F narrow tracks'
+    # deltas: same function, 1/F the kernels, one full-width residual stream
+    # instead of F (27B N=24: 6.4-7.7 -> ~3 s/step). --no-merge-fused forces the
+    # summing path, which is how the two are A/B'd on real weights.
+    F = args.fuse_tracks
+    tracks_per_rank = manifest.n_tracks // dist.get_world_size()
+    merge_group = 1
+    if F > 1 and F == tracks_per_rank and not args.no_merge_fused:
+        if args.sync_attention_heads:
+            raise SystemExit(
+                "--sync-attention-heads cannot be merged: it keeps each kv-group's "
+                "copies bit-identical across tracks, but merged they are one tensor. "
+                "Pass --no-merge-fused."
+            )
+        merge_group, F = F, 1
+    layout = build_groups(n_tracks=manifest.n_tracks // merge_group)
     teacher_dir = args.teacher_dir or args.checkpoint_dir
 
     cfg_hf = AutoConfig.from_pretrained(args.hf_model)
@@ -263,7 +329,10 @@ def main() -> int:
         sync_layers.append(num_layers - 1)  # the head needs the final post-MLP sync
 
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
-               f"boundaries={len(sync_layers)} phase={args.sync_phase}")
+               f"boundaries={len(sync_layers)} phase={args.sync_phase} "
+               f"fuse={args.fuse_tracks}"
+               + (f" (merged {merge_group}x -> {layout.n_tracks} wide tracks)"
+                  if merge_group > 1 else ""))
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
 
@@ -280,19 +349,19 @@ def main() -> int:
     eval_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
 
     student = _build_student(text_cfg, manifest, layout, args.checkpoint_dir,
-                             sync_layers, args.sync_phase)
+                             sync_layers, args.sync_phase, F, merge_group)
     student.use_checkpoint = not args.no_checkpoint
     student.train()
 
     if args.teacher_stream:
         teacher_model, streamer = _build_teacher_streamed(
-            text_cfg, manifest, layout, teacher_dir, sync_layers)
+            text_cfg, manifest, layout, teacher_dir, sync_layers, merge_group)
         teacher = freeze_slice_teacher(teacher_model)
         _log(rank, f"[init] teacher layers streamed from pinned host DRAM: "
                    f"{streamer.host_bytes / 2**30:.2f} GiB/rank off-device")
     else:
         teacher_model = _build_student(text_cfg, manifest, layout, teacher_dir,
-                                       sync_layers, "exact")
+                                       sync_layers, "exact", 1, merge_group)
         teacher = freeze_slice_teacher(teacher_model)
 
     # Freeze the dense-copy pieces; tie the teacher's to the student's frozen
@@ -406,14 +475,10 @@ def main() -> int:
     dcfg = DistillConfig(
         sync_layer_indices=tuple(sync_layers),
         lambda_block=args.lambda_block,
-        lambda_kl=args.lambda_kl,
         lambda_ce=args.lambda_ce,
-        lambda_logit_mse=args.lambda_logit_mse,
-        kl_temperature=args.kl_temperature,
-        normalize_block_mse=True,
         block_mse_clamp=args.block_mse_clamp,
         intra_window_mse=args.intra_window_mse,
-        kl_ce_chunk_size=args.kl_ce_chunk_size,
+        ce_chunk_size=args.ce_chunk_size,
     )
     out_dir = Path(args.out_dir)
     best_macro = float("-inf")
@@ -463,15 +528,10 @@ def main() -> int:
     while step < args.max_steps:
         batch = next(train_iter)
         batch = {k: v.to(torch.cuda.current_device()) for k, v in batch.items()}
-        sf_p = student_forcing_schedule(
-            step, args.student_forcing_prob, args.student_forcing_warmup
-        )
         cur_lr[0] = lr_at(step)  # the in-backward hooks read this as they fire
         gsq.zero_()
         losses = distill_step(
             student, teacher, lm_head, batch, dcfg,
-            student_forcing_prob=sf_p,
-            forcing_seed=(args.seed, step),
             loss_scale=1.0 / args.grad_accum_steps,
         )
         accum += 1
@@ -504,9 +564,9 @@ def main() -> int:
         if step % args.log_every == 0:
             dt = (time.perf_counter() - t0) / max(1, step + 1)
             _log(rank, f"step {step} total={losses['total'].item():.4f} "
-                       f"block={losses['block_mse'].item():.4f} kl={losses['kl'].item():.4f} "
-                       f"ce={losses['ce'].item():.4f} lmse={losses['logit_mse'].item():.4f} "
-                       f"sf={sf_p:.3f} gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
+                       f"block={losses['block_mse'].item():.4f} "
+                       f"ce={losses['ce'].item():.4f} "
+                       f"gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
                        f"{dt:.2f}s/step")
         if args.mem_report and step == 2:
             _log(rank, f"[mem] rank0 peak={torch.cuda.max_memory_allocated()/2**30:.2f}GiB "

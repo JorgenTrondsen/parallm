@@ -4,10 +4,10 @@ The training loop only measures student-only LM CE on a held-out batch. After
 distillation we want to know how closely the student *matches the teacher* on
 the same input — KL, top-k agreement, per-sync-boundary hidden MSE, and
 perplexity gap. This module provides one entry point, `fidelity_step`, that
-mirrors the call shape of `validate_step` but produces the full metric panel.
+produces the full metric panel.
 
 All work runs under `torch.no_grad()`. The chunked vocab pass mirrors
-`distill._kl_ce_chunked`'s memory-bounding pattern (no backward, so no
+`distill.ce_chunked`'s memory-bounding pattern (no backward, so no
 `retain_graph` bookkeeping).
 
 Aggregation contract: only the rank that owns track 0 (and therefore `lm_head`)
