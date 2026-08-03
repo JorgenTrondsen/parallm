@@ -121,7 +121,19 @@ class SyncBoundary(nn.Module):
         self,
         h_list: "list[torch.Tensor] | torch.Tensor",
         h_pre_block: torch.Tensor,
+        stacked: bool = False,
     ) -> torch.Tensor:
+        """``stacked`` says ``h_list`` is ONE ``[G, ...]`` tensor of G members'
+        states (the batched merged path), not a per-track list — so the local
+        reduce is a single ``sum(0)`` instead of G-1 full-residual adds. Explicit
+        rather than sniffed from the shape: a bare tensor otherwise still means
+        the legacy K=1 caller, and the two must not be confused."""
+        if stacked:
+            if self.n_tracks <= 1 and h_list.shape[0] == 1:
+                return h_list[0]
+            partial = (h_list - h_pre_block).sum(0)
+            return h_pre_block + self._all_reduce(partial)
+
         # Single-tensor shim: a leftover K=1 caller can pass a bare tensor.
         if isinstance(h_list, torch.Tensor):
             h_list = [h_list]
@@ -135,10 +147,12 @@ class SyncBoundary(nn.Module):
         for h in h_list[1:]:
             partial = partial + (h - h_pre_block)
 
-        if self.track_group is not None:
-            if partial.requires_grad:
-                partial = _AllReduceSum.apply(partial, self.track_group)
-            else:
-                dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.track_group)
+        return h_pre_block + self._all_reduce(partial)
 
-        return h_pre_block + partial
+    def _all_reduce(self, partial: torch.Tensor) -> torch.Tensor:
+        if self.track_group is None:
+            return partial
+        if partial.requires_grad:
+            return _AllReduceSum.apply(partial, self.track_group)
+        dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.track_group)
+        return partial

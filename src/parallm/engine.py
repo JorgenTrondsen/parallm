@@ -56,20 +56,41 @@ def _submodule(mod, dotted: str):
     return mod
 
 
-def _stacked(shadow, li: int, path: str) -> torch.Tensor:
-    """The N tracks' param at ``path`` stacked ``[N, ...]`` (cached). A
-    single-track grid gets a zero-copy view — the own-track provider must not
-    duplicate the rank's full weights."""
-    key = (li, path)
-    t = shadow._stacked.get(key)
-    if t is None:
-        mods = [_submodule(tr[li], path) for tr in shadow.grid]
-        t = mods[0].unsqueeze(0) if len(mods) == 1 else torch.stack(mods)
-        shadow._stacked[key] = t
-    return t
+class GridStacked:
+    """``stacked`` for providers whose storage is a ``grid[track][layer]``.
+
+    Split out from the providers so the batched forward can source its ``[N, ...]``
+    weights from something else — `parallm.model.batched.MergedShadow` serves them
+    as views of ONE merged parameter, which is how a merged track runs unfused.
+    """
+
+    def stacked(self, li: int, path: str) -> torch.Tensor:
+        """The N tracks' param at ``path`` stacked ``[N, ...]`` (cached). A
+        single-track grid gets a zero-copy view — the own-track provider must not
+        duplicate the rank's full weights."""
+        key = (li, path)
+        t = self._stacked.get(key)
+        if t is None:
+            mods = [_submodule(tr[li], path) for tr in self.grid]
+            t = mods[0].unsqueeze(0) if len(mods) == 1 else torch.stack(mods)
+            self._stacked[key] = t
+        return t
 
 
-class DenseShadow:
+def _norm_flat(norm, x: torch.Tensor, B: int, T: int) -> torch.Tensor:
+    """RMSNorm the residual and flatten it to ``blinear``'s input layout.
+
+    ``x [B, T, H]`` — every track reads the same synced residual (decode, and any
+    boundary sublayer) — flattens to ``[M, H]`` and ``blinear`` broadcasts it over
+    the N tracks. ``x [N, B, T, H]`` — each track carries its own residual (the
+    unfused own-carry walk) — flattens to ``[N, M, H]``. The norm weight is
+    track-synced in both cases, so one module applies to every member.
+    """
+    h = norm(x)
+    return h.reshape(-1, B * T, h.shape[-1]) if h.ndim == 4 else h.reshape(B * T, -1)
+
+
+class DenseShadow(GridStacked):
     """Materialized shadow modules, ``grid[track][layer]``. Exact copies can
     share the student's own modules (weights are read-only here); degraded
     copies come from ``model.replica.degrade_track_layers``."""
@@ -89,7 +110,7 @@ class DenseShadow:
                 per_track: bool = False) -> torch.Tensor:
         """All N tracks' Linear at ``rel``: ``[M, in]`` shared x (or ``[N, M,
         in]`` per-track x) → ``[N, M, out]``. matmul broadcasts the shared x."""
-        w = _stacked(self, li, f"{rel}.weight")
+        w = self.stacked(li, f"{rel}.weight")
         return torch.matmul(x, w.transpose(-2, -1))
 
 
@@ -523,7 +544,7 @@ def assemble_codes(packs: "list[dict]", track_nnz=None) -> "tuple[torch.Tensor, 
     return codes, codes.numel()
 
 
-class PackedShadow:
+class PackedShadow(GridStacked):
     """Shadow provider backed by a packed replica pool file: HF layer skeletons
     (meta-built, exact non-Linear params from the track shards) hold the small
     diverged params; every Linear is computed by ``blinear`` straight from the
@@ -697,28 +718,35 @@ def _hf():
 
 
 def _rms_tracks(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
-    """Per-track Qwen3.5 RMSNorm (zero-centered weight): ``x [N, ..., d]``,
-    ``w [N, d]``."""
+    """Per-track Qwen3.5 RMSNorm (zero-centered weight) on ``x [N, ..., d]``.
+
+    ``w`` is ``[N, d]`` when each of the N streams owns one copy, or ``[N, F, d]``
+    when a stream is a GROUP of F members that each kept their own — the middle
+    dims are right-aligned against x's, so the broadcast lands on the head axis
+    either way. The ``[N, d]`` form reproduces the previous view exactly.
+    """
     xf = x.float()
     out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    out = out * (1.0 + w.float()).view(w.shape[0], *([1] * (x.ndim - 2)), -1)
-    return out.type_as(x)
+    wv = (1.0 + w.float()).view(w.shape[0], *([1] * (x.ndim - w.ndim)), *w.shape[1:])
+    return (out * wv).type_as(x)
 
 
 def _batched_attn(shadow, li: int, x, position_embeddings, attention_mask, cache):
-    """All N tracks' full-attention mixers on the shared input ``x [B, T, h]``
-    → per-track deltas ``[N, B, T, h]``. Mirrors ``Qwen3_5Attention.forward``
-    with the track dim folded into batch."""
+    """All N tracks' full-attention mixers → per-track deltas ``[N, B, T, h]``.
+    Mirrors ``Qwen3_5Attention.forward`` with the track dim folded into batch.
+    ``x`` is the shared residual ``[B, T, h]`` or a per-track one ``[N, B, T, h]``
+    (see `_norm_flat`); everything downstream of the projections is per-track
+    either way, because attention never mixes heads."""
     m = _hf()
     layer0 = shadow.grid[0][li]
     attn = layer0.self_attn
-    N, (B, T, _) = shadow.n_tracks, x.shape
+    N, B, T = shadow.n_tracks, x.shape[-3], x.shape[-2]
     d = attn.head_dim
-    h2 = layer0.input_layernorm(x).reshape(B * T, -1)  # residual norms are track-synced
+    h2 = _norm_flat(layer0.input_layernorm, x, B, T)
     q, gate = shadow.blinear(li, "self_attn.q_proj", h2).view(N, B, T, -1, 2 * d).chunk(2, dim=-1)
-    q = _rms_tracks(q, _stacked(shadow, li, "self_attn.q_norm.weight"), attn.q_norm.eps)
+    q = _rms_tracks(q, shadow.stacked(li, "self_attn.q_norm.weight"), attn.q_norm.eps)
     k = shadow.blinear(li, "self_attn.k_proj", h2).view(N, B, T, -1, d)
-    k = _rms_tracks(k, _stacked(shadow, li, "self_attn.k_norm.weight"), attn.k_norm.eps)
+    k = _rms_tracks(k, shadow.stacked(li, "self_attn.k_norm.weight"), attn.k_norm.eps)
     v = shadow.blinear(li, "self_attn.v_proj", h2)
     q = q.reshape(N * B, T, -1, d).transpose(1, 2)
     k = k.reshape(N * B, T, -1, d).transpose(1, 2)
@@ -751,25 +779,26 @@ def _batched_attn(shadow, li: int, x, position_embeddings, attention_mask, cache
 
 
 def _batched_gdn(shadow, li: int, x, attention_mask, cache):
-    """All N tracks' gated-delta-net mixers on the shared input → per-track
-    deltas. Mirrors ``Qwen3_5GatedDeltaNet.forward``; tracks fold into the conv
-    CHANNEL dim (depthwise conv keys weights by channel, not batch) and into
-    the BATCH dim of the delta-rule kernels."""
+    """All N tracks' gated-delta-net mixers → per-track deltas. Mirrors
+    ``Qwen3_5GatedDeltaNet.forward``; tracks fold into the conv CHANNEL dim
+    (depthwise conv keys weights by channel, not batch) and into the BATCH dim of
+    the delta-rule kernels. ``x`` is shared ``[B, T, h]`` or per-track
+    ``[N, B, T, h]`` (see `_norm_flat`)."""
     m = _hf()
     layer0 = shadow.grid[0][li]
     gdn = layer0.linear_attn
-    N, (B, T, _) = shadow.n_tracks, x.shape
+    N, B, T = shadow.n_tracks, x.shape[-3], x.shape[-2]
     Hv, Hk = gdn.num_v_heads, gdn.num_k_heads
     dk, dv = gdn.head_k_dim, gdn.head_v_dim
     C, K = gdn.conv_dim, gdn.conv_kernel_size
     x = m.apply_mask_to_padding_states(x, attention_mask)
-    h2 = layer0.input_layernorm(x).reshape(B * T, -1)
+    h2 = _norm_flat(layer0.input_layernorm, x, B, T)
     qkv = shadow.blinear(li, "linear_attn.in_proj_qkv", h2)
     z = shadow.blinear(li, "linear_attn.in_proj_z", h2)
     b = shadow.blinear(li, "linear_attn.in_proj_b", h2)
     a = shadow.blinear(li, "linear_attn.in_proj_a", h2)
 
-    conv_w = _stacked(shadow, li, "linear_attn.conv1d.weight").reshape(N * C, K)
+    conv_w = shadow.stacked(li, "linear_attn.conv1d.weight").reshape(N * C, K)
     xc = qkv.view(N, B, T, C).permute(1, 0, 3, 2).reshape(B, N * C, T)
     state = cache.conv.get(li) if cache is not None else None
     logged = cache is not None and cache.log is not None
@@ -804,8 +833,8 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
     k = k.reshape(N * B, T, Hk, dk)
     v = v.reshape(N * B, T, Hv, dv)
     beta = b.view(N * B, T, Hv).sigmoid()
-    A_log = _stacked(shadow, li, "linear_attn.A_log")
-    dt_bias = _stacked(shadow, li, "linear_attn.dt_bias")
+    A_log = shadow.stacked(li, "linear_attn.A_log")
+    dt_bias = shadow.stacked(li, "linear_attn.dt_bias")
     g = -A_log.float().exp().view(N, 1, 1, Hv) * nn.functional.softplus(
         a.view(N, B, T, Hv).float() + dt_bias.view(N, 1, 1, Hv))
     g = g.reshape(N * B, T, Hv)
@@ -828,7 +857,7 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
         cache.update_rec(li, rec_out)
     # Gated RMSNorm (per-track weight, NOT zero-centered), norm before gate —
     # the torch reference math of Qwen3_5RMSNormGated.
-    normw = _stacked(shadow, li, "linear_attn.norm.weight")
+    normw = shadow.stacked(li, "linear_attn.norm.weight")
     cf = core.view(N, B, T, Hv, dv).float()
     cn = cf * torch.rsqrt(cf.pow(2).mean(-1, keepdim=True) + gdn.layer_norm_epsilon)
     cn = normw.view(N, 1, 1, 1, dv) * cn.to(core.dtype)
@@ -839,10 +868,11 @@ def _batched_gdn(shadow, li: int, x, attention_mask, cache):
 
 
 def _batched_mlp(shadow, li: int, x):
-    """All N tracks' MLPs on the shared input ``x`` → per-track deltas."""
+    """All N tracks' MLPs → per-track deltas. ``x`` is the shared residual
+    ``[B, T, h]`` or a per-track one ``[N, B, T, h]`` (see `_norm_flat`)."""
     layer0 = shadow.grid[0][li]
-    N, (B, T, _) = shadow.n_tracks, x.shape
-    h2 = layer0.post_attention_layernorm(x).reshape(B * T, -1)
+    N, B, T = shadow.n_tracks, x.shape[-3], x.shape[-2]
+    h2 = _norm_flat(layer0.post_attention_layernorm, x, B, T)
     g = shadow.blinear(li, "mlp.gate_proj", h2)
     u = shadow.blinear(li, "mlp.up_proj", h2)
     y = shadow.blinear(li, "mlp.down_proj", layer0.mlp.act_fn(g) * u, per_track=True)

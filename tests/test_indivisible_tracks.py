@@ -280,6 +280,65 @@ def test_merged_tracks_reproduce_dense_where_both_mechanisms_fire():
         assert drift < 1e-4, f"merge_group={fuse} drift {drift} exceeds tolerance"
 
 
+def test_batched_exec_on_the_replicating_indivisible_config():
+    """The batched fold where BOTH N=24 mechanisms fire — the production config.
+
+    `test_track_fusion_equivalence`'s batched rails run on `_nesting_config`, where
+    the GDN stays COMPACT and the MLP divides. The 27B at N=24 is the other regime:
+    16 k-heads over 24 tracks means one k-head copy per v-head, and 17408 zero-pads
+    to 768 per track. `MergedShadow._regroup_qkv` derives its `[Q|K|V]` segment
+    widths from the per-member config, so the two regimes give it different splits —
+    and the one this program actually runs was, until now, the untested one.
+
+    Both schedules, because they fail differently: `exact` checks the fold against
+    DENSE ground truth (a mis-split of the qkv slab shows up immediately), and the
+    sparse schedule checks it against the looped unfused walk, which is the only
+    place per-member own-carry exists at all.
+    """
+    cfg = _indivisible_config()
+    torch.manual_seed(0)
+    dense = Qwen3_5TextModel(cfg)
+    dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    dense.eval()
+    tracks, manifest = slice_model_to_tracks(
+        dense, n_tracks=N_TRACKS, sync_block_depth=1, text_config_attr="config"
+    )
+    states = {t: tracks[t] for t in range(N_TRACKS)}
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 16), generator=torch.manual_seed(123))
+    merged_states = merge_track_states(
+        get_adapter_for_config(cfg), cfg, N_TRACKS, states, N_TRACKS
+    )
+
+    def _batched(phase, sync_layers):
+        pt = PTWrappedModel(
+            text_config=cfg, n_tracks=1, local_track_ids=(0,),
+            sync_after_layers=sync_layers, track_group=None,
+            merge_group=N_TRACKS, exec_groups=N_TRACKS,
+        )
+        pt.set_sync_phase(phase)
+        pt.eval()
+        pt.load_track_state_dicts(merged_states, strict=True)
+        pt.lm_head.load_state_dict(dense.lm_head.state_dict())
+        with torch.no_grad():
+            return pt(input_ids=input_ids)[0]
+
+    with torch.no_grad():
+        dense_logits = dense.lm_head(
+            dense(input_ids=input_ids, use_cache=False).last_hidden_state)
+    drift = (dense_logits - _batched("exact", manifest.sync_layer_indices)).abs().max().item()
+    assert drift < 1e-4, f"batched exec at exact drifts from dense by {drift}"
+
+    sparse = [1, 3, cfg.num_hidden_layers - 1]
+    looped = _build_pt(cfg, tracks, sparse, phase="post-attn", fuse_size=1, dense=dense)
+    with torch.no_grad():
+        want = looped(input_ids=input_ids)[0]
+    got = _batched("post-attn", sparse)
+    drift = (want - got).abs().max().item()
+    assert drift < 1e-4, f"batched exec != looped unfused at a sparse schedule: {drift}"
+    # Non-vacuous: own-carry really is doing something at this schedule.
+    assert (want - dense_logits).abs().max().item() > 1e-3
+
+
 def test_merge_then_split_returns_the_original_shards():
     """A merged run saves by splitting back to N shards, so eval/serve never see the
     merged form. That only holds if `split(merge(x)) == x` for every key — including

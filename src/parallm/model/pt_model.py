@@ -51,6 +51,7 @@ class PTWrappedModel(nn.Module):
         track_group: "torch.distributed.ProcessGroup | None" = None,
         fuse_size: int = 1,
         merge_group: int = 1,
+        exec_groups: int = 1,
     ):
         super().__init__()
         # Late import: parallm.adapters imports its registered adapters,
@@ -117,6 +118,29 @@ class PTWrappedModel(nn.Module):
 
         if merge_group > 1:
             self._widen_diverged_norms(merge_group)
+
+        # `exec_groups` G: run the merged track as G INDEPENDENT streams of width
+        # merge_group/G instead of one wide track. The merged slabs are what perform
+        # fusion (the contracting projections reduce over the member dim), so
+        # G = merge_group recovers the fully unfused model at close to merged step
+        # time, G = 1 is the merged track itself, and an intermediate G is
+        # `fuse_size` with the same speed. See `parallm.model.batched`.
+        if merge_group % exec_groups:
+            raise ValueError(
+                f"exec_groups {exec_groups} must divide merge_group {merge_group} — "
+                f"each of the G streams is one whole run of merge_group/G members."
+            )
+        self.exec_groups = exec_groups
+        self.shadow = None
+        if exec_groups > 1:
+            # Late import: `parallm.model.batched` pulls in `parallm.engine`, which
+            # imports this module at top level.
+            from parallm.model.batched import MergedShadow
+
+            self.shadow = MergedShadow(
+                self.text_models[0], adapter, text_config, exec_groups,
+                group_width=merge_group // exec_groups,
+            )
 
         # lm_head lives on the owner track only. The final SyncBoundary
         # broadcasts the post-block hidden state to all tracks, so whichever
@@ -271,10 +295,12 @@ class PTWrappedModel(nn.Module):
                 capture_post_mlp=capture_post_mlp,
             )
         else:
-            if self.sync_module.fuse_size > 1:
+            if self.sync_module.fuse_size > 1 or self.exec_groups > 1:
                 # Silently ignoring the flag here would report a fused number for
                 # an unfused run; nothing trains on post-mlp, so just refuse.
-                raise ValueError("fuse_size > 1 is implemented for post-attn/exact only")
+                raise ValueError(
+                    "fuse_size/exec_groups > 1 are implemented for post-attn/exact only"
+                )
             block_start = h
             per_track_h = [h for _ in self.text_models]
             for layer_idx in range(len(tm0.layers)):
@@ -360,6 +386,12 @@ class PTWrappedModel(nn.Module):
             tap_attn = tap_mlp = ()
         else:
             tap_attn, tap_mlp = capture_post_attn or (), capture_post_mlp or ()
+        if self.exec_groups > 1:
+            return self._run_batched_stack(
+                h, position_embeddings, text_position_ids, causal_mask,
+                linear_attn_mask, L, last, sync_attn_set, sync_hiddens,
+                tap_attn, tap_mlp, exact,
+            )
         run_mixer, run_mlp = checkpointed_halves(
             self.use_checkpoint and torch.is_grad_enabled(),
             position_embeddings,
@@ -420,6 +452,67 @@ class PTWrappedModel(nn.Module):
                         sync_hiddens[i] = h
                 else:
                     per_track_h = new_h
+            if self.layer_stream is not None:
+                self.layer_stream.release(i)
+        return h
+
+    def _run_batched_stack(
+        self, h, position_embeddings, text_position_ids, causal_mask,
+        linear_attn_mask, L, last, sync_attn_set, sync_hiddens,
+        tap_attn, tap_mlp, exact,
+    ) -> torch.Tensor:
+        """`_run_post_attn_stack` for a merged track run as G members.
+
+        Same schedule, same boundary semantics — the G members' states live in one
+        ``[G, B, T, H]`` tensor instead of a per-track list, so the rank-local
+        reduce is a ``sum(0)`` and `SyncBoundary.fuse`/`leaders` have nothing to
+        do (group width already expresses fusion). A shared ``[B, T, H]`` residual
+        straight out of a sync broadcasts into the members on the next add, which
+        is exactly "every member restarts the window from the synced state".
+        """
+        from parallm.model.batched import batched_halves
+
+        run_mixer, run_mlp = batched_halves(
+            self.shadow,
+            self.use_checkpoint and torch.is_grad_enabled(),
+            position_embeddings,
+            text_position_ids,
+        )
+        block_start = h
+        carry = h
+        for i in range(L):
+            layer_mask = (
+                linear_attn_mask
+                if self.text_models[0].config.layer_types[i] == "linear_attention"
+                else causal_mask
+            )
+            if self.layer_stream is not None:
+                self.layer_stream.acquire(i)
+            h_attn = run_mixer(i, carry, layer_mask)
+            if i in sync_attn_set:
+                R = self.sync_module(h_attn, block_start, stacked=True)
+                if i in tap_attn:
+                    sync_hiddens[i] = R
+                block_start = R
+                new_h = run_mlp(i, R)
+                if exact:
+                    Hm = self.sync_module(new_h, R, stacked=True)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = Hm
+                    if i == last:
+                        h = Hm
+                    block_start = Hm
+                    carry = Hm
+                else:
+                    carry = new_h
+            else:
+                new_h = run_mlp(i, h_attn)
+                if i == last:
+                    h = self.sync_module(new_h, block_start, stacked=True)
+                    if i in tap_mlp:
+                        sync_hiddens[i] = h
+                else:
+                    carry = new_h
             if self.layer_stream is not None:
                 self.layer_stream.release(i)
         return h

@@ -33,6 +33,7 @@ torch.set_default_dtype(torch.float32)
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
+from parallm.engine import _submodule
 from parallm.model.pt_model import PTWrappedModel
 from parallm.slicer.convert import slice_model_to_tracks
 from parallm.train.distill import (
@@ -74,7 +75,8 @@ def _tiny_config(n_layers: int = 8):
     )
 
 
-def _build(n_tracks: int, sync_after=None, n_layers: int = 8, fuse_size: int = 1):
+def _build(n_tracks: int, sync_after=None, n_layers: int = 8, fuse_size: int = 1,
+           merge_group: int = 1, exec_groups: int = 1):
     cfg = _tiny_config(n_layers)
     torch.manual_seed(42)
     dense = Qwen3_5TextModel(cfg)
@@ -83,9 +85,18 @@ def _build(n_tracks: int, sync_after=None, n_layers: int = 8, fuse_size: int = 1
     nn.init.normal_(dense.lm_head.weight, mean=0.0, std=0.02)
     dense.eval()
 
+    n_shards = n_tracks * merge_group
     tracks, manifest = slice_model_to_tracks(
-        dense, n_tracks=n_tracks, sync_block_depth=4, text_config_attr="config"
+        dense, n_tracks=n_shards, sync_block_depth=4, text_config_attr="config"
     )
+    states = dict(enumerate(tracks))
+    if merge_group > 1:
+        from parallm.adapters import get_adapter_for_config
+        from parallm.model.merge import merge_track_states
+
+        states = merge_track_states(
+            get_adapter_for_config(cfg), cfg, n_shards, states, merge_group
+        )
     pt = PTWrappedModel(
         text_config=cfg,
         n_tracks=n_tracks,
@@ -93,9 +104,11 @@ def _build(n_tracks: int, sync_after=None, n_layers: int = 8, fuse_size: int = 1
         sync_after_layers=list(sync_after) if sync_after is not None else manifest.sync_layer_indices,
         track_group=None,
         fuse_size=fuse_size,
+        merge_group=merge_group,
+        exec_groups=exec_groups,
     )
     pt.eval()
-    pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    pt.load_track_state_dicts(states, strict=False)
     return cfg, dense, tracks, pt
 
 
@@ -197,6 +210,73 @@ def test_distill_step_grads_flow_n4():
     assert all(not p_.requires_grad for p_ in teacher.parameters())
 
 
+def test_distill_step_batched_merged_matches_looped_unfused():
+    """The TF block loop must mirror `pt_model._run_post_attn_stack` sublayer for
+    sublayer, or the block targets are measured against a different model than the
+    one the free-running forward trains. The two walks share `mix`/`mlp`/`sync`
+    adapters precisely so they cannot drift; this pins that they haven't.
+
+    Checkpointing is ON so the batched path is exercised through recompute, which
+    is where the two representations could disagree on saved-tensor order.
+    """
+    sched = [1, 3, 5, 7]
+    cfg, _dense, tracks, looped = _build(n_tracks=4, sync_after=sched)
+    _cfg2, _d2, _t2, merged = _build(n_tracks=1, sync_after=sched,
+                                     merge_group=4, exec_groups=4)
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
+        sync_after_layers=list(range(8)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)  # exact schedule: layout-independent
+
+    dcfg = DistillConfig(sync_layer_indices=tuple(sched))
+    batch = _batch(cfg)
+    out = []
+    for pt in (looped, merged):
+        pt.set_sync_phase("post-attn")
+        pt.use_checkpoint = True
+        pt.train()
+        out.append(distill_step(pt, teacher, pt.lm_head, batch, dcfg))
+    lo, me = out
+
+    assert abs(lo["block_mse"].item() - me["block_mse"].item()) < 1e-5, (
+        f"block_mse {lo['block_mse'].item()} vs {me['block_mse'].item()}")
+    assert abs(lo["ce"].item() - me["ce"].item()) < 1e-4, (
+        f"ce {lo['ce'].item()} vs {me['ce'].item()}")
+    assert lo["layer_relmse"].keys() == me["layer_relmse"].keys()
+    for i, r in lo["layer_relmse"].items():
+        assert abs(r - me["layer_relmse"][i]) < 1e-5, f"tap {i}: {r} vs {me['layer_relmse'][i]}"
+    # Non-vacuous: the taps carry real error, not ~0 from a degenerate walk.
+    assert max(lo["layer_relmse"].values()) > 1e-6
+
+    got = sum(1 for p_ in merged.text_models[0].layers.parameters()
+              if p_.grad is not None and p_.grad.abs().sum() > 0)
+    assert got > 0, "no gradient reached the merged weights"
+
+
+def test_merged_shadow_tracks_live_parameters():
+    """`MergedShadow.stacked` must read through to the parameter every call.
+
+    Caching it looks free — `DenseShadow` does exactly that — but this provider's
+    weights are being TRAINED, and `_regroup_qkv` returns a `cat`, i.e. a copy.
+    A cached copy would pin the GDN qkv and conv weights at their step-0 values
+    while the optimizer moved the real ones, and nothing in the loss would say so.
+    Checked on the GDN params specifically, because they are the only ones whose
+    unmerge is not a view.
+    """
+    _cfg, _dense, _tracks, merged = _build(n_tracks=1, sync_after=[1, 3, 5, 7],
+                                           merge_group=4, exec_groups=4)
+    for path in ("linear_attn.in_proj_qkv.weight", "linear_attn.conv1d.weight",
+                 "mlp.down_proj.weight", "self_attn.q_norm.weight"):
+        li = 0 if "linear_attn" in path else 3  # layer 3 is the full-attention one
+        before = merged.shadow.stacked(li, path).clone()
+        with torch.no_grad():
+            _submodule(merged.text_models[0].layers[li], path).add_(1.0)
+        after = merged.shadow.stacked(li, path)
+        assert torch.allclose(after, before + 1.0), f"{path} is stale — stacked() cached"
+
+
 def test_distill_step_fixed_d2_schedule_n4():
     """The fixed-D=2 re-heal: student BUILT at the gapped schedule (own-carry at
     layers 0,2,4,6), checkpointing on. Grads must reach every track through both
@@ -213,7 +293,7 @@ def test_distill_step_fixed_d2_schedule_n4():
     teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
     teacher = freeze_slice_teacher(teacher_pt)
 
-    dcfg = DistillConfig(sync_layer_indices=tuple(sched), block_mse_clamp=None)
+    dcfg = DistillConfig(sync_layer_indices=tuple(sched))
     batch = _batch(cfg)
     losses = distill_step(pt, teacher, pt.lm_head, batch, dcfg)
     assert torch.isfinite(losses["total"])

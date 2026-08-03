@@ -43,7 +43,6 @@ def block_mse(
     attention_mask: torch.Tensor | None = None,
     normalize: bool = False,
     eps: float = 1e-6,
-    clamp_max: float | None = None,
 ) -> torch.Tensor:
     """MSE between (B, T, H) student and teacher hidden states, over non-pad positions.
 
@@ -55,13 +54,14 @@ def block_mse(
     each block's loss is O(1) regardless of its activation magnitude and every depth
     contributes comparably. The trailing hidden-dim elements cancel in the ratio.
 
-    ``clamp_max`` (normalized path only): cap the returned relative-MSE at this value.
-    Under student forcing a block can be fed the student's own drifted hidden, which
-    occasionally makes the ratio blow up (e.g. 100+) on a single batch — a spike that
-    inflates the gradient and trips the global grad-norm clip, throttling every param.
-    Clamping saturates the gradient above the cap (outlier rejection): normal per-block
-    ratios (~0.5–1.5) are untouched, only the spikes are capped. Ignored when
-    ``normalize=False``.
+    There is deliberately NO clamp here. A ``clamp_max`` existed to cap spikes caused
+    by student forcing feeding a block its own drifted hidden; sf was removed from the
+    trainer, and the cap then did active harm. At D=2 the first boundary's ratio starts
+    at 15.9 against a cap of 10, so it sat pinned at exactly the cap while being ~93%
+    of the block loss — and ``clamp`` passes ZERO gradient above its max, leaving the
+    dominant term untrainable until unrelated CE drift happened to carry it under 10.
+    That was the multi-hundred-step "ledge". Removing the cap took macro 0.592 -> 0.638
+    at 500 steps and made the first boundary train from step 0 (15.9 -> 0.23).
     """
     if student_hidden.shape != teacher_hidden.shape:
         raise ValueError(
@@ -71,7 +71,4 @@ def block_mse(
     if not normalize:
         return _masked_mean(diff, attention_mask)
     denom = _masked_sum(teacher_hidden.float().pow(2), attention_mask).clamp(min=eps)
-    ratio = _masked_sum(diff, attention_mask) / denom
-    if clamp_max is not None:
-        ratio = ratio.clamp(max=clamp_max)
-    return ratio
+    return _masked_sum(diff, attention_mask) / denom

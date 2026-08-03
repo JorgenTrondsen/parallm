@@ -599,17 +599,24 @@ class KVReplicatedColwise:
         return tuple(out)
 
     def replication_groups(self, n_tracks: int, force_sync: bool = False) -> list[list[int]]:
+        if not (self.sync or force_sync):
+            # Diverge: every track's KV head trains independently, so the answer is
+            # singletons and the kv-group factor is never formed. Divisibility is
+            # deliberately NOT required here — under merged tracks this is called
+            # with the LOGICAL track count (24 shards / F per rank), which need not
+            # be a multiple of num_kv_heads: F=2 at N=24 gives 6 logical tracks
+            # against 4 kv heads. Slicing still happens at the shard count, where
+            # divisibility does hold.
+            return [[t] for t in range(n_tracks)]
+        # Keep each kv-group's copies bit-identical (dense GQA). Only this branch
+        # partitions BY kv-group, so only this branch needs the factor to exist.
         if n_tracks % self.num_kv_heads != 0:
             raise ValueError(
                 f"KVReplicatedColwise.replication_groups: n_tracks {n_tracks} "
                 f"must be a multiple of num_kv_heads {self.num_kv_heads}"
             )
         tpg = n_tracks // self.num_kv_heads
-        if self.sync or force_sync:
-            # Keep each kv-group's copies bit-identical (dense GQA).
-            return [[g * tpg + i for i in range(tpg)] for g in range(self.num_kv_heads)]
-        # Diverge: every track's KV head trains independently.
-        return [[t] for t in range(n_tracks)]
+        return [[g * tpg + i for i in range(tpg)] for g in range(self.num_kv_heads)]
 
     def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
         # The merged track gets one kv-head per q-head (num_key_value_heads = F,

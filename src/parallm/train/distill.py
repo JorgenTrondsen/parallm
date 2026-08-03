@@ -62,9 +62,8 @@ class DistillConfig:
     """
 
     sync_layer_indices: tuple[int, ...] = field(default_factory=tuple)
-    lambda_block: float = 1.0
+    lambda_block: float = 4.0
     lambda_ce: float = 1.0
-    block_mse_clamp: float | None = 10.0
     intra_window_mse: bool = False
     ce_chunk_size: int = 256
 
@@ -243,17 +242,14 @@ def distill_step(
     position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
 
     def tap_loss(h_synced: torch.Tensor, t_target: torch.Tensor) -> torch.Tensor:
-        r = block_mse(
+        return block_mse(
             h_synced, t_target, attention_mask=attention_mask,
             normalize=True,  # always: the un-normalized form has no caller
-            clamp_max=cfg.block_mse_clamp,
         )
-        return r
 
     # ----- Teacher-forced post-attn block loop (per-segment backward) -----
     block_loss_val = torch.zeros((), device=device)
     layer_relmse: dict[int, float] = {}
-    block_input = [inputs_embeds.detach() for _ in student.text_models]
     block_start = inputs_embeds.detach()
     seg_loss = torch.zeros((), device=device)
     seg_count = 0
@@ -271,11 +267,38 @@ def distill_step(
     # ponytail: gapless <=> D=1; a stray missing boundary => one length-2 segment,
     # still memory-safe uncheckpointed.
     gapless = len(sync_attn_set) >= L - 1
-    run_mixer, run_mlp = checkpointed_halves(
-        student.use_checkpoint and torch.is_grad_enabled() and not gapless,
-        position_embeddings,
-        text_position_ids,
-    )
+    use_ckpt = student.use_checkpoint and torch.is_grad_enabled() and not gapless
+
+    # Sublayer/sync/share adapters, so ONE loop body serves both track
+    # representations — this walk and `pt_model._run_post_attn_stack` must agree
+    # sublayer for sublayer or the block targets are measured against a different
+    # model, and two hand-mirrored loops is how that drifts. `mix`/`mlp` take the
+    # per-sublayer INPUT as both the operand and the fuse pre-state, which every
+    # call site here and in the model already satisfies.
+    K = len(student.text_models)
+    if student.exec_groups > 1:
+        # Merged track run as G members: states are one [G, B, T, H] tensor, and
+        # a shared [B, T, H] straight out of a sync broadcasts into the members.
+        from parallm.model.batched import batched_halves
+
+        mix, mlp = batched_halves(
+            student.shadow, use_ckpt, position_embeddings, text_position_ids)
+        def sync(xs, pre): return student.sync_module(xs, pre, stacked=True)
+        def share(t): return t
+    else:
+        run_mixer, run_mlp = checkpointed_halves(
+            use_ckpt, position_embeddings, text_position_ids)
+        def mix(i, xs, mask):
+            return student.sync_module.fuse(
+                [run_mixer(tm.layers[i], xs[k], mask)
+                 for k, tm in enumerate(student.text_models)], xs)
+        def mlp(i, xs):
+            return student.sync_module.fuse(
+                [run_mlp(student.text_models[k].layers[i], xs[k]) for k in range(K)], xs)
+        def sync(xs, pre): return student.sync_module(student.sync_module.leaders(xs), pre)
+        def share(t): return [t] * K
+
+    block_input = share(inputs_embeds.detach())
 
     for i in range(L):
         layer_mask = (
@@ -283,31 +306,16 @@ def distill_step(
             if tm0.config.layer_types[i] == "linear_attention"
             else causal_mask
         )
-        # Fuse/leaders mirror `pt_model._run_post_attn_stack` exactly — if the TF
-        # walk and the free-running forward disagree here the block targets are
-        # measured against a different model. No-ops at fuse_size=1.
-        h_attn = student.sync_module.fuse(
-            [run_mixer(tm.layers[i], block_input[k], layer_mask)
-             for k, tm in enumerate(student.text_models)],
-            block_input,
-        )
+        h_attn = mix(i, block_input, layer_mask)
         is_boundary = i in sync_attn_set
         supervise = is_boundary or i == last or cfg.intra_window_mse
         if is_boundary:
-            h_synced = student.sync_module(  # post-attn, carried
-                student.sync_module.leaders(h_attn), block_start)
+            h_synced = sync(h_attn, block_start)  # post-attn, carried
         else:
-            new_h = student.sync_module.fuse(
-                [run_mlp(student.text_models[k].layers[i], h_attn[k])
-                 for k in range(len(student.text_models))],
-                h_attn,
-            )
+            new_h = mlp(i, h_attn)
             # Final layer: post-MLP carried sync. Non-boundary: loss-only tap
             # (synced reconstruction; the forward keeps carrying the partial).
-            h_synced = (
-                student.sync_module(student.sync_module.leaders(new_h), block_start)
-                if supervise else None
-            )
+            h_synced = sync(new_h, block_start) if supervise else None
         if supervise:
             t_l = t_caps.pop(i).detach()
             r = tap_loss(h_synced, t_l)
@@ -320,10 +328,7 @@ def distill_step(
             seg_loss = torch.zeros((), device=device)
             seg_count = 0
             block_start = t_l  # teacher-forced carry (see the sf note above)
-            block_input = student.sync_module.fuse(
-                [run_mlp(tm.layers[i], t_l) for tm in student.text_models],
-                [t_l] * len(student.text_models),
-            )
+            block_input = mlp(i, share(t_l))
         elif i == last:
             _flush(seg_loss, seg_count)
         else:

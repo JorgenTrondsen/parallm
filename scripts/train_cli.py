@@ -23,6 +23,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -81,7 +82,7 @@ def _load_states(text_cfg, layout, ckpt_dir: str, merge_group: int):
 
 
 def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_phase: str,
-                   fuse_size: int = 1, merge_group: int = 1):
+                   fuse_size: int = 1, merge_group: int = 1, exec_groups: int = 1):
     model = PTWrappedModel(
         text_config=text_cfg,
         n_tracks=layout.n_tracks,
@@ -90,6 +91,7 @@ def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_
         track_group=layout.track_group,
         fuse_size=fuse_size,
         merge_group=merge_group,
+        exec_groups=exec_groups,
     )
     states = _load_states(text_cfg, layout, ckpt_dir, merge_group)
     model.load_track_state_dicts(states, strict=True)
@@ -218,13 +220,15 @@ def main() -> int:
                    help="F rank-local tracks pool their partials at every non-sync "
                         "sublayer, so a group computes as one F-wide track between "
                         "syncs (an N/F-track model on N shards). Groups must sit whole "
-                        "on a rank: n_tracks/world_size must be a multiple of F. When "
-                        "F == tracks/rank the group is merged into one wide track "
-                        "instead (same function, ~2x faster).")
+                        "on a rank: n_tracks/world_size must be a multiple of F. This "
+                        "is a SEMANTIC knob only — the rank's tracks are merged into "
+                        "one wide track for speed regardless, and F picks how many "
+                        "INDEPENDENT streams that track runs as (tracks/rank / F). "
+                        "F > 1 needs one q head and one kv head per member.")
     p.add_argument("--no-merge-fused", action="store_true",
-                   help="Sum F narrow tracks' deltas instead of merging their slabs "
-                        "into one wide track. Same function, ~2x slower — for A/B'ing "
-                        "the merge on real weights.")
+                   help="Run the rank's tracks as separate narrow modules instead of "
+                        "merging their slabs into one wide track. Same function, ~2x "
+                        "slower — for A/B'ing the merge on real weights.")
     p.add_argument("--intra-window-mse", action="store_true",
                    help="Loss-only synced taps at non-boundary layers (the D>1 curriculum wants this)")
     # Recipe constants (the 9B-record defaults).
@@ -232,7 +236,7 @@ def main() -> int:
     p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=1)
-    p.add_argument("--lr", type=float, default=3e-5)
+    p.add_argument("--lr", type=float, default=6e-5)
     p.add_argument("--optim", choices=["adamw", "adafactor"], default="adamw",
                    help="adamw = fused bf16 default (27B/N=8, ~4 B/param state); adafactor "
                         "(factored 2nd moment, no 1st moment) ≈ 0 optimizer state (~0.5 GB/rank "
@@ -246,9 +250,8 @@ def main() -> int:
     p.add_argument("--warmup-steps", type=int, default=100)
     p.add_argument("--lr-min-ratio", type=float, default=0.1)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
-    p.add_argument("--lambda-block", type=float, default=1.0)
+    p.add_argument("--lambda-block", type=float, default=4.0)
     p.add_argument("--lambda-ce", type=float, default=1.0)
-    p.add_argument("--block-mse-clamp", type=float, default=10.0)
     p.add_argument("--ce-chunk-size", type=int, default=256)
     p.add_argument("--train-embeddings", action="store_true",
                    help="Unfreeze embed_tokens (lm_head stays frozen — the replicated loss "
@@ -290,6 +293,11 @@ def main() -> int:
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mem-report", action="store_true")
+    p.add_argument("--ledge-probe", action="store_true",
+                   help="Diagnostics for the block-loss crossing: per-tap relMSE "
+                        "([taps]) and distance from the warm start ([dist]). The "
+                        "latter snapshots theta_0 (~+7GB/rank at 27B/N=24), hence "
+                        "opt-in. Emitted on --log-every steps only.")
     args = p.parse_args()
 
     dist.init_process_group(backend="nccl")
@@ -299,22 +307,33 @@ def main() -> int:
     torch.manual_seed(args.seed)
 
     manifest = load_manifest(args.checkpoint_dir)
-    # When a fusion group is a rank's WHOLE track set, the group is arithmetically
-    # one F-wide track, so merge the slabs instead of summing F narrow tracks'
-    # deltas: same function, 1/F the kernels, one full-width residual stream
-    # instead of F (27B N=24: 6.4-7.7 -> ~3 s/step). --no-merge-fused forces the
-    # summing path, which is how the two are A/B'd on real weights.
+    # Merge the rank's WHOLE track set into one wide track (concatenated slabs)
+    # whenever it holds more than one: 1/K the kernels and one full-width residual
+    # stream instead of K (27B N=24: 6.4-7.7 -> ~3 s/step). `exec_groups` then says
+    # how to RUN it — G=1 as one wide track (which sums the members' deltas, i.e.
+    # fusion), G=K as K independent members (unfused, `parallm.model.batched`). The
+    # step-time win is the merged STORAGE and belongs to both. --no-merge-fused
+    # forces the looped path, which is how they are A/B'd on real weights.
+    #
+    # Merging is forward-equivalent but NOT optimizer-equivalent, and always was:
+    # the K members share one nn.Parameter, so (a) adafactor keeps one factored
+    # second moment for all of them, and (b) a Replicated(sync=True) weight — the
+    # residual norms — has ONE copy per rank instead of K, so its replication group
+    # is K times smaller and `sync_replicated_grads` divides by K less. Both are
+    # per-parameter rescalings that adafactor/Adam largely absorb, and both already
+    # applied to every merged run; they are why the looped path is the equivalence
+    # reference and not a step-for-step trajectory reference.
     F = args.fuse_tracks
     tracks_per_rank = manifest.n_tracks // dist.get_world_size()
-    merge_group = 1
-    if F > 1 and F == tracks_per_rank and not args.no_merge_fused:
+    merge_group = exec_groups = 1
+    if tracks_per_rank > 1 and tracks_per_rank % F == 0 and not args.no_merge_fused:
         if args.sync_attention_heads:
             raise SystemExit(
                 "--sync-attention-heads cannot be merged: it keeps each kv-group's "
                 "copies bit-identical across tracks, but merged they are one tensor. "
                 "Pass --no-merge-fused."
             )
-        merge_group, F = F, 1
+        merge_group, exec_groups, F = tracks_per_rank, tracks_per_rank // F, 1
     layout = build_groups(n_tracks=manifest.n_tracks // merge_group)
     teacher_dir = args.teacher_dir or args.checkpoint_dir
 
@@ -331,7 +350,9 @@ def main() -> int:
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
                f"fuse={args.fuse_tracks}"
-               + (f" (merged {merge_group}x -> {layout.n_tracks} wide tracks)"
+               + (f" (merged {merge_group}x, run as "
+                  + ("1 wide track" if exec_groups == 1
+                     else f"{exec_groups} streams x {merge_group // exec_groups}") + ")"
                   if merge_group > 1 else ""))
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
@@ -349,7 +370,7 @@ def main() -> int:
     eval_tasks = [t.strip() for t in args.eval_tasks.split(",") if t.strip()]
 
     student = _build_student(text_cfg, manifest, layout, args.checkpoint_dir,
-                             sync_layers, args.sync_phase, F, merge_group)
+                             sync_layers, args.sync_phase, F, merge_group, exec_groups)
     student.use_checkpoint = not args.no_checkpoint
     student.train()
 
@@ -405,6 +426,38 @@ def main() -> int:
     trainable = [p_ for p_ in student.parameters() if p_.requires_grad]
     n_train = sum(p_.numel() for p_ in trainable)
     _log(rank, f"[init] trainable params/rank ≈ {n_train/1e9:.2f}B; replication groups={len(plan)}")
+
+    # --ledge-probe: distance from the warm start. The block loss sits at exactly
+    # its warm-start value for hundreds of steps and then falls 6x in ~40, only
+    # inside an LR window (2e-5 crosses at ~340, 3e-5 at ~700, >=4e-5 never) and
+    # only with CE active. If the trigger is how far CE has transported the model
+    # rather than LR itself, two LRs should cross at the SAME ||theta - theta_0||.
+    # Grouped by parameter name with the layer index stripped, so the report says
+    # attn vs MLP vs the per-track q_norm/k_norm rather than naming 64 layers.
+    theta0: dict[str, torch.Tensor] = {}
+    if args.ledge_probe:
+        theta0 = {n_: p_.detach().clone()
+                  for n_, p_ in student.named_parameters() if p_.requires_grad}
+        _log(rank, f"[dist] theta_0 snapshot held: "
+                   f"{sum(t.numel()*t.element_size() for t in theta0.values())/2**30:.2f}GiB/rank")
+
+    def _dist_report() -> str:
+        """Total and per-group L2 drift from theta_0 (rank-local shard)."""
+        groups: dict[str, float] = {}
+        total = 0.0
+        for n_, p_ in student.named_parameters():
+            t0_ = theta0.get(n_)
+            if t0_ is None:
+                continue
+            # One param at a time: the fp32 temporary is a single tensor, not a
+            # second copy of the whole shard.
+            d2 = float((p_.detach() - t0_).float().pow_(2).sum())
+            total += d2
+            key = re.sub(r"\.\d+\.", ".*.", n_).rsplit(".", 1)[0]
+            groups[key] = groups.get(key, 0.0) + d2
+        top = sorted(groups.items(), key=lambda kv: -kv[1])[:5]
+        return (f"total={total**0.5:.4f} "
+                + " ".join(f"{k}={v**0.5:.4f}" for k, v in top))
     # fused: single-kernel step, no _foreach transients — the multi-tensor path
     # materializes a full extra copy of the second-moment states (~5.7 GB at
     # 27B/N=8), which is exactly the 40 GB card's missing headroom.
@@ -476,7 +529,6 @@ def main() -> int:
         sync_layer_indices=tuple(sync_layers),
         lambda_block=args.lambda_block,
         lambda_ce=args.lambda_ce,
-        block_mse_clamp=args.block_mse_clamp,
         intra_window_mse=args.intra_window_mse,
         ce_chunk_size=args.ce_chunk_size,
     )
@@ -568,6 +620,15 @@ def main() -> int:
                        f"ce={losses['ce'].item():.4f} "
                        f"gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
                        f"{dt:.2f}s/step")
+            if args.ledge_probe:
+                # Per-tap relMSE is already computed and returned by distill_step;
+                # gnorm is a rank-local non-deduplicated sum under
+                # --optim-in-backward, so THIS is the trustworthy crossing signal.
+                taps = losses.get("layer_relmse") or {}
+                if taps:
+                    _log(rank, f"[taps] step {step} "
+                               + " ".join(f"{i}:{v:.4f}" for i, v in sorted(taps.items())))
+                _log(rank, f"[dist] step {step} {_dist_report()}")
         if args.mem_report and step == 2:
             _log(rank, f"[mem] rank0 peak={torch.cuda.max_memory_allocated()/2**30:.2f}GiB "
                        f"resident={torch.cuda.memory_allocated()/2**30:.2f}GiB")

@@ -18,6 +18,7 @@ torch.set_default_dtype(torch.float32)
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
 
+from parallm.slicer.base import KVReplicatedColwise
 from parallm.slicer.convert import slice_model_to_tracks
 
 
@@ -114,3 +115,24 @@ def test_per_track_full_attention_shapes_at_n8(kv_model):
     assert tracks[3]["layers.3.self_attn.k_proj.weight"].shape == (8, 64)
     # o_proj dense: (64, 8*8) = (64, 64). Rowwise N=8: (64, 8).
     assert tracks[0]["layers.3.self_attn.o_proj.weight"].shape == (64, 8)
+
+
+def test_diverged_kv_replication_groups_do_not_require_divisibility():
+    """`sync=False` must give singletons for ANY track count.
+
+    Under merged tracks the replication plan is built over the LOGICAL track count
+    (shards / F per rank), which need not be a multiple of num_kv_heads: 27B at
+    N=24 with F=2 on 6 ranks gives 6 logical tracks against 4 kv heads. The
+    divisibility guard used to run before the sync branch and killed that run at
+    startup — but the factor it protects is only ever formed when the copies are
+    kept bit-identical. Diverged copies (the DEFAULT) share nothing, so the answer
+    is singletons and no factor exists.
+    """
+    spec = KVReplicatedColwise(num_kv_heads=4, sync=False)
+    assert spec.replication_groups(6) == [[t] for t in range(6)]
+    assert spec.replication_groups(8) == [[t] for t in range(8)]
+
+    # force_sync still partitions BY kv-group, so there it must still divide.
+    assert spec.replication_groups(8, force_sync=True) == [[0, 1], [2, 3], [4, 5], [6, 7]]
+    with pytest.raises(ValueError, match="multiple of num_kv_heads"):
+        spec.replication_groups(6, force_sync=True)
