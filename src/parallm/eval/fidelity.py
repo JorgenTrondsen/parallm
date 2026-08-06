@@ -26,7 +26,7 @@ import torch
 import torch.nn.functional as F
 
 from parallm.model.pt_model import PTWrappedModel
-from parallm.train.losses import block_mse
+from parallm.train.losses import block_direction_magnitude, block_mse
 from parallm.train.teacher import HookedTeacher
 
 
@@ -166,11 +166,26 @@ def fidelity_step(
     teacher_logits, teacher_hiddens = teacher.forward(
         input_ids, attention_mask=attention_mask
     )
+    # At post-attn/exact the student only records a hidden for layers named in
+    # the capture sets — passing neither yields an EMPTY dict and every metric
+    # lookup below KeyErrors. (The legacy post-mlp path populates unconditionally,
+    # which is why this went unnoticed: post-attn is the schedule everything
+    # actually trains at.) Reuse the trainer's own helper so fidelity taps land on
+    # exactly the depths training supervises.
+    from parallm.train.distill import capture_sets
+
+    cap_attn, cap_mlp = capture_sets(
+        student.sync_after_layers,
+        len(student.text_models[0].layers),
+        intra_window_taps,
+    )
     student_logits, student_sync_hiddens = student(
         input_ids=input_ids,
         attention_mask=attention_mask,
         return_sync_hiddens=True,
         return_intra_window_hiddens=intra_window_taps,
+        capture_post_attn=cap_attn,
+        capture_post_mlp=cap_mlp,
     )
 
     device = input_ids.device
@@ -194,6 +209,17 @@ def fidelity_step(
                 attention_mask=attention_mask,
                 normalize=True,
             ).detach().float()
+            # relMSE conflates "points the wrong way" with "right way, wrong
+            # length" (relMSE ≈ 1 − 2ρr + r²). Those are different failures with
+            # different remedies, and which one the D>1 deficit is has never been
+            # measured at the boundaries — only at the logits.
+            cos, ratio = block_direction_magnitude(
+                student_sync_hiddens[layer_idx],
+                teacher_hiddens[layer_idx],
+                attention_mask=attention_mask,
+            )
+            metrics[f"block_cos_l{layer_idx}"] = cos.detach().float()
+            metrics[f"block_normratio_l{layer_idx}"] = ratio.detach().float()
         metrics.update(
             _fidelity_logit_metrics(
                 student_logits, teacher_logits, labels, attention_mask, chunk_size
@@ -204,6 +230,8 @@ def fidelity_step(
         for layer_idx in sync_layer_indices:
             metrics[f"block_mse_l{layer_idx}"] = zero.clone()
             metrics[f"block_relmse_l{layer_idx}"] = zero.clone()
+            metrics[f"block_cos_l{layer_idx}"] = zero.clone()
+            metrics[f"block_normratio_l{layer_idx}"] = zero.clone()
         for name in _LOGIT_METRIC_NAMES:
             metrics[name] = zero.clone()
 

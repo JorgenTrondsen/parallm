@@ -125,6 +125,15 @@ def stream_text_state_dict(hf_model: str, *, drop_lm_head: bool = False) -> "dic
                        for s in ("weight_scale", "weight_scale_2")
                        if f"{base}.{s}" in present}
                 sd[key] = dequant_weight(f.get_tensor(k), sib)
+    # Tied embeddings (`tie_word_embeddings`, every small Qwen3.5) ship no
+    # `lm_head.weight` at all, and the PT model has a real one — an untied copy
+    # per the `OwnerOnly(owner_track=0)` spec — so the load fails with
+    # `missing=['lm_head.weight']`. Untie here rather than teaching the model
+    # about tying: the head is FROZEN in every trainer and eval, so a copy can
+    # never drift from the embedding, and the converted artifact stays an
+    # ordinary untied checkpoint the rest of the stack already handles.
+    if "lm_head.weight" not in sd and "embed_tokens.weight" in sd and not drop_lm_head:
+        sd["lm_head.weight"] = sd["embed_tokens.weight"].clone()
     return _fuse_moe_experts(sd)
 
 

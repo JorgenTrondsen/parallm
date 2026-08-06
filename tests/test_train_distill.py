@@ -302,3 +302,181 @@ def test_distill_step_fixed_d2_schedule_n4():
         got = sum(1 for p_ in tm.layers.parameters()
                   if p_.grad is not None and p_.grad.abs().sum() > 0)
         assert got > 0, f"track {k}: no grad at the fixed-D=2 schedule"
+
+
+def test_direction_magnitude_separates_what_relmse_conflates():
+    """`block_direction_magnitude` must split the two failures relMSE merges.
+
+    relMSE ≈ 1 − 2·cos·r + r², so a state pointing the wrong way and one that
+    points the right way but is short can score IDENTICALLY. They are not the
+    same defect: a gain error is something the next layer can absorb, a
+    direction error is missing content. The pair is only worth reporting if it
+    tells those two apart where relMSE cannot — so construct exactly that case.
+    """
+    from parallm.train.losses import block_direction_magnitude
+
+    torch.manual_seed(0)
+    B, T, H = 2, 6, 32
+    t = torch.randn(B, T, H)
+
+    # (a) pure MAGNITUDE error: same direction, scaled by r.
+    r = 0.8
+    s_mag = t * r
+    # (b) pure DIRECTION error: unit-norm-preserving, tuned so relMSE matches.
+    # For an orthogonal perturbation of relative size d, relMSE = d²/(1+d²) at
+    # matched norm... simplest is to search a mix that ties relMSE to (a)'s.
+    noise = torch.randn(B, T, H)
+    noise = noise - (noise * t).sum(-1, keepdim=True) / t.pow(2).sum(-1, keepdim=True) * t
+    target_rel = block_mse(s_mag, t, normalize=True).item()
+    lo, hi = 0.0, 5.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        cand = t + mid * noise * (t.norm(dim=-1, keepdim=True) / noise.norm(dim=-1, keepdim=True))
+        cand = cand * (t.norm(dim=-1, keepdim=True) / cand.norm(dim=-1, keepdim=True))
+        if block_mse(cand, t, normalize=True).item() < target_rel:
+            lo = mid
+        else:
+            hi = mid
+    s_dir = t + lo * noise * (t.norm(dim=-1, keepdim=True) / noise.norm(dim=-1, keepdim=True))
+    s_dir = s_dir * (t.norm(dim=-1, keepdim=True) / s_dir.norm(dim=-1, keepdim=True))
+
+    rel_mag = block_mse(s_mag, t, normalize=True).item()
+    rel_dir = block_mse(s_dir, t, normalize=True).item()
+    assert abs(rel_mag - rel_dir) < 0.02 * rel_mag, (
+        f"fixture failed to tie relMSE: {rel_mag} vs {rel_dir}"
+    )
+
+    cos_mag, r_mag = block_direction_magnitude(s_mag, t)
+    cos_dir, r_dir = block_direction_magnitude(s_dir, t)
+
+    # Same relMSE, opposite anatomy — this is the whole point of the metric.
+    # Closed forms at this fixture: pure scale gives rel=(1−r)², cos=1, ratio=r;
+    # norm-preserving rotation gives rel=2(1−cos), ratio=1. So with r=0.8 both
+    # score rel=0.04 while cos is 1.000 vs 0.980 and ratio is 0.800 vs 1.000.
+    assert cos_mag.item() > 0.999, f"pure-scale error should keep direction: {cos_mag}"
+    assert abs(r_mag.item() - r) < 1e-4, f"norm ratio should recover {r}: {r_mag}"
+    assert abs(r_dir.item() - 1.0) < 1e-4, f"norm-preserving, got r={r_dir}"
+    assert abs(cos_dir.item() - (1.0 - rel_dir / 2)) < 1e-3, (
+        f"rotation cosine should be 1−rel/2={1 - rel_dir / 2:.4f}, got {cos_dir.item():.4f}"
+    )
+    # The claim that matters: relMSE ties to <2% while BOTH new coordinates
+    # separate by orders of magnitude more than that tie tolerance.
+    tie = 0.02 * rel_mag
+    assert (cos_mag - cos_dir).item() > 10 * tie, "cosine did not separate the two"
+    assert (r_dir - r_mag).item() > 10 * tie, "norm ratio did not separate the two"
+
+    # Exact match is the degenerate anchor.
+    cos_id, r_id = block_direction_magnitude(t, t)
+    assert abs(cos_id.item() - 1.0) < 1e-6 and abs(r_id.item() - 1.0) < 1e-6
+
+    # Padding is excluded, like block_mse: corrupting a masked position is a no-op.
+    mask = torch.ones(B, T)
+    mask[:, -2:] = 0
+    s_pad = s_mag.clone()
+    s_pad[:, -2:] = 1e3
+    cos_a, r_a = block_direction_magnitude(s_mag, t, attention_mask=mask)
+    cos_b, r_b = block_direction_magnitude(s_pad, t, attention_mask=mask)
+    assert torch.allclose(cos_a, cos_b) and torch.allclose(r_a, r_b)
+
+
+def _d2_step_fixture(sched=(1, 3, 5, 7)):
+    """A D=2 student + exact-schedule frozen teacher, ready for `distill_step`."""
+    cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=list(sched))
+    pt.set_sync_phase("post-attn")
+    pt.train()
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
+        sync_after_layers=list(range(cfg.num_hidden_layers)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    return cfg, pt, freeze_slice_teacher(teacher_pt), tuple(sched)
+
+
+def test_lambda_mag_is_inert_by_default_and_live_when_set():
+    """`--lambda-mag` must not perturb existing recipes at its default, and must
+    actually change the step when set.
+
+    It targets a measured defect in the relMSE tap (2026-08-04): the FIRST
+    boundary at D=2 is cos 0.935 / r 5.4 = 99% magnitude while being ~93% of the
+    block loss, yet magnitude is the failure training fixes on its own. What
+    survives is direction, so the knob moves the gradient budget onto it.
+    """
+    cfg, pt, teacher, sync_after = _d2_step_fixture()
+    batch = _batch(cfg)
+
+    def run(**kw):
+        for p in pt.parameters():
+            if p.grad is not None:
+                p.grad = None
+        torch.manual_seed(0)
+        out = distill_step(pt, teacher, pt.lm_head, batch,
+                           DistillConfig(sync_layer_indices=sync_after, **kw))
+        return out, {n: p.grad.detach().clone()
+                     for n, p in pt.named_parameters() if p.grad is not None}
+
+    base, g_base = run()
+    off, g_off = run(lambda_mag=None)
+    mag, g_mag = run(lambda_mag=0.1)
+
+    # Inert at the default: bit-identical to not passing it at all.
+    assert torch.equal(base["block_mse"], off["block_mse"])
+    for n in g_base:
+        assert torch.equal(g_base[n], g_off[n]), f"the default perturbed {n}"
+
+    # Live when set — and it reaches the weights.
+    assert not torch.equal(base["block_mse"], mag["block_mse"]), (
+        "lambda_mag did not change the block loss"
+    )
+    changed = [n for n in g_base if not torch.equal(g_base[n], g_mag[n])]
+    assert changed, "lambda_mag changed no gradient — the knob is a no-op"
+
+
+def test_block_split_reconstructs_relmse_and_isolates_the_two_failures():
+    """`block_split` must be the honest decomposition of the tap it replaces.
+
+    relMSE ≈ 1 − 2·cos·r + r², so direction=2(1−cos) and magnitude=log(r)² have
+    to track the same underlying quantities — otherwise the weighting decisions
+    made from them are made from a different number than the one measured.
+    """
+    from parallm.train.losses import block_mse, block_split
+
+    torch.manual_seed(0)
+    t = torch.randn(2, 6, 32)
+
+    # Pure scale error: direction term ~0, magnitude term = log(r)^2 exactly.
+    r = 2.5
+    d, m = block_split(t * r, t)
+    assert d.item() < 1e-6, f"pure scale error leaked into direction: {d.item()}"
+    assert abs(m.item() - torch.tensor(r).log().pow(2).item()) < 1e-5
+
+    # Exact match is zero on both.
+    d0, m0 = block_split(t, t)
+    assert d0.item() < 1e-6 and m0.item() < 1e-6
+
+    # The identity relMSE = 1 - 2·cos·r + r² is EXACT PER TOKEN. relMSE is a
+    # ratio of sums while the split averages two nonlinear per-token functions,
+    # so they only agree exactly when there is one token to average — check it
+    # there, where any algebra error is unmissable.
+    t1 = torch.randn(1, 1, 32)
+    s1 = t1 + 0.4 * torch.randn_like(t1)
+    d, m = block_split(s1, t1)
+    cos = 1.0 - d.item() / 2.0
+    ratio = float(torch.exp(torch.sqrt(m)))
+    exact = 1.0 - 2.0 * cos * ratio + ratio**2
+    rel1 = block_mse(s1, t1, normalize=True).item()
+    assert abs(exact - rel1) < 1e-4 * max(rel1, 1.0), (
+        f"per-token identity broken: {exact:.6f} vs {rel1:.6f}"
+    )
+
+    # In aggregate the two diverge by Jensen, but must stay the same order —
+    # the weighting decisions in the plan are read off real profiles where the
+    # gap measured 1-4%, so a wild divergence here would invalidate them.
+    s = t + 0.4 * torch.randn_like(t)
+    d, m = block_split(s, t)
+    cos = 1.0 - d.item() / 2.0
+    ratio = float(torch.exp(torch.sqrt(m)))
+    approx = 1.0 - 2.0 * cos * ratio + ratio**2
+    rel = block_mse(s, t, normalize=True).item()
+    assert 0.5 * rel < approx < 2.0 * rel, (
+        f"split and relMSE disagree by more than 2x: {approx:.4f} vs {rel:.4f}"
+    )

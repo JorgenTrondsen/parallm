@@ -252,6 +252,14 @@ def main() -> int:
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--lambda-block", type=float, default=4.0)
     p.add_argument("--lambda-ce", type=float, default=1.0)
+    p.add_argument("--lambda-mag", type=float, default=None,
+                   help="Switch every block tap from relMSE to "
+                        "direction + LAMBDA_MAG*magnitude (losses.block_split). "
+                        "relMSE = 1 - 2*cos*r + r^2 merges the two, and at D=2 the "
+                        "FIRST boundary measures cos 0.935 / r 5.4 — 99%% magnitude, "
+                        "direction already right — while being ~93%% of the block "
+                        "loss. What actually survives training is direction (cos "
+                        "0.93 -> 0.80 at r ~ 1.0). Unset = the historical relMSE.")
     p.add_argument("--ce-chunk-size", type=int, default=256)
     p.add_argument("--train-embeddings", action="store_true",
                    help="Unfreeze embed_tokens (lm_head stays frozen — the replicated loss "
@@ -529,6 +537,7 @@ def main() -> int:
         sync_layer_indices=tuple(sync_layers),
         lambda_block=args.lambda_block,
         lambda_ce=args.lambda_ce,
+        lambda_mag=args.lambda_mag,
         intra_window_mse=args.intra_window_mse,
         ce_chunk_size=args.ce_chunk_size,
     )
@@ -618,8 +627,8 @@ def main() -> int:
             _log(rank, f"step {step} total={losses['total'].item():.4f} "
                        f"block={losses['block_mse'].item():.4f} "
                        f"ce={losses['ce'].item():.4f} "
-                       f"gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
-                       f"{dt:.2f}s/step")
+                       + f"gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
+                         f"{dt:.2f}s/step")
             if args.ledge_probe:
                 # Per-tap relMSE is already computed and returned by distill_step;
                 # gnorm is a rank-local non-deduplicated sum under

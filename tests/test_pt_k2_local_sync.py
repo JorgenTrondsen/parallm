@@ -145,3 +145,65 @@ def test_k2_peer_rank_returns_no_logits():
     with torch.no_grad():
         logits, _ = pt(input_ids=input_ids, attention_mask=attention_mask)
     assert logits is None
+
+
+def test_post_attn_capture_sets_cover_every_metric_layer():
+    """At post-attn the student records ONLY the layers named in the capture
+    sets, so `capture_sets` and the metric layers must agree exactly.
+
+    eval_fidelity passed neither set and got an EMPTY dict back, KeyError-ing on
+    the first layer — its per-layer block_mse never worked at post-attn at all.
+    It went unnoticed because the legacy post-mlp branch populates
+    unconditionally, and post-attn is the schedule everything actually trains at.
+    """
+    from parallm.train.distill import capture_sets
+
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    pt = PTWrappedModel(
+        text_config=cfg,
+        n_tracks=2,
+        local_track_ids=(0, 1),
+        sync_after_layers=[1, 3, 5, 7],  # D=2
+        track_group=None,
+    ).eval()
+    pt.set_sync_phase("post-attn")
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    attention_mask = torch.ones((1, 8), dtype=torch.long)
+
+    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, False)
+    with torch.no_grad():
+        _, hiddens = pt(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_sync_hiddens=True,
+            capture_post_attn=cap_attn,
+            capture_post_mlp=cap_mlp,
+        )
+    assert set(hiddens) == {1, 3, 5, 7}, f"got {sorted(hiddens)}"
+
+    # Falsify: no capture sets at post-attn records nothing (the actual bug).
+    with torch.no_grad():
+        _, empty = pt(
+            input_ids=input_ids, attention_mask=attention_mask, return_sync_hiddens=True
+        )
+    assert empty == {}
+
+    # ⚠ MID-WINDOW taps are NOT implemented at post-attn. capture_sets(intra=True)
+    # names every layer, but _run_post_attn_stack only records at a boundary or at
+    # `last` — there is no loss-only reconstruction branch for the depths in
+    # between, the way the legacy post-mlp path has at pt_model.py:331-332. So
+    # --intra-window-taps silently degrades to boundary-only here. Asserted so the
+    # gap is a recorded fact rather than a surprise at the next call site.
+    cap_attn, cap_mlp = capture_sets(pt.sync_after_layers, L, True)
+    assert cap_attn | cap_mlp == set(range(L))
+    with torch.no_grad():
+        _, partial = pt(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_sync_hiddens=True,
+            return_intra_window_hiddens=True,
+            capture_post_attn=cap_attn,
+            capture_post_mlp=cap_mlp,
+        )
+    assert set(partial) == {1, 3, 5, 7}, "mid-window at post-attn is now implemented — update this rail"

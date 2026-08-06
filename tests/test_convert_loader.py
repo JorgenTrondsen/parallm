@@ -80,3 +80,36 @@ def test_fuse_unfused_moe_experts():
     # already-fused input is a no-op
     fused = {"layers.0.mlp.experts.gate_up_proj": torch.randn(E, 2 * I, H)}
     assert _fuse_moe_experts(dict(fused)).keys() == fused.keys()
+
+
+def test_tied_embeddings_get_an_untied_lm_head(tmp_path):
+    """`tie_word_embeddings` checkpoints ship NO `lm_head.weight`.
+
+    Every small Qwen3.5 is tied (the 0.8B is), and the PT model has a real
+    untied head per `OwnerOnly(owner_track=0)`, so without this the convert
+    loads with `missing=['lm_head.weight']` and nothing downstream runs. Untie
+    at stream time: the head is frozen everywhere, so a copy cannot drift.
+    """
+    src = {
+        "model.language_model.layers.0.mlp.gate_proj.weight": torch.randn(8, 4, dtype=torch.bfloat16),
+        "model.language_model.embed_tokens.weight": torch.randn(6, 4, dtype=torch.bfloat16),
+        "model.norm.weight": torch.randn(4, dtype=torch.bfloat16),
+    }
+    save_file(src, str(tmp_path / "model.safetensors"))
+
+    sd = stream_text_state_dict(str(tmp_path))
+    assert "lm_head.weight" in sd, "tied checkpoint produced no lm_head"
+    assert torch.equal(sd["lm_head.weight"], sd["embed_tokens.weight"])
+    # A copy, not an alias — the head is frozen, but aliasing would make any
+    # future embedding update silently rewrite the head too.
+    assert sd["lm_head.weight"].data_ptr() != sd["embed_tokens.weight"].data_ptr()
+
+    # An UNTIED checkpoint must be left exactly as it is.
+    src["lm_head.weight"] = torch.randn(6, 4, dtype=torch.bfloat16)
+    save_file(src, str(tmp_path / "model.safetensors"))
+    sd2 = stream_text_state_dict(str(tmp_path))
+    assert torch.equal(sd2["lm_head.weight"], src["lm_head.weight"])
+    assert not torch.equal(sd2["lm_head.weight"], sd2["embed_tokens.weight"])
+
+    # ...and drop_lm_head must still drop it (replica calibration relies on that).
+    assert "lm_head.weight" not in stream_text_state_dict(str(tmp_path), drop_lm_head=True)

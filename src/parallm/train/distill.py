@@ -45,7 +45,7 @@ from torch import nn
 
 from parallm.model.pt_model import PTWrappedModel
 from parallm.model.seam import checkpointed_halves
-from parallm.train.losses import block_mse
+from parallm.train.losses import block_mse, block_split
 
 
 @dataclass
@@ -64,6 +64,7 @@ class DistillConfig:
     sync_layer_indices: tuple[int, ...] = field(default_factory=tuple)
     lambda_block: float = 4.0
     lambda_ce: float = 1.0
+    lambda_mag: float | None = None
     intra_window_mse: bool = False
     ce_chunk_size: int = 256
 
@@ -223,7 +224,6 @@ def distill_step(
         teacher, input_ids, attention_mask,
         post_attn_layers=sync_attn_set, post_mlp_layers=post_mlp_set,
     )
-
     # ----- Scaffolding (embed broadcast + masks + rotary, shared by the loop) -----
     inputs_embeds = student.embed(input_ids)
     position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
@@ -242,6 +242,9 @@ def distill_step(
     position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
 
     def tap_loss(h_synced: torch.Tensor, t_target: torch.Tensor) -> torch.Tensor:
+        if cfg.lambda_mag is not None:
+            d, m = block_split(h_synced, t_target, attention_mask=attention_mask)
+            return d + cfg.lambda_mag * m
         return block_mse(
             h_synced, t_target, attention_mask=attention_mask,
             normalize=True,  # always: the un-normalized form has no caller

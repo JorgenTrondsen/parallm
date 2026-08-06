@@ -245,8 +245,10 @@ def main() -> int:
             lm_head=teacher_model.lm_head,
             sync_layer_indices=sync_layers,
         )
-        teacher_model = teacher_model.to(torch.cuda.current_device())
+        # Shards layer-by-layer off CPU; moving the whole dense teacher across
+        # first OOMs a 40 GB card at 27B (see wrap_teacher_with_fsdp).
         wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
+        teacher_model = teacher_model.to(torch.cuda.current_device())
         teardown_fns.append(teacher.remove_hooks)
 
     tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]

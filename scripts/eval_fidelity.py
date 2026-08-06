@@ -182,8 +182,10 @@ def main() -> int:
         lm_head=teacher_model.lm_head,
         sync_layer_indices=metric_indices,
     )
-    teacher_model = teacher_model.to(torch.cuda.current_device())
+    # Shards layer-by-layer off CPU; moving the whole dense teacher across first
+    # OOMs a 40 GB card at 27B (see wrap_teacher_with_fsdp).
     wrap_teacher_with_fsdp(text_model, teacher_model.lm_head)
+    teacher_model = teacher_model.to(torch.cuda.current_device())
 
     # ----- Student. Same construction as the train script so the loaded
     # state_dict aligns 1:1 with the safetensors keys. -----
@@ -200,7 +202,11 @@ def main() -> int:
         student.set_sync_phase(args.sync_phase)
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
-    student = student.to(torch.cuda.current_device()).to(torch.bfloat16)
+    # Cast BEFORE the move (as train_cli and eval_lm_harness do): the tracks are
+    # built in fp32, so moving first ships 2x the bytes across and peaks at fp32
+    # size on the card before the cast frees it — 18 GiB rather than 9 for 4
+    # tracks of the 27B, which OOMs once the sharded teacher is already resident.
+    student = student.to(torch.bfloat16).to(torch.cuda.current_device())
     student.eval()
 
     # ----- Data. PackedTokenStream is reused as-is; switching dataset is just
@@ -274,16 +280,21 @@ def main() -> int:
         print(f"  top5_set_iou = {sums['top5_set_iou'].item():.4f}")
         boundary_set = set(sync_layers)
         label = "per-layer" if args.intra_window_taps else "per-sync-boundary"
-        print(f"  {label} block_mse (raw | rel=Σ(s−t)²/Σt²):")
+        print(f"  {label} block_mse (raw | rel=Σ(s−t)²/Σt² | cos | ‖s‖/‖t‖):")
         for layer_idx in sync_indices:
             raw = sums[f"block_mse_l{layer_idx}"].item()
             rel = sums[f"block_relmse_l{layer_idx}"].item()
+            # cos/ratio split `rel` into its two factors (rel ≈ 1 − 2·cos·r + r²):
+            # missing content points the wrong way, a gain error is only short.
+            cos = sums[f"block_cos_l{layer_idx}"].item()
+            ratio = sums[f"block_normratio_l{layer_idx}"].item()
             # "(mid)" rows are loss-only reconstructions at non-boundary depths,
             # not state the forward carries.
             tag = ""
             if args.intra_window_taps:
                 tag = "      " if layer_idx in boundary_set else " (mid)"
-            print(f"    layer {layer_idx:3d}{tag}: raw={raw:.6e}  rel={rel:.6e}")
+            print(f"    layer {layer_idx:3d}{tag}: raw={raw:.6e}  rel={rel:.6e}  "
+                  f"cos={cos:+.4f}  r={ratio:.4f}")
         print()
 
     teacher.remove_hooks()
