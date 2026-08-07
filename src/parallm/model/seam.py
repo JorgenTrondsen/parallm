@@ -1,5 +1,4 @@
-"""Decoder-block seam: split a HF Qwen3.5-family decoder layer at the
-post-attention point.
+"""Decoder-block seam: split a HF decoder layer at the post-attention point.
 
 The post-attn (lever B) and exact sync schedules place a boundary INSIDE the
 layer — after the token mixer's residual add, before the MLP — so the walk
@@ -14,11 +13,16 @@ import torch
 
 
 def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids):
-    """First half of a Qwen3.5-family decoder layer: ``input_layernorm`` →
-    token mixer → residual add. Returns ``h_attn = x + Y`` where ``Y`` is the
-    per-track mixer output (self-attn or gated-delta)."""
+    """First half of a pre-norm decoder layer: ``input_layernorm`` → token mixer →
+    residual add. Returns ``h_attn = x + Y`` where ``Y`` is the per-track mixer
+    output (self-attn or gated-delta).
+
+    ``block_type`` is Qwen3.5's hybrid marker; a family with only self-attention
+    (gpt-oss) has no such attribute, hence the ``getattr`` — same guard
+    `train.teacher.HookedTeacher._attn_submodule` uses.
+    """
     h_ln = layer.input_layernorm(x)
-    if layer.block_type == "linear_attention":
+    if getattr(layer, "block_type", None) == "linear_attention":
         y = layer.linear_attn(
             hidden_states=h_ln, cache_params=None, attention_mask=attention_mask
         )
@@ -34,8 +38,13 @@ def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids
 
 
 def seam_mlp(layer, h_attn: torch.Tensor) -> torch.Tensor:
-    """Second half: ``post_attention_layernorm`` → ``mlp`` → residual add."""
-    return h_attn + layer.mlp(layer.post_attention_layernorm(h_attn))
+    """Second half: ``post_attention_layernorm`` → ``mlp`` → residual add.
+
+    A sparse MoE block may hand back ``(hidden_states, router_scores)`` (gpt-oss)
+    rather than a bare tensor; only the hidden state joins the residual.
+    """
+    y = layer.mlp(layer.post_attention_layernorm(h_attn))
+    return h_attn + (y[0] if isinstance(y, tuple) else y)
 
 
 def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):

@@ -16,13 +16,13 @@ from parallm.model.tracks.qwen3_5 import (
     PTTrackTextModel,
     build_per_track_text_config,
 )
-from parallm.slicer.qwen3_5 import decoder_layer_specs, top_level_specs
+from parallm.slicer.qwen3_5 import (
+    VALID_LAYER_TYPES,
+    build_masks,
+    decoder_layer_specs,
+    top_level_specs,
+)
 from parallm.utils.max_tracks import ConstraintSet
-
-
-def _qwen3_5_get_layer_types(text_cfg: Any) -> list[str]:
-    # Qwen3.5 ships explicit hybrid layer_types in the config.
-    return list(text_cfg.layer_types)
 
 
 def _qwen3_5_constraints(cfg: Any) -> ConstraintSet:
@@ -41,18 +41,10 @@ QWEN3_5_ADAPTER = ModelAdapter(
     model_type="qwen3_5_text",
     layer_specs=decoder_layer_specs,
     top_level_specs=top_level_specs,
-    get_layer_types=_qwen3_5_get_layer_types,
-    valid_layer_types=("full_attention", "linear_attention"),
+    valid_layer_types=VALID_LAYER_TYPES,
     track_text_model_cls=PTTrackTextModel,
     build_per_track_text_config=build_per_track_text_config,
-    # Sub-module prefixes that appear under `layers.{i}.<prefix>.*` in slicer output.
-    state_dict_layer_prefixes=(
-        "self_attn",
-        "linear_attn",
-        "mlp",
-        "input_layernorm",
-        "post_attention_layernorm",
-    ),
+    build_masks=build_masks,
     full_text_model_cls=Qwen3_5TextModel,
     constraints=_qwen3_5_constraints,
 )

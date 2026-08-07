@@ -250,27 +250,17 @@ class PTWrappedModel(nn.Module):
         capture_post_attn: "set[int] | None" = None,
         capture_post_mlp: "set[int] | None" = None,
     ):
-        # Local import: keeps the engine model-family-agnostic at import time.
-        from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
-
         # 1. Embed (owner-only) + cross-track broadcast via the all-reduce in `embed`.
         h = self.embed(input_ids)
 
         # 2. Scaffolding (rotary, masks) computed once — every track's per-track
-        # config is identical, so reuse the first track's modules.
+        # config is identical, so reuse the first track's modules. The adapter owns
+        # the {layer_type: mask} mapping, so this walk never names a family's layer
+        # types or imports its modeling module.
         tm0 = self.text_models[0]
         position_ids_resolved, text_position_ids = tm0._resolve_position_ids(h, position_ids)
-        causal_mask = create_causal_mask(
-            config=tm0.config,
-            inputs_embeds=h,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            position_ids=text_position_ids,
-        )
-        linear_attn_mask = (
-            None
-            if (attention_mask is not None and torch.all(attention_mask == 1))
-            else attention_mask
+        layer_masks = self._adapter.build_masks(
+            tm0.config, h, attention_mask, text_position_ids
         )
         position_embeddings = tm0.rotary_emb(h, position_ids_resolved)
 
@@ -287,8 +277,7 @@ class PTWrappedModel(nn.Module):
                 h,
                 position_embeddings,
                 text_position_ids,
-                causal_mask,
-                linear_attn_mask,
+                layer_masks,
                 sync_hiddens=sync_hiddens,
                 exact=self.sync_phase == "exact",
                 capture_post_attn=capture_post_attn,
@@ -306,11 +295,7 @@ class PTWrappedModel(nn.Module):
             for layer_idx in range(len(tm0.layers)):
                 new_h: list[torch.Tensor] = []
                 for k, tm in enumerate(self.text_models):
-                    mask = (
-                        linear_attn_mask
-                        if tm.config.layer_types[layer_idx] == "linear_attention"
-                        else causal_mask
-                    )
+                    mask = layer_masks[tm.config.layer_types[layer_idx]]
                     new_h.append(
                         tm.layers[layer_idx](
                             per_track_h[k],
@@ -347,8 +332,7 @@ class PTWrappedModel(nn.Module):
         h: torch.Tensor,
         position_embeddings,
         text_position_ids,
-        causal_mask,
-        linear_attn_mask,
+        layer_masks: dict,
         sync_hiddens: "dict[int, torch.Tensor] | None" = None,
         exact: bool = False,
         capture_post_attn: "set[int] | None" = None,
@@ -388,8 +372,8 @@ class PTWrappedModel(nn.Module):
             tap_attn, tap_mlp = capture_post_attn or (), capture_post_mlp or ()
         if self.exec_groups > 1:
             return self._run_batched_stack(
-                h, position_embeddings, text_position_ids, causal_mask,
-                linear_attn_mask, L, last, sync_attn_set, sync_hiddens,
+                h, position_embeddings, text_position_ids, layer_masks,
+                L, last, sync_attn_set, sync_hiddens,
                 tap_attn, tap_mlp, exact,
             )
         run_mixer, run_mlp = checkpointed_halves(
@@ -403,11 +387,7 @@ class PTWrappedModel(nn.Module):
         for i in range(L):
             # layer_types[i] is identical on every track, so the mixer mask is
             # per-layer.
-            layer_mask = (
-                linear_attn_mask
-                if self.text_models[0].config.layer_types[i] == "linear_attention"
-                else causal_mask
-            )
+            layer_mask = layer_masks[self.text_models[0].config.layer_types[i]]
             if self.layer_stream is not None:
                 self.layer_stream.acquire(i)
             # Fuse after every sublayer, and feed a global sync one leader per
@@ -457,8 +437,8 @@ class PTWrappedModel(nn.Module):
         return h
 
     def _run_batched_stack(
-        self, h, position_embeddings, text_position_ids, causal_mask,
-        linear_attn_mask, L, last, sync_attn_set, sync_hiddens,
+        self, h, position_embeddings, text_position_ids, layer_masks,
+        L, last, sync_attn_set, sync_hiddens,
         tap_attn, tap_mlp, exact,
     ) -> torch.Tensor:
         """`_run_post_attn_stack` for a merged track run as G members.
@@ -481,11 +461,7 @@ class PTWrappedModel(nn.Module):
         block_start = h
         carry = h
         for i in range(L):
-            layer_mask = (
-                linear_attn_mask
-                if self.text_models[0].config.layer_types[i] == "linear_attention"
-                else causal_mask
-            )
+            layer_mask = layer_masks[self.text_models[0].config.layer_types[i]]
             if self.layer_stream is not None:
                 self.layer_stream.acquire(i)
             h_attn = run_mixer(i, carry, layer_mask)

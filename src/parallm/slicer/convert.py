@@ -1,7 +1,8 @@
 """Apply SlicerSpecs to a dense HF model and emit N per-track state_dicts + a manifest.
 
-This is the conversion entrypoint. Given a loaded HF `Qwen3_5ForCausalLM`
-(or any registered model_type), it produces:
+This is the conversion entrypoint. Given a loaded HF causal-LM (or anything
+duck-typed like one, e.g. `loader.StateDictModel`) whose `model_type` has a
+registered adapter, it produces:
 
 - `tracks`: list[dict[str, Tensor]] — one state_dict per track, keyed with
   the same parameter names the per-track model modules expect.
@@ -25,7 +26,7 @@ class PTManifest:
     model_type: str
     n_tracks: int
     num_layers: int
-    layer_types: list[str]  # one of "full_attention" | "linear_attention"
+    layer_types: list[str]  # per-layer token-mixer type, from the adapter
     per_track_param_shapes: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # Maps top-level param name -> owner track id for params that live on a
     # single track only (e.g. embed_tokens, lm_head). Absence means "every
@@ -54,7 +55,7 @@ def resolve_param_specs(adapter: "Any", text_cfg: Any) -> dict[str, SlicerSpec]:
     out: dict[str, SlicerSpec] = {}
     for canonical, spec in adapter.top_level_specs(text_cfg).items():
         out[canonical] = spec
-    layer_types: list[str] = adapter.get_layer_types(text_cfg)
+    layer_types: list[str] = adapter.layer_types_for(text_cfg)
     for layer_idx, layer_type in enumerate(layer_types):
         for sub_key, spec in adapter.layer_specs(text_cfg, layer_type).items():
             out[f"layers.{layer_idx}.{sub_key}"] = spec
@@ -170,7 +171,7 @@ def slice_model_to_tracks(
     adapter = get_adapter_for_config(text_cfg)
     model_type = adapter.model_type
     num_layers = int(text_cfg.num_hidden_layers)
-    layer_types: list[str] = adapter.get_layer_types(text_cfg)
+    layer_types: list[str] = adapter.layer_types_for(text_cfg)
     if len(layer_types) != num_layers:
         raise ValueError(f"layer_types len {len(layer_types)} != num_hidden_layers {num_layers}")
     unknown = set(layer_types) - set(adapter.valid_layer_types)

@@ -24,7 +24,9 @@ from parallm.model.sync import SyncBoundary
 from parallm.model.pt_model import PTTrackTextModelConfig
 
 
-def apply_common_per_track_sizing(text_config, n_tracks: int, fuse_size: int = 1):
+def apply_common_per_track_sizing(
+    text_config, n_tracks: int, fuse_size: int = 1, attn_implementation: str = "sdpa"
+):
     """Deep-copy `text_config` and apply the KV-replicated *attention* sizing shared
     by every family. Callers then divide their own MLP-width fields.
 
@@ -36,16 +38,22 @@ def apply_common_per_track_sizing(text_config, n_tracks: int, fuse_size: int = 1
         v-head (per-track ratio 1). Mirrors `slicer.base.GDNFusedQKV`, which does
         the matching weight-side replication — keep the two in step.
 
+    The two ``linear_num_*`` rules apply only to families that HAVE linear attention;
+    a config without those fields (gpt-oss) just skips them.
+
     ``fuse_size`` > 1 sizes a MERGED track: F consecutive tracks' slabs concatenated
     into one F-wide track (see `parallm.model.merge`). Every divided field is scaled
     back up by F, so this is the N-track slicing with F of them glued together — NOT
     the N/F-track slicing, which would replicate GDN k-heads and pad the MLP
     differently and so would not match the shards on disk.
 
-    Also forces SDPA: the per-track full-attention layers are built standalone (no
-    PreTrainedModel to resolve a backend), so eager would materialize a full (T, T)
-    score matrix per head. Only affects full-attention layers; masks built via
-    `create_causal_mask(config=...)` follow this setting.
+    ``attn_implementation`` defaults to SDPA: the per-track full-attention layers are
+    built standalone (no PreTrainedModel to resolve a backend), so eager would
+    materialize a full (T, T) score matrix per head. Families whose attention SDPA
+    cannot express must override it — gpt-oss passes ``"eager"`` because
+    `sdpa_attention_forward` has no ``s_aux`` parameter and would therefore drop the
+    attention sinks SILENTLY. Masks built via `create_causal_mask(config=...)` follow
+    this setting.
     """
     cfg = copy.deepcopy(text_config)
     if cfg.num_attention_heads % n_tracks != 0:
@@ -55,21 +63,25 @@ def apply_common_per_track_sizing(text_config, n_tracks: int, fuse_size: int = 1
             f"n_tracks {n_tracks} must be a multiple of num_key_value_heads {cfg.num_key_value_heads} "
             f"(KV-replicated rule)"
         )
-    if cfg.linear_num_value_heads % n_tracks != 0:
-        raise ValueError(f"linear_num_value_heads {cfg.linear_num_value_heads} not divisible by {n_tracks}")
     cfg.num_attention_heads //= n_tracks
     cfg.num_key_value_heads = 1
-    divides_k = cfg.linear_num_key_heads % n_tracks == 0
-    cfg.linear_num_value_heads //= n_tracks
-    cfg.linear_num_key_heads = (
-        cfg.linear_num_key_heads // n_tracks if divides_k else cfg.linear_num_value_heads
-    )
+    if getattr(cfg, "linear_num_value_heads", None) is not None:
+        if cfg.linear_num_value_heads % n_tracks != 0:
+            raise ValueError(
+                f"linear_num_value_heads {cfg.linear_num_value_heads} not divisible by {n_tracks}"
+            )
+        divides_k = cfg.linear_num_key_heads % n_tracks == 0
+        cfg.linear_num_value_heads //= n_tracks
+        cfg.linear_num_key_heads = (
+            cfg.linear_num_key_heads // n_tracks if divides_k else cfg.linear_num_value_heads
+        )
     if fuse_size > 1:
         cfg.num_attention_heads *= fuse_size
         cfg.num_key_value_heads *= fuse_size  # one kv-head per q-head: ratio 1
-        cfg.linear_num_value_heads *= fuse_size
-        cfg.linear_num_key_heads *= fuse_size
-    cfg._attn_implementation = "sdpa"
+        if getattr(cfg, "linear_num_value_heads", None) is not None:
+            cfg.linear_num_value_heads *= fuse_size
+            cfg.linear_num_key_heads *= fuse_size
+    cfg._attn_implementation = attn_implementation
     return cfg
 
 
@@ -121,7 +133,8 @@ class PTTrackTextModelBase(nn.Module):
 
     def _resolve_position_ids(self, inputs_embeds, position_ids):
         # Mirrors the HF TextModel.forward. The 4-dim form is for multimodal mrope;
-        # for pure text fine-tuning, position_ids is typically None.
+        # for pure text fine-tuning, position_ids is typically None. Families whose
+        # rotary takes plain 2-D position ids override this (see `tracks/gpt_oss.py`).
         if position_ids is None:
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
             position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)

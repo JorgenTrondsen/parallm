@@ -29,6 +29,48 @@ import torch.distributed as dist
 from torch import nn
 
 
+def load_dense_reference(hf_model: str, **kwargs):
+    """Load the dense HF causal-LM used as the fidelity/harness reference.
+
+    Two family-dependent details that a caller must not hard-code:
+
+    - **Never force an attention backend.** gpt-oss's SDPA path drops the attention
+      SINKS silently (`sdpa_attention_forward` has no ``s_aux`` parameter, and
+      `GptOssPreTrainedModel._supports_sdpa` is False), so a forced ``sdpa`` would
+      make the *reference* wrong and the student look broken. Left unset,
+      `from_pretrained` picks each family's own supported default.
+    - **MXFP4 checkpoints must be dequantized.** gpt-oss ships 4-bit expert slabs;
+      the PT slices are bf16, so the reference has to be too.
+
+    Returns ``(model, text_model)`` — the second is the decoder stack `HookedTeacher`
+    hooks (unwrapping the VLM `language_model` level when there is one).
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    cfg = AutoConfig.from_pretrained(hf_model)
+    quant = getattr(cfg, "quantization_config", None)
+    method = (quant or {}).get("quant_method") if isinstance(quant, dict) else getattr(
+        quant, "quant_method", None
+    )
+    if method == "mxfp4":
+        from transformers import Mxfp4Config
+
+        kwargs.setdefault("quantization_config", Mxfp4Config(dequantize=True))
+
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True, **kwargs
+    )
+    model.eval()
+    for param in model.parameters():
+        param.requires_grad = False
+    text_model = (
+        model.model.language_model
+        if hasattr(model.model, "language_model")
+        else model.model
+    )
+    return model, text_model
+
+
 class HookedTeacher:
     """Wraps a loaded dense text decoder + lm_head and captures hidden states at sync points.
 

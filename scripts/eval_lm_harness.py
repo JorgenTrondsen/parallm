@@ -36,7 +36,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
@@ -48,7 +48,7 @@ from parallm.eval.lm_eval_adapter import (
     run_lm_eval,
 )
 from parallm.model.pt_model import PTWrappedModel
-from parallm.train.teacher import HookedTeacher
+from parallm.train.teacher import HookedTeacher, load_dense_reference
 from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
 
 
@@ -228,18 +228,7 @@ def main() -> int:
 
     if want_teacher:
         _log(rank, "[init] loading frozen dense teacher…")
-        teacher_model = AutoModelForCausalLM.from_pretrained(
-            args.hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True,
-            attn_implementation="sdpa",
-        )
-        teacher_model.eval()
-        for param in teacher_model.parameters():
-            param.requires_grad = False
-        text_model = (
-            teacher_model.model.language_model
-            if hasattr(teacher_model.model, "language_model")
-            else teacher_model.model
-        )
+        teacher_model, text_model = load_dense_reference(args.hf_model)
         teacher = HookedTeacher(
             text_model=text_model,
             lm_head=teacher_model.lm_head,

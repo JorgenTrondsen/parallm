@@ -113,3 +113,41 @@ def test_tied_embeddings_get_an_untied_lm_head(tmp_path):
 
     # ...and drop_lm_head must still drop it (replica calibration relies on that).
     assert "lm_head.weight" not in stream_text_state_dict(str(tmp_path), drop_lm_head=True)
+
+
+def test_mxfp4_blocks_scales_dequantize_to_one_param(tmp_path):
+    """gpt-oss ships experts as `<proj>_blocks` (uint8, 2 fp4 values/byte) plus
+    `<proj>_scales` (uint8 exponents). The loader must emit ONE bf16 `<proj>` and
+    drop the scales, matching what transformers' own dequantizer produces."""
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+
+    E, out, G, B = 2, 8, 3, 16  # in_features = G * B * 2 = 96
+    torch.manual_seed(0)
+    blocks = torch.randint(0, 256, (E, out, G, B), dtype=torch.uint8)
+    scales = torch.randint(100, 150, (E, out, G), dtype=torch.uint8)
+    src = {
+        "model.layers.0.mlp.experts.gate_up_proj_blocks": blocks,
+        "model.layers.0.mlp.experts.gate_up_proj_scales": scales,
+        "model.embed_tokens.weight": torch.randn(6, 4, dtype=torch.bfloat16),
+        "model.norm.weight": torch.randn(4, dtype=torch.bfloat16),
+        "lm_head.weight": torch.randn(6, 4, dtype=torch.bfloat16),
+    }
+    save_file(src, str(tmp_path / "model.safetensors"))
+
+    sd = stream_text_state_dict(str(tmp_path))
+    assert "layers.0.mlp.experts.gate_up_proj" in sd
+    assert not any(k.endswith(("_blocks", "_scales")) for k in sd)
+
+    got = sd["layers.0.mlp.experts.gate_up_proj"]
+    want = convert_moe_packed_tensors(blocks, scales, dtype=torch.bfloat16)
+    assert got.dtype == torch.bfloat16
+    assert got.shape == want.shape == (E, G * B * 2, out)  # [E, in, out]
+    assert torch.equal(got, want)
+
+
+def test_slicer_key_maps_mxfp4_pair():
+    assert (
+        slicer_key("model.layers.7.mlp.experts.down_proj_blocks")
+        == "layers.7.mlp.experts.down_proj"
+    )
+    assert slicer_key("model.layers.7.mlp.experts.down_proj_scales") is None

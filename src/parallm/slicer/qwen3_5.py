@@ -15,17 +15,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
 from parallm.slicer.base import (
     Colwise,
     GatedQColwise,
     GDNFusedQKV,
     KVReplicatedColwise,
     LayerSpec,
-    OwnerOnly,
     PerHead,
     Replicated,
     Rowwise,
     build_decoder_layer_specs,
+    standard_top_level_specs,
 )
 
 
@@ -100,28 +102,50 @@ def mlp_specs(text_cfg: Any) -> LayerSpec:
     }
 
 
+# Layer type -> (decoder-layer submodule prefix, spec builder). `valid_layer_types`
+# is derived from the keys, so the adapter's declared list cannot drift from what
+# this module can actually slice.
+ATTENTION_SPECS = {
+    "full_attention": ("self_attn", full_attention_specs),
+    "linear_attention": ("linear_attn", linear_attention_specs),
+}
+VALID_LAYER_TYPES = tuple(ATTENTION_SPECS)
+
+
 def decoder_layer_specs(text_cfg: Any, layer_type: str) -> LayerSpec:
     """All sliceable params under one dense decoder layer (with prefixes)."""
     return build_decoder_layer_specs(
         text_cfg,
         layer_type,
-        full_attention_specs=full_attention_specs,
-        linear_attention_specs=linear_attention_specs,
+        attention_specs=ATTENTION_SPECS,
         mlp_specs=mlp_specs,
     )
 
 
-def top_level_specs(_text_cfg: Any) -> LayerSpec:
-    """Params that live outside any decoder layer: embeddings, final norm, lm head.
+def build_masks(per_track_cfg, inputs_embeds, attention_mask, position_ids) -> dict:
+    """``{layer_type: mask}`` — the adapter's mask contract.
 
-    `embed_tokens` and `lm_head` live on track 0 only; the input embedding is
-    broadcast to peer tracks via the start-of-forward sync (zero-padded
-    all-reduce), and lm_head is applied locally on track 0 to the synced
-    post-final-norm hidden state. `norm.weight` stays replicated because every
-    track applies the final RMSNorm to its (synced) hidden state.
+    Mirrors ``Qwen3_5TextModel.forward``'s ``causal_mask_mapping``. The linear
+    (gated-delta) branch wants the raw padding mask, or None when there is no
+    padding to strip.
     """
+    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
+
     return {
-        "embed_tokens.weight": OwnerOnly(owner_track=0),
-        "norm.weight": Replicated(),
-        "lm_head.weight": OwnerOnly(owner_track=0),
+        "full_attention": create_causal_mask(
+            config=per_track_cfg,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+        ),
+        "linear_attention": (
+            None
+            if (attention_mask is not None and torch.all(attention_mask == 1))
+            else attention_mask
+        ),
     }
+
+
+# Embeddings / final norm / lm_head slice identically for every family so far.
+top_level_specs = standard_top_level_specs

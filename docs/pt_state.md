@@ -78,7 +78,8 @@ at S≥25 or PCIe5.
 
 ## 3. Where it lives
 
-- **Convert:** [slicer/](../src/parallm/slicer/) + [scripts/convert.py](../scripts/convert.py) (one streaming converter for bf16 / NVFP4, dense / MoE) → per-track `safetensors` + manifest.
+- **Convert:** [slicer/](../src/parallm/slicer/) + [scripts/convert.py](../scripts/convert.py) (one streaming converter for bf16 / NVFP4 / FP8 / MXFP4, dense / MoE) → per-track `safetensors` + manifest.
+- **Model families:** [adapters/](../src/parallm/adapters/) — `qwen3_5_text`, `qwen3_5_moe_text`, `gpt_oss` (20b + 120b). Adding one is three small files: `slicer/<family>.py` (per-param `SlicerSpec`s + the `{layer_type: (prefix, spec_fn)}` map + `build_masks`), `model/tracks/<family>.py` (three HF module classes + a per-track config builder), `adapters/<family>.py` (the `ModelAdapter` + one import line in `adapters/__init__.py`). Nothing outside those may name a family. Rails to copy: [tests/test_gpt_oss_slice.py](../tests/test_gpt_oss_slice.py) — reassembly round-trip, N=1 dense parity, and **N>1 parity at `sync_phase="exact"`**, which is the one that catches a wrong spec.
 - **Copies (the payload):** [model/replica.py](../src/parallm/model/replica.py) — `collect_input_norms` (dense calibration), `wanda_prune_weight` / `fake_quant_weight` / `block_wanda_prune_weight` (the per-weight transforms), `degrade_track_layers` (build a track's replica pool). Rails: [tests/test_replica.py](../tests/test_replica.py).
 - **Forward:** [model/pt_model.py](../src/parallm/model/pt_model.py) `PTWrappedModel` (lockstep window iteration + `SyncBoundary`).
 - **Eval:** [eval/fidelity.py](../src/parallm/eval/fidelity.py) (KL/ppl), [eval/downstream.py](../src/parallm/eval/downstream.py) + [eval/lm_eval_adapter.py](../src/parallm/eval/lm_eval_adapter.py). **Judge recovery by downstream retention** (arc_challenge / winogrande / piqa), not KL/ppl — the proxy hid a real failure once (KL ~85% while hard-reasoning was ~22–33%).

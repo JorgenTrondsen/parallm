@@ -33,7 +33,7 @@ import os
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
@@ -47,7 +47,7 @@ from parallm.train.data import (
     preset_names,
     preset_sources,
 )
-from parallm.train.teacher import HookedTeacher
+from parallm.train.teacher import HookedTeacher, load_dense_reference
 from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
 
 
@@ -159,17 +159,7 @@ def main() -> int:
     # ----- Teacher (frozen, FSDP-sharded across the world). -----
     cfg = AutoConfig.from_pretrained(args.hf_model)
     _log(rank, "[init] loading frozen dense teacher…")
-    teacher_model = AutoModelForCausalLM.from_pretrained(
-        args.hf_model, dtype=torch.bfloat16, low_cpu_mem_usage=True
-    )
-    teacher_model.eval()
-    for param in teacher_model.parameters():
-        param.requires_grad = False
-    text_model = (
-        teacher_model.model.language_model
-        if hasattr(teacher_model.model, "language_model")
-        else teacher_model.model
-    )
+    teacher_model, text_model = load_dense_reference(args.hf_model)
     # Mid-window taps need a teacher hidden at EVERY layer (same pattern as the
     # train script's --intra-window-mse); otherwise hook only the boundaries.
     metric_indices = (

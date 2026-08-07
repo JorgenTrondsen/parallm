@@ -2,9 +2,9 @@
 
 A `ModelAdapter` packages everything model-specific that the PT engine needs:
 slicer specs, per-track text-model class, per-track config builder, and the
-state-dict layer prefixes used by the loader. The engine (`slicer/convert.py`
-and `model/pt_model.py`) holds no model knowledge and looks up the right
-adapter via `get_adapter_for_config(config)`.
+per-layer-type attention masks. The engine (`slicer/convert.py` and
+`model/pt_model.py`) holds no model knowledge and looks up the right adapter
+via `get_adapter_for_config(config)`.
 
 To add a new model, write a new module under `src/parallm/adapters/`
 that builds a `ModelAdapter` and calls `register_model_adapter(adapter)`.
@@ -34,15 +34,21 @@ class ModelAdapter:
     # ----- Slicer side -----
     layer_specs: Callable[[Any, str], LayerSpec]
     top_level_specs: Callable[[Any], LayerSpec]
-    get_layer_types: Callable[[Any], list[str]]
     valid_layer_types: tuple[str, ...]
     # ----- Per-track model side -----
     track_text_model_cls: type
     build_per_track_text_config: Callable[[Any, int], Any]
-    # ----- State-dict remap -----
-    # Sub-module prefixes (under `layers.{i}.*`) that the slicer emits and
-    # that need to be re-routed under `text_models.{k}.layers.{i}.*` at load time.
-    state_dict_layer_prefixes: tuple[str, ...]
+    # ----- Attention masks -----
+    # `(per_track_cfg, inputs_embeds, attention_mask, position_ids) -> {layer_type: mask}`.
+    # This is the `causal_mask_mapping` every HF text model builds internally; hoisting
+    # it onto the adapter is what keeps the engine's forward from importing one family's
+    # modeling module and branching on that family's layer-type names.
+    build_masks: Callable[..., dict[str, Any]]
+    # ----- Layer types -----
+    # `(text_cfg) -> [layer_type per layer]`. Defaults to the config's own `layer_types`
+    # (every hybrid family ships one), falling back to all-`full_attention` for a
+    # homogeneous stack — so most families need not supply it.
+    get_layer_types: "Callable[[Any], list[str]] | None" = None
     # ----- Full (unsliced) text model -----
     # The HF text-model class used to instantiate the *dense* model for replica
     # calibration (its state_dict keys match the slicer's canonical `layers.*`
@@ -53,6 +59,21 @@ class ModelAdapter:
     # `parallm.utils.max_tracks`). Takes a *text config*, returns a `ConstraintSet`.
     # Optional so lightweight/test adapters can omit it.
     constraints: "Callable[[Any], ConstraintSet] | None" = None
+    # ----- Capabilities -----
+    # Whether a rank's tracks may be MERGED into one wide track (`parallm.model.merge`).
+    # False for families whose per-track slabs have no verified concatenation rule (the
+    # MoE expert slabs) — the trainer then keeps the looped path instead of failing deep
+    # inside `build_per_track_text_config`.
+    supports_merged_tracks: bool = True
+
+    def layer_types_for(self, text_cfg) -> list[str]:
+        """The per-layer type list, via `get_layer_types` or the config default."""
+        if self.get_layer_types is not None:
+            return list(self.get_layer_types(text_cfg))
+        types = getattr(text_cfg, "layer_types", None)
+        if types is not None:
+            return list(types)
+        return ["full_attention"] * int(text_cfg.num_hidden_layers)
 
 
 _REGISTRY: dict[str, ModelAdapter] = {}
@@ -90,5 +111,6 @@ def list_registered() -> list[str]:
 
 
 # Import-time adapter registrations. Add one line per shipped adapter.
+from parallm.adapters import gpt_oss as _gpt_oss  # noqa: E402,F401
 from parallm.adapters import qwen3_5 as _qwen3_5  # noqa: E402,F401
 from parallm.adapters import qwen3_5_moe as _qwen3_5_moe  # noqa: E402,F401

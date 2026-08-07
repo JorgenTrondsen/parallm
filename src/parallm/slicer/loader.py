@@ -1,11 +1,12 @@
 """Stream a HF checkpoint's *text* weights to a bf16 state_dict for the slicer.
 
-One loader for every source we convert — plain-bf16, NVFP4/FP8 mixed-precision,
-VLM or text-only. It reads the safetensors shards, dequantizes each weight to
-bf16 (NVFP4 uint8 / FP8 float8 via compressed-tensors' tested decoders; everything
-else a passthrough cast), remaps the key to the slicer's canonical name, and drops
-the vision tower, MTP head, and scale siblings. The result feeds
-``slice_model_to_tracks`` via ``StateDictModel`` (no need to instantiate the model).
+One loader for every source we convert — plain-bf16, NVFP4/FP8/MXFP4
+mixed-precision, VLM or text-only. It reads the safetensors shards, dequantizes each
+weight to bf16 (NVFP4 uint8 / FP8 float8 via compressed-tensors' tested decoders,
+MXFP4 expert slabs via transformers' own decoder; everything else a passthrough
+cast), remaps the key to the slicer's canonical name, and drops the vision tower,
+MTP head, and scale siblings. The result feeds ``slice_model_to_tracks`` via
+``StateDictModel`` (no need to instantiate the model).
 """
 from __future__ import annotations
 
@@ -19,7 +20,15 @@ from safetensors import safe_open
 from compressed_tensors.compressors.nvfp4 import unpack_fp4_from_uint8
 from compressed_tensors.quantization import dequantize
 
-_SCALE_SIBLINGS = (".weight_scale", ".weight_scale_2", ".input_scale", ".k_scale", ".v_scale")
+_SCALE_SIBLINGS = (
+    ".weight_scale", ".weight_scale_2", ".input_scale", ".k_scale", ".v_scale",
+    # MXFP4 (gpt-oss): the block exponents ride alongside `<proj>_blocks` and are
+    # consumed with it, never emitted on their own.
+    "_scales",
+)
+# MXFP4 packs a 3-D expert slab as `<proj>_blocks` (uint8, two fp4 values per byte)
+# plus `<proj>_scales` (uint8 exponents); together they dequantize to `<proj>`.
+_MXFP4_BLOCKS = "_blocks"
 
 # Decoder layers appear as `model.language_model.layers.{i}.*` (VLM) or
 # `model.layers.{i}.*` (text-only); both remap to `layers.{i}.*`.
@@ -48,11 +57,27 @@ def dequant_weight(w: torch.Tensor, sib: "dict[str, torch.Tensor]") -> torch.Ten
     return w.to(torch.bfloat16)
 
 
+def dequant_mxfp4(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """One MXFP4 expert slab → bf16, via transformers' own decoder.
+
+    ``convert_moe_packed_tensors`` returns ``[E, in, out]`` — exactly the layout the
+    `GptOssExperts` parameters declare (`gate_up_proj [E, H, 2I]`,
+    `down_proj [E, I, H]`), so no transpose is needed here. Deferring to the library
+    decoder mirrors how `dequant_weight` defers to compressed-tensors for NVFP4.
+    """
+    from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+
+    return convert_moe_packed_tensors(blocks, scales, dtype=torch.bfloat16)
+
+
 def slicer_key(k: str) -> "str | None":
     """Map a checkpoint key to the slicer's canonical name, or None to drop
-    (vision tower, MTP head, scale siblings)."""
+    (vision tower, MTP head, scale siblings). MXFP4 `<proj>_blocks` maps to
+    `<proj>` — the packed pair becomes one dequantized param."""
     if any(k.endswith(s) for s in _SCALE_SIBLINGS):
         return None
+    if k.endswith(_MXFP4_BLOCKS):
+        k = k[: -len(_MXFP4_BLOCKS)]
     m = _LAYER.match(k)
     if m:
         return f"layers.{m.group(1)}.{m.group(2)}"
@@ -119,6 +144,12 @@ def stream_text_state_dict(hf_model: str, *, drop_lm_head: bool = False) -> "dic
             for k in (ks if ks is not None else list(present)):
                 key = slicer_key(k)
                 if key is None or (drop_lm_head and key == "lm_head.weight"):
+                    continue
+                if k.endswith(_MXFP4_BLOCKS):
+                    # blocks/scales are always written to the same shard (checked on
+                    # both gpt-oss releases), so the sibling is in `present`.
+                    scales_key = k[: -len(_MXFP4_BLOCKS)] + "_scales"
+                    sd[key] = dequant_mxfp4(f.get_tensor(k), f.get_tensor(scales_key))
                     continue
                 base = k.rsplit(".", 1)[0]
                 sib = {s: f.get_tensor(f"{base}.{s}")

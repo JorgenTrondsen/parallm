@@ -227,17 +227,10 @@ def distill_step(
     # ----- Scaffolding (embed broadcast + masks + rotary, shared by the loop) -----
     inputs_embeds = student.embed(input_ids)
     position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
-    from transformers.models.qwen3_5.modeling_qwen3_5 import create_causal_mask
-
-    causal_mask = create_causal_mask(
-        config=tm0.config,
-        inputs_embeds=inputs_embeds,
-        attention_mask=attention_mask,
-        past_key_values=None,
-        position_ids=text_position_ids,
-    )
-    linear_attn_mask = (
-        None if (attention_mask is not None and torch.all(attention_mask == 1)) else attention_mask
+    # The adapter owns the {layer_type: mask} mapping — same call the model's own
+    # walk makes, so the two loops cannot drift on masking.
+    layer_masks = student._adapter.build_masks(
+        tm0.config, inputs_embeds, attention_mask, text_position_ids
     )
     position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
 
@@ -304,11 +297,7 @@ def distill_step(
     block_input = share(inputs_embeds.detach())
 
     for i in range(L):
-        layer_mask = (
-            linear_attn_mask
-            if tm0.config.layer_types[i] == "linear_attention"
-            else causal_mask
-        )
+        layer_mask = layer_masks[tm0.config.layer_types[i]]
         h_attn = mix(i, block_input, layer_mask)
         is_boundary = i in sync_attn_set
         supervise = is_boundary or i == last or cfg.intra_window_mse

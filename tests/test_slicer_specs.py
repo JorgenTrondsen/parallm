@@ -13,6 +13,7 @@ from parallm.slicer.base import (
     PerHead,
     Replicated,
     Rowwise,
+    SummedBias,
 )
 
 
@@ -142,3 +143,42 @@ def test_colwise_rejects_indivisible_dim():
         assert "not divisible" in str(e)
         return
     raise AssertionError("expected ValueError")
+
+
+def test_summed_bias_owner_keeps_it_peers_get_zeros():
+    spec = SummedBias()
+    full = torch.randn(8)
+    slices = [spec.slice(full, t, 4) for t in range(4)]
+    assert torch.equal(slices[0], full)
+    for s in slices[1:]:
+        assert torch.count_nonzero(s) == 0
+    # every track keeps the full shape (it is added to a full-width output)
+    for s in slices:
+        assert tuple(s.shape) == spec.per_track_shape(tuple(full.shape), 4)
+
+
+def test_summed_bias_reassembles_by_summing():
+    spec = SummedBias()
+    full = torch.randn(3, 5)
+    slices = [spec.slice(full, t, 3) for t in range(3)]
+    assert torch.equal(spec.reassemble(slices), full)
+    # A DIVERGED set (what training produces) reassembles to its sum, which is the
+    # effective bias — not to any single copy.
+    diverged = [torch.randn(3, 5) for _ in range(3)]
+    assert torch.allclose(spec.reassemble(diverged), sum(diverged))
+
+
+def test_summed_bias_groups_are_singletons():
+    # Averaging these copies would not preserve their sum, so they never share a grad.
+    assert SummedBias().replication_groups(4) == [[0], [1], [2], [3]]
+    assert SummedBias().replication_groups(4, force_sync=True) == [[0], [1], [2], [3]]
+
+
+def test_summed_bias_merge_split_preserve_the_sum():
+    spec = SummedBias()
+    members = [torch.randn(6) for _ in range(3)]
+    merged = spec.merge(members, n_tracks=6)
+    assert torch.allclose(merged, sum(members))
+    back = spec.split(merged, fuse=3, n_tracks=6)
+    assert len(back) == 3
+    assert torch.allclose(sum(back), merged)

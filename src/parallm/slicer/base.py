@@ -39,22 +39,35 @@ class SlicerSpec(Protocol):
     def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]: ...
 
 
-def align_chunk(chunk: int, align: int = 64) -> int:
-    """Round a zero-padded per-track slab up to a tensor-core-friendly multiple.
+def align_chunk(chunk: int, align: int | None = None) -> int:
+    """Round a zero-padded per-track slab up to a friendlier multiple.
 
-    Measured on the 27B (bf16, M=2048, K=5120): a **726**-wide GEMM — `ceil(17408/24)`
-    — runs at 101 TFLOP/s, while the **768**-wide one that does 5.8% MORE work runs
-    at 160. Since the extra lanes are zeros (exact for SwiGLU), rounding up is free
-    quality and ~1.5x on the dense model's dominant GEMM.
+    ``align=None`` (the default) is the THROUGHPUT alignment: round to 64. Measured
+    on the 27B (bf16, M=2048, K=5120): a **726**-wide GEMM — `ceil(17408/24)` — runs
+    at 101 TFLOP/s, while the **768**-wide one that does 5.8% MORE work runs at 160.
+    Since the extra lanes are zeros (exact for SwiGLU), rounding up is free quality
+    and ~1.5x on the dense model's dominant GEMM. It is SKIPPED when the rounding
+    would inflate the slab by more than 1/8 — that only happens at tiny (test-sized)
+    widths, where there is no tensor-core win anyway.
 
-    Skipped when the rounding would inflate the slab by more than 1/8 — that only
-    happens at tiny (test-sized) widths, where there is no tensor-core win anyway.
+    An explicit ``align`` is a KERNEL REQUIREMENT and is applied unconditionally: an
+    unaligned width there is a crash, not a slowdown, so the 1/8 escape hatch would
+    be actively wrong. `torch._grouped_mm` (the MoE `grouped_mm` experts path)
+    rejects a contracted dim whose row stride is not a multiple of 16 bytes —
+    "strides should be multiple of 16 bytes" — so a bf16 per-track expert width must
+    be a multiple of 8 whatever the padding costs. Falling back instead is 4.7x
+    slower (measured, 32 experts at hidden 2880: 3.6 vs 16.9 ms/MLP call).
     """
-    up = -(-chunk // align) * align
+    if align is not None:
+        return -(-chunk // align) * align
+    up = -(-chunk // 64) * 64
     return up if up * 8 <= chunk * 9 else chunk
 
 
-def _even_chunk(size: int, n_tracks: int, pad_full_size: int | None, label: str) -> int:
+def _even_chunk(
+    size: int, n_tracks: int, pad_full_size: int | None, label: str,
+    align: int | None = None,
+) -> int:
     """Per-track chunk along a split dim. Without `pad_full_size` the dim must
     divide evenly; with it the chunk rounds *up* (and to a GEMM-friendly multiple)
     and short slices are zero-filled."""
@@ -64,7 +77,7 @@ def _even_chunk(size: int, n_tracks: int, pad_full_size: int | None, label: str)
         return size // n_tracks
     if size != pad_full_size:
         raise ValueError(f"{label}: expected dim size {pad_full_size}, got {size}")
-    return align_chunk(-(-size // n_tracks))
+    return align_chunk(-(-size // n_tracks), align)
 
 
 def _cat_merge(slices: list[torch.Tensor], dim: int, chunk: int | None = None) -> torch.Tensor:
@@ -122,9 +135,12 @@ class Colwise:
 
     dim: int = 0  # output dim of nn.Linear weight is 0
     pad_full_size: int | None = None
+    align: int | None = None  # see `align_chunk`: None = throughput, int = hard requirement
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
-        chunk = _even_chunk(weight.shape[self.dim], n_tracks, self.pad_full_size, "Colwise")
+        chunk = _even_chunk(
+            weight.shape[self.dim], n_tracks, self.pad_full_size, "Colwise", self.align
+        )
         return _chunk_slice(weight, self.dim, track_idx, chunk)
 
     def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
@@ -135,13 +151,17 @@ class Colwise:
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         out = list(full_shape)
-        out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Colwise")
+        out[self.dim] = _even_chunk(
+            out[self.dim], n_tracks, self.pad_full_size, "Colwise", self.align
+        )
         return tuple(out)
 
     def _merge_chunk(self, n_tracks: int) -> int | None:
         if self.pad_full_size is None:
             return None
-        return _even_chunk(self.pad_full_size, n_tracks, self.pad_full_size, "Colwise")
+        return _even_chunk(
+            self.pad_full_size, n_tracks, self.pad_full_size, "Colwise", self.align
+        )
 
     def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
         return _cat_merge(slices, self.dim, self._merge_chunk(n_tracks))
@@ -161,9 +181,12 @@ class Rowwise:
 
     dim: int = 1  # input dim of nn.Linear weight is 1
     pad_full_size: int | None = None
+    align: int | None = None  # see `align_chunk`: None = throughput, int = hard requirement
 
     def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
-        chunk = _even_chunk(weight.shape[self.dim], n_tracks, self.pad_full_size, "Rowwise")
+        chunk = _even_chunk(
+            weight.shape[self.dim], n_tracks, self.pad_full_size, "Rowwise", self.align
+        )
         return _chunk_slice(weight, self.dim, track_idx, chunk)
 
     def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
@@ -174,13 +197,17 @@ class Rowwise:
 
     def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
         out = list(full_shape)
-        out[self.dim] = _even_chunk(out[self.dim], n_tracks, self.pad_full_size, "Rowwise")
+        out[self.dim] = _even_chunk(
+            out[self.dim], n_tracks, self.pad_full_size, "Rowwise", self.align
+        )
         return tuple(out)
 
     def _merge_chunk(self, n_tracks: int) -> int | None:
         if self.pad_full_size is None:
             return None
-        return _even_chunk(self.pad_full_size, n_tracks, self.pad_full_size, "Rowwise")
+        return _even_chunk(
+            self.pad_full_size, n_tracks, self.pad_full_size, "Rowwise", self.align
+        )
 
     def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
         return _cat_merge(slices, self.dim, self._merge_chunk(n_tracks))
@@ -329,6 +356,55 @@ class OwnerOnly:
         # it), so the owner's position within its group is owner_track % fuse.
         own = self.owner_track % fuse
         return [merged.detach().clone() if i == own else None for i in range(fuse)]
+
+
+@dataclass(frozen=True)
+class SummedBias:
+    """Additive bias on a ROW-PARALLEL output (``o_proj.bias``, ``experts.down_proj_bias``).
+
+    A row-parallel projection makes every track produce a *partial sum* that the next
+    `SyncBoundary` all-reduce completes. A `Replicated` bias would therefore be added
+    N times. Instead the owner track keeps the full bias and its peers hold zeros, so
+    the summed partials carry it exactly once — exact in bf16, unlike a ``w / N`` split.
+
+    The copies are deliberately free to DIVERGE under training (singleton replication
+    groups): only their SUM is the effective bias, so there is nothing to keep
+    bit-identical and each track's copy is real extra capacity.
+    """
+
+    owner_track: int = 0
+
+    def slice(self, weight: torch.Tensor, track_idx: int, n_tracks: int) -> torch.Tensor:
+        if track_idx == self.owner_track:
+            return weight.detach().clone()
+        return torch.zeros_like(weight)
+
+    def reassemble(self, slices: list[torch.Tensor]) -> torch.Tensor:
+        out = slices[0].detach().clone()
+        for s in slices[1:]:
+            out = out + s
+        return out.contiguous()
+
+    def per_track_shape(self, full_shape: tuple[int, ...], n_tracks: int) -> tuple[int, ...]:
+        return tuple(full_shape)
+
+    def replication_groups(self, n_tracks: int, force_sync: bool = False) -> list[list[int]]:
+        # `force_sync` is accepted for signature uniformity and ignored: averaging these
+        # copies would not preserve their sum, which is the only thing that is meaningful.
+        return [[t] for t in range(n_tracks)]
+
+    def merge(self, slices: list[torch.Tensor], n_tracks: int) -> torch.Tensor:
+        # The merged track's row-parallel GEMM reduces over the members' concatenated
+        # input dim, i.e. it sums their outputs — so one bias equal to the members' sum.
+        return self.reassemble(slices)
+
+    def split(self, merged: torch.Tensor, fuse: int, n_tracks: int) -> list[torch.Tensor]:
+        # Any split whose sum is `merged` is exact; put it all on the group's owner.
+        own = self.owner_track % fuse
+        return [
+            merged.detach().clone() if i == own else torch.zeros_like(merged)
+            for i in range(fuse)
+        ]
 
 
 @dataclass(frozen=True)
@@ -681,31 +757,57 @@ class GatedQColwise:
 LayerSpec = dict[str, "SlicerSpec"]
 
 
+# A family's token-mixer spec table: layer type -> (module prefix under the decoder
+# layer, spec builder). Deriving `valid_layer_types` from its keys is what stops the
+# adapter's declared type list drifting from the types it can actually slice.
+AttentionSpecMap = dict[str, "tuple[str, object]"]
+
+
 def build_decoder_layer_specs(
     text_cfg,
     layer_type: str,
     *,
-    full_attention_specs,
-    linear_attention_specs,
+    attention_specs: AttentionSpecMap,
     mlp_specs,
 ) -> LayerSpec:
-    """Assemble one decoder layer's specs: replicated norms + the attention specs
-    for `layer_type` (prefixed `self_attn.`/`linear_attn.`) + the MLP specs
-    (prefixed `mlp.`). Model families supply the three spec functions; this shape
-    is identical across dense and MoE.
+    """Assemble one decoder layer's specs: replicated norms + the token-mixer specs
+    for `layer_type` (under its own module prefix) + the MLP specs (prefixed `mlp.`).
+
+    `attention_specs` maps every layer type the family supports to
+    ``(module_prefix, spec_fn)`` — Qwen3.5 has ``full_attention -> self_attn`` and
+    ``linear_attention -> linear_attn``; gpt-oss has ``full_attention`` and
+    ``sliding_attention`` both under ``self_attn`` (they differ only by mask). This
+    shape is identical across dense and MoE.
     """
     out: LayerSpec = {
         "input_layernorm.weight": Replicated(),
         "post_attention_layernorm.weight": Replicated(),
     }
-    if layer_type == "full_attention":
-        prefix, specs = "self_attn", full_attention_specs(text_cfg)
-    elif layer_type == "linear_attention":
-        prefix, specs = "linear_attn", linear_attention_specs(text_cfg)
-    else:
-        raise ValueError(f"Unknown layer_type {layer_type!r}")
-    for k, v in specs.items():
+    entry = attention_specs.get(layer_type)
+    if entry is None:
+        raise ValueError(
+            f"Unknown layer_type {layer_type!r}; this family slices {sorted(attention_specs)}"
+        )
+    prefix, spec_fn = entry
+    for k, v in spec_fn(text_cfg).items():
         out[f"{prefix}.{k}"] = v
     for k, v in mlp_specs(text_cfg).items():
         out[f"mlp.{k}"] = v
     return out
+
+
+def standard_top_level_specs(_text_cfg) -> LayerSpec:
+    """Params outside any decoder layer: embeddings, final norm, lm head.
+
+    Identical for every family so far, so it is the default rather than per-family
+    boilerplate. `embed_tokens` and `lm_head` live on track 0 only; the input embedding
+    is broadcast to peer tracks via the start-of-forward sync (zero-padded all-reduce),
+    and lm_head is applied locally on track 0 to the synced post-final-norm hidden
+    state. `norm.weight` stays replicated because every track applies the final RMSNorm
+    to its (synced) hidden state.
+    """
+    return {
+        "embed_tokens.weight": OwnerOnly(owner_track=0),
+        "norm.weight": Replicated(),
+        "lm_head.weight": OwnerOnly(owner_track=0),
+    }

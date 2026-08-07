@@ -82,10 +82,20 @@ def test_qwen3_5_adapter_top_level_specs_match_direct_call():
         assert type(via[k]) is type(direct[k])
 
 
-def test_qwen3_5_adapter_get_layer_types_reads_from_config():
+def test_qwen3_5_adapter_layer_types_read_from_config():
+    """No `get_layer_types` override: the default reads `text_cfg.layer_types`."""
     adapter = get_adapter_for_config(SimpleNamespace(model_type="qwen3_5_text"))
+    assert adapter.get_layer_types is None
     cfg = SimpleNamespace(layer_types=["linear_attention", "full_attention"])
-    assert adapter.get_layer_types(cfg) == ["linear_attention", "full_attention"]
+    assert adapter.layer_types_for(cfg) == ["linear_attention", "full_attention"]
+
+
+def test_layer_types_default_is_homogeneous_full_attention():
+    """A config with no `layer_types` (a non-hybrid family) defaults to all-full."""
+    adapter = get_adapter_for_config(SimpleNamespace(model_type="qwen3_5_text"))
+    assert adapter.layer_types_for(SimpleNamespace(num_hidden_layers=3)) == (
+        ["full_attention"] * 3
+    )
 
 
 def test_register_then_resolve_synthetic_adapter():
@@ -118,13 +128,13 @@ def test_register_then_resolve_synthetic_adapter():
         valid_layer_types=("self_attention",),
         track_text_model_cls=_FakeTrackModel,
         build_per_track_text_config=_fake_build_pt_cfg,
-        state_dict_layer_prefixes=("self_attn", "mlp"),
+        build_masks=lambda *a: {},
     )
     register_model_adapter(fake)
 
     resolved = get_adapter_for_config(SimpleNamespace(model_type="pt_test_synth_model"))
     assert resolved is fake
-    assert resolved.get_layer_types(SimpleNamespace(num_hidden_layers=3)) == [
+    assert resolved.layer_types_for(SimpleNamespace(num_hidden_layers=3)) == [
         "self_attention",
         "self_attention",
         "self_attention",
@@ -160,7 +170,7 @@ def test_re_registration_overwrites():
         valid_layer_types=(),
         track_text_model_cls=_M,
         build_per_track_text_config=_build,
-        state_dict_layer_prefixes=(),
+        build_masks=lambda *a: {},
     )
     second = ModelAdapter(
         model_type="pt_test_overwrite",
@@ -170,7 +180,7 @@ def test_re_registration_overwrites():
         valid_layer_types=("self_attention",),  # differs
         track_text_model_cls=_M,
         build_per_track_text_config=_build,
-        state_dict_layer_prefixes=("self_attn",),  # differs
+        build_masks=lambda *a: {},
     )
     register_model_adapter(first)
     register_model_adapter(second)
@@ -227,7 +237,7 @@ def test_slicer_engine_uses_adapter_layer_types(monkeypatch):
         valid_layer_types=("linear_attention", "full_attention"),
         track_text_model_cls=PTTrackTextModel,
         build_per_track_text_config=build_per_track_text_config,
-        state_dict_layer_prefixes=("self_attn", "linear_attn", "mlp"),
+        build_masks=lambda *a: {},
     )
     register_model_adapter(synthetic)
     cfg.model_type = "pt_test_engine_routes_through_adapter"

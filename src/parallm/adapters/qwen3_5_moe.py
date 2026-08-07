@@ -15,12 +15,13 @@ from parallm.model.tracks.qwen3_5_moe import (
     PTTrackTextModel,
     build_per_track_text_config,
 )
-from parallm.slicer.qwen3_5_moe import moe_decoder_layer_specs, top_level_specs
+from parallm.slicer.qwen3_5_moe import (
+    VALID_LAYER_TYPES,
+    build_masks,
+    moe_decoder_layer_specs,
+    top_level_specs,
+)
 from parallm.utils.max_tracks import ConstraintSet
-
-
-def _qwen3_5_moe_get_layer_types(text_cfg: Any) -> list[str]:
-    return list(text_cfg.layer_types)
 
 
 def _qwen3_5_moe_constraints(cfg: Any) -> ConstraintSet:
@@ -43,19 +44,17 @@ QWEN3_5_MOE_ADAPTER = ModelAdapter(
     model_type="qwen3_5_moe_text",
     layer_specs=moe_decoder_layer_specs,
     top_level_specs=top_level_specs,
-    get_layer_types=_qwen3_5_moe_get_layer_types,
-    valid_layer_types=("full_attention", "linear_attention"),
+    valid_layer_types=VALID_LAYER_TYPES,
     track_text_model_cls=PTTrackTextModel,
     build_per_track_text_config=build_per_track_text_config,
-    state_dict_layer_prefixes=(
-        "self_attn",
-        "linear_attn",
-        "mlp",
-        "input_layernorm",
-        "post_attention_layernorm",
-    ),
+    build_masks=build_masks,
     full_text_model_cls=Qwen3_5MoeTextModel,
     constraints=_qwen3_5_moe_constraints,
+    # The merged-track speedup targets the dense 27B's per-track launch cost; the MoE
+    # MLP is expert-group-bound, so merging buys ~nothing and the expert slabs' merge
+    # rule is unverified. Declaring it here makes the trainer fall back to the looped
+    # path instead of failing inside `build_per_track_text_config`.
+    supports_merged_tracks=False,
 )
 
 register_model_adapter(QWEN3_5_MOE_ADAPTER)

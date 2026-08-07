@@ -34,12 +34,19 @@ from parallm.slicer.base import (
     build_decoder_layer_specs,
 )
 from parallm.slicer.qwen3_5 import (
-    full_attention_specs,
-    linear_attention_specs,
+    ATTENTION_SPECS,  # attention slicing is byte-identical to dense Qwen3.5
+    VALID_LAYER_TYPES,
+    build_masks,  # re-exported for the adapter (same hybrid mask mapping)
     top_level_specs,  # re-exported for the adapter (embeddings/norm/lm_head)
 )
 
-__all__ = ["moe_mlp_specs", "moe_decoder_layer_specs", "top_level_specs"]
+__all__ = [
+    "moe_mlp_specs",
+    "moe_decoder_layer_specs",
+    "top_level_specs",
+    "build_masks",
+    "VALID_LAYER_TYPES",
+]
 
 
 def moe_mlp_specs(text_cfg: Any) -> LayerSpec:
@@ -68,7 +75,6 @@ def moe_decoder_layer_specs(text_cfg: Any, layer_type: str) -> LayerSpec:
     return build_decoder_layer_specs(
         text_cfg,
         layer_type,
-        full_attention_specs=full_attention_specs,
-        linear_attention_specs=linear_attention_specs,
+        attention_specs=ATTENTION_SPECS,
         mlp_specs=moe_mlp_specs,
     )

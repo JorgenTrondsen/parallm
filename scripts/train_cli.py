@@ -237,7 +237,7 @@ def main() -> int:
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--grad-accum-steps", type=int, default=1)
     p.add_argument("--lr", type=float, default=6e-5)
-    p.add_argument("--optim", choices=["adamw", "adafactor"], default="adamw",
+    p.add_argument("--optim", choices=["adamw", "adafactor"], default="adafactor",
                    help="adamw = fused bf16 default (27B/N=8, ~4 B/param state); adafactor "
                         "(factored 2nd moment, no 1st moment) ≈ 0 optimizer state (~0.5 GB/rank "
                         "vs 8 GB) — what fits N=16 K=2 on a 40 GB card (the 35B recipe) and "
@@ -315,6 +315,9 @@ def main() -> int:
     torch.manual_seed(args.seed)
 
     manifest = load_manifest(args.checkpoint_dir)
+    cfg_hf = AutoConfig.from_pretrained(args.hf_model)
+    text_cfg = cfg_hf.text_config if hasattr(cfg_hf, "text_config") else cfg_hf
+    adapter = get_adapter_for_config(text_cfg)
     # Merge the rank's WHOLE track set into one wide track (concatenated slabs)
     # whenever it holds more than one: 1/K the kernels and one full-width residual
     # stream instead of K (27B N=24: 6.4-7.7 -> ~3 s/step). `exec_groups` then says
@@ -331,10 +334,15 @@ def main() -> int:
     # per-parameter rescalings that adafactor/Adam largely absorb, and both already
     # applied to every merged run; they are why the looped path is the equivalence
     # reference and not a step-for-step trajectory reference.
+    #
+    # Families whose per-track slabs have no verified concatenation rule (the MoE
+    # ones) declare `supports_merged_tracks=False` and keep the looped path — the
+    # alternative is failing deep inside `build_per_track_text_config`.
     F = args.fuse_tracks
     tracks_per_rank = manifest.n_tracks // dist.get_world_size()
     merge_group = exec_groups = 1
-    if tracks_per_rank > 1 and tracks_per_rank % F == 0 and not args.no_merge_fused:
+    can_merge = adapter.supports_merged_tracks and not args.no_merge_fused
+    if tracks_per_rank > 1 and tracks_per_rank % F == 0 and can_merge:
         if args.sync_attention_heads:
             raise SystemExit(
                 "--sync-attention-heads cannot be merged: it keeps each kv-group's "
@@ -345,8 +353,6 @@ def main() -> int:
     layout = build_groups(n_tracks=manifest.n_tracks // merge_group)
     teacher_dir = args.teacher_dir or args.checkpoint_dir
 
-    cfg_hf = AutoConfig.from_pretrained(args.hf_model)
-    text_cfg = cfg_hf.text_config if hasattr(cfg_hf, "text_config") else cfg_hf
     num_layers = text_cfg.num_hidden_layers
     if args.sync_indices is not None:
         sync_layers = sorted(int(x) for x in args.sync_indices.split(",") if x.strip())
@@ -424,7 +430,6 @@ def main() -> int:
         lm_head.weight = torch.nn.Parameter(w, requires_grad=False)
         lm_head = lm_head.to(torch.bfloat16).to(torch.cuda.current_device())
 
-    adapter = get_adapter_for_config(text_cfg)
     plan = build_replication_plan(
         student, adapter=adapter, text_cfg=text_cfg, layout=layout,
         force_sync=args.sync_attention_heads,
