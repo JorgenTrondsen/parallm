@@ -16,9 +16,12 @@ from __future__ import annotations
 import torch
 from transformers.optimization import Adafactor
 
+from parallm.model import seam
 from parallm.model.pt_model import HostResidentLayers, PTWrappedModel
 from parallm.train.distill import (
     DistillConfig,
+    TF_CKPT_MIN_SEGMENT,
+    _max_segment_layers,
     capture_sets,
     distill_step,
     freeze_slice_teacher,
@@ -110,3 +113,55 @@ def test_optim_in_backward_matches_step_after_backward():
     # _build seeds torch, so both runs start from identical weights.
     for a, b in zip(_run(in_backward=False), _run(in_backward=True)):
         assert torch.equal(a, b), f"param drifts by {(a - b).abs().max().item()}"
+
+
+def test_max_segment_layers_picks_the_tf_checkpoint_policy():
+    """The TF loop backwards at every boundary, so its live graph is ONE segment.
+
+    Checkpointing a segment shorter than the threshold is pure recompute on the
+    launch-bound hot path — it saves no memory, because the graph is freed at the
+    next boundary either way. d1b (every layer a boundary) always skipped it; D=2 is
+    the case this generalisation adds.
+    """
+    L = 24
+    cases = {
+        1: list(range(L)),                 # d1b: every layer, segment 1
+        2: list(range(1, L, 2)),           # D=2: segment 2
+        4: list(range(3, L, 4)),           # D=4: segment 4
+        9: [0, 1, 5, 9, 14, L - 1],        # uneven: the LONGEST stretch is what binds
+    }
+    for want, sched in cases.items():
+        sync_attn, _ = capture_sets(sched, L)
+        got = _max_segment_layers(sync_attn, L)
+        assert got == want, f"schedule {sched[:4]}...: max segment {got}, want {want}"
+        # The policy this feeds: hold short segments, checkpoint long ones.
+        assert (got > TF_CKPT_MIN_SEGMENT) == (want > 2)
+
+
+def test_tf_checkpointing_is_numerically_inert():
+    """Rail 3 — TF-loop checkpointing must trade memory for time and NOTHING else.
+
+    Recompute is exact, so flipping the policy is pure scheduling: every gradient
+    must land identical. This is what lets the segment-length threshold be tuned on
+    a `--mem-report` peak alone, without re-validating downstream.
+    """
+    sched = list(range(3, N_LAYERS, 4))  # D=4 ⇒ segment 4 ⇒ checkpointed by default
+
+    def grads(min_segment: int):
+        cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=sched)
+        pt.set_sync_phase("post-attn")
+        pt.use_checkpoint = True
+        pt.train()
+        teacher = _teacher(cfg, tracks)
+        dcfg = DistillConfig(sync_layer_indices=tuple(sched),
+                             tf_ckpt_min_segment=min_segment)
+        distill_step(pt, teacher, pt.lm_head, _batch(cfg), dcfg)
+        return [(n, p.grad.detach().clone())
+                for n, p in pt.named_parameters() if p.grad is not None]
+
+    # 0 checkpoints every segment (the pre-2026-08-07 behaviour); 99 never does.
+    on, off = grads(min_segment=0), grads(min_segment=99)
+    assert on and len(on) == len(off)
+    for (n, a), (_, b) in zip(on, off):
+        assert torch.allclose(a, b, rtol=0, atol=1e-6), \
+            f"{n}: checkpointing moved the gradient by {(a - b).abs().max().item():.3e}"

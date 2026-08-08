@@ -151,7 +151,16 @@ def main() -> int:
                    help="Path to a packed replica pool: score the student through the "
                         "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
                         "of the plain PT forward — the deployed decode math.")
+    p.add_argument("--moe-experts", choices=["auto", "dense", "grouped_mm"], default="auto",
+                   help="How a per-track MoE evaluates its experts (see train_cli). Exposed "
+                        "here because scoring ONE checkpoint under both settings is the "
+                        "equivalence check: lm-harness is bit-deterministic, so any macro "
+                        "difference on identical weights is the implementation, not noise.")
     args = p.parse_args()
+
+    from parallm.model.moe_dense import set_experts_policy
+
+    set_experts_policy(args.moe_experts)
 
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))

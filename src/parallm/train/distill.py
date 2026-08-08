@@ -46,6 +46,7 @@ from torch import nn
 from parallm.model.pt_model import PTWrappedModel
 from parallm.model.seam import checkpointed_halves
 from parallm.train.losses import block_mse, block_split
+from parallm.train.profile import PhaseTimer
 
 
 @dataclass
@@ -67,6 +68,10 @@ class DistillConfig:
     lambda_mag: float | None = None
     intra_window_mse: bool = False
     ce_chunk_size: int = 256
+    # Longest own-carry segment the TF loop holds uncheckpointed; see
+    # TF_CKPT_MIN_SEGMENT. 0 restores the pre-2026-08-07 "always checkpoint at D>1"
+    # behaviour, which is what a step-time control arm wants.
+    tf_ckpt_min_segment: int = 2
 
 
 def freeze_slice_teacher(model: PTWrappedModel) -> PTWrappedModel:
@@ -117,6 +122,30 @@ def capture_sets(
         set(range(num_layers)) - post_attn - {last} if intra_window_mse else set()
     )
     return post_attn, post_mlp
+
+
+# Default for `DistillConfig.tf_ckpt_min_segment`: the longest own-carry segment (in
+# layers) the TF loop will hold uncheckpointed. A segment of n layers is 2n sublayers
+# across K local tracks; at the F=1/N=64 shape (B=1, T=2048, H=2880, K=8) that is
+# ~0.75 GB per layer of segment, so 2 costs ~1.5 GB against a 15.9 GiB peak — worth
+# paying to delete a whole recompute of the TF forward. Raise it only with a
+# `--mem-report` peak to back it up: rank 0 shares its card with a foreign job.
+TF_CKPT_MIN_SEGMENT = 2
+
+
+def _max_segment_layers(sync_attn_set: set[int], num_layers: int) -> int:
+    """Layers in the longest stretch the TF loop carries between backwards.
+
+    The loop flushes at every boundary and again at the final layer, so the live
+    graph is one segment — `[0..b0]`, `(b0..b1]`, ... `(b_last..L-1]`. At D=1 every
+    non-last layer is a boundary and every segment is 1; at D=2 they are all 2.
+    """
+    flushes = sorted(sync_attn_set | {num_layers - 1})
+    prev, longest = -1, 0
+    for f in flushes:
+        longest = max(longest, f - prev)
+        prev = f
+    return longest
 
 
 def ce_chunked(
@@ -188,6 +217,7 @@ def distill_step(
     batch: dict[str, torch.Tensor],
     cfg: DistillConfig,
     loss_scale: float = 1.0,
+    prof: "PhaseTimer | None" = None,
 ) -> dict[str, torch.Tensor]:
     """One heal step (backward done internally; caller syncs grads + steps).
 
@@ -202,6 +232,7 @@ def distill_step(
     scores the same evaluated FREE-RUNNING as one trained half on them, so
     exposure bias does not bind along the depth axis here.
     """
+    prof = prof if prof is not None else PhaseTimer()  # disabled null object
     input_ids = batch["input_ids"]
     attention_mask = batch.get("attention_mask")
     labels = batch["labels"]
@@ -220,11 +251,14 @@ def distill_step(
     # by flipping teacher_forward's return_hidden_pre_lm_head to False: that
     # makes PTWrappedModel.forward materialize a (B, T, V) logits tensor on the
     # lm_head owner (~2 GB bf16 at T=2048, V=248320).
-    _, t_caps = teacher_forward(
-        teacher, input_ids, attention_mask,
-        post_attn_layers=sync_attn_set, post_mlp_layers=post_mlp_set,
-    )
+    with prof.phase("teacher_fwd"):
+        _, t_caps = teacher_forward(
+            teacher, input_ids, attention_mask,
+            post_attn_layers=sync_attn_set, post_mlp_layers=post_mlp_set,
+        )
     # ----- Scaffolding (embed broadcast + masks + rotary, shared by the loop) -----
+    prof_scaffold = prof.phase("scaffold")
+    prof_scaffold.__enter__()
     inputs_embeds = student.embed(input_ids)
     position_ids, text_position_ids = tm0._resolve_position_ids(inputs_embeds, None)
     # The adapter owns the {layer_type: mask} mapping — same call the model's own
@@ -233,6 +267,7 @@ def distill_step(
         tm0.config, inputs_embeds, attention_mask, text_position_ids
     )
     position_embeddings = tm0.rotary_emb(inputs_embeds, position_ids)
+    prof_scaffold.__exit__(None, None, None)
 
     def tap_loss(h_synced: torch.Tensor, t_target: torch.Tensor) -> torch.Tensor:
         if cfg.lambda_mag is not None:
@@ -251,19 +286,28 @@ def distill_step(
     seg_count = 0
 
     def _flush(sl, sc):
+        # One backward per boundary segment, so the graph is freed each time and
+        # peak memory is ~one segment.
         if sc > 0 and cfg.lambda_block != 0.0 and sl.requires_grad:
-            (cfg.lambda_block * (sl / sc) * loss_scale).backward()
+            with prof.phase("tf_backward"):
+                (cfg.lambda_block * (sl / sc) * loss_scale).backward()
 
     # Per-sublayer activation checkpointing bounds the peak graph to ONE
-    # recomputed layer regardless of own-carry segment length. But at d1b (every
-    # non-last layer a boundary) each segment is length-1 and flushed
-    # immediately, so checkpointing the TF loop saves ZERO memory and is pure
-    # recompute on the launch-bound hot path — skip it there. The FR forward
-    # below keeps the model's own checkpointing regardless (it holds all L layers).
-    # ponytail: gapless <=> D=1; a stray missing boundary => one length-2 segment,
-    # still memory-safe uncheckpointed.
-    gapless = len(sync_attn_set) >= L - 1
-    use_ckpt = student.use_checkpoint and torch.is_grad_enabled() and not gapless
+    # recomputed layer regardless of own-carry segment length. But the TF loop
+    # backwards at EVERY boundary, so its live graph is one SEGMENT, not the whole
+    # stack — and a short segment is cheap enough to hold uncheckpointed. Below the
+    # threshold, checkpointing is pure recompute on the launch-bound hot path.
+    # Measured share it comes out of: `tf_backward` is 36% of an F=1/N=64 step and
+    # runs 4.7x its own forward where checkpoint+grad predicts ~3x.
+    #
+    # The FR forward below keeps the model's own checkpointing regardless — that one
+    # holds all L layers and genuinely needs it.
+    max_seg = _max_segment_layers(sync_attn_set, L)
+    use_ckpt = (
+        student.use_checkpoint
+        and torch.is_grad_enabled()
+        and max_seg > cfg.tf_ckpt_min_segment
+    )
 
     # Sublayer/sync/share adapters, so ONE loop body serves both track
     # representations — this walk and `pt_model._run_post_attn_stack` must agree
@@ -296,6 +340,8 @@ def distill_step(
 
     block_input = share(inputs_embeds.detach())
 
+    prof_block = prof.phase("tf_block_loop")
+    prof_block.__enter__()
     for i in range(L):
         layer_mask = layer_masks[tm0.config.layer_types[i]]
         h_attn = mix(i, block_input, layer_mask)
@@ -325,6 +371,7 @@ def distill_step(
             _flush(seg_loss, seg_count)
         else:
             block_input = new_h  # carry the partial
+    prof_block.__exit__(None, None, None)
 
     n_taps = max(1, len(layer_relmse))
     block_loss_val = block_loss_val / n_taps
@@ -339,20 +386,25 @@ def distill_step(
     # while together they reach 0.595.
     ce_val = torch.zeros((), device=device)
     if need_ce:
-        hidden, _ = student(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_sync_hiddens=False,
-            return_hidden_pre_lm_head=True,
-        )
-        ce_val, grad_h = ce_chunked(
-            hidden, lm_head, labels,
-            lambda_ce=cfg.lambda_ce,
-            chunk_size=cfg.ce_chunk_size,
-            loss_scale=loss_scale,
-        )
+        with prof.phase("fr_forward"):
+            hidden, _ = student(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_sync_hiddens=False,
+                return_hidden_pre_lm_head=True,
+            )
+        with prof.phase("ce_chunked"):
+            ce_val, grad_h = ce_chunked(
+                hidden, lm_head, labels,
+                lambda_ce=cfg.lambda_ce,
+                chunk_size=cfg.ce_chunk_size,
+                loss_scale=loss_scale,
+            )
         if grad_h is not None:
-            torch.autograd.backward([hidden], [grad_h])
+            # Backward through the checkpointed full forward: this RECOMPUTES every
+            # sublayer, so it carries a whole extra forward's worth of work.
+            with prof.phase("fr_backward"):
+                torch.autograd.backward([hidden], [grad_h])
 
     total_val = cfg.lambda_block * block_loss_val + cfg.lambda_ce * ce_val
     return {

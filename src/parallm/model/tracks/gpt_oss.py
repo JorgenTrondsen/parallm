@@ -33,6 +33,7 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
     GptOssRotaryEmbedding,
 )
 
+from parallm.model.moe_dense import choose_experts_impl
 from parallm.model.tracks.base import PTTrackTextModelBase, apply_common_per_track_sizing
 from parallm.slicer.base import align_chunk
 from parallm.slicer.gpt_oss import EXPERT_WIDTH_ALIGN
@@ -80,7 +81,13 @@ def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
     # `_apply_gate`, so the swiglu clamp is preserved — exact in fp32, relL2 ~3e-3 in
     # bf16 from the different accumulation order) and 4.7x faster than the loop
     # (measured 3.6 vs 16.9 ms/MLP call, 32 experts at hidden 2880, T=2048).
-    # `batched_mm` was measured too and is WORSE than the loop (40 ms) and OOMs at
-    # wider slabs — do not re-try it.
-    cfg._experts_implementation = "grouped_mm"
+    #
+    # ...but `grouped_mm` itself stops being the right shape once the slab is narrow
+    # enough, because `torch._grouped_mm` LOOPS over experts below SM90 and the sort it
+    # needs costs more than the GEMMs it feeds. `choose_experts_impl` switches to dense
+    # evaluation below the measured width crossover — which is exactly where max tracks
+    # puts us. See `parallm.model.moe_dense`.
+    cfg._experts_implementation = choose_experts_impl(
+        int(cfg.num_local_experts), int(cfg.intermediate_size)
+    )
     return cfg

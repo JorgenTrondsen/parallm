@@ -25,6 +25,7 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from parallm.adapters import get_adapter_for_config
 from parallm.dist.groups import build_groups
 from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
+from parallm.train.profile import PhaseTimer
 from parallm.train.data import (
     CalibrationDataConfig,
     PackedTokenStream,
@@ -59,6 +61,86 @@ from parallm.utils.checkpoint import load_manifest, load_track, load_track_keys,
 def _log(rank: int, msg: str) -> None:
     if rank == 0:
         print(msg, flush=True)
+
+
+@contextmanager
+def _eval_compile_guard():
+    """Force the seam back to eager for the duration of an lm-eval pass.
+
+    `parallm.model.seam` resolves the compiled callables per `checkpointed_halves`
+    call, so swapping the registry out and back is enough — no re-compilation, and
+    the training graphs survive because `torch.compile` caches on the function
+    object, which we hand straight back.
+    """
+    from parallm.model import seam
+
+    saved = dict(seam._COMPILED)
+    seam._COMPILED.clear()
+    try:
+        yield
+    finally:
+        seam._COMPILED.update(saved)
+
+
+class _KernelWindow:
+    """`torch.profiler` over a fixed mid-run window, aggregated AFTER the loop.
+
+    Starts at `_WARM` so the trace is of a settled step: with `--compile` the first
+    steps carry inductor codegen and any dynamo recompiles, which would swamp the
+    kernel counts. Ends after `_SPAN` steps — one step here issues ~700k kernels, and
+    the trace holds every event in memory.
+
+    Two things this got wrong the first time, both of which killed a run:
+
+    **Every rank profiles, not just rank 0.** A rank-local slowdown desynchronizes
+    the group — the ranks join a collective at every sync boundary, so whichever rank
+    is paying for instrumentation makes the other seven wait. Profiling all of them
+    keeps the cost symmetric; only rank 0 prints.
+
+    **The aggregation happens after the training loop.** `key_averages()` over 2.09 M
+    events took longer than the 600 s NCCL timeout, so ranks 1-7 aborted at the
+    all-reduce while rank 0 was still summarising. Stopping the profiler mid-loop is
+    cheap; turning it into a report is not, so that waits until no collective is
+    pending.
+    """
+
+    _WARM, _SPAN = 8, 2
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.ctx = None
+        self.t0 = 0.0
+        self.wall = 0.0
+
+    def maybe_start(self, step: int) -> None:
+        if not self.enabled or self.ctx is not None or step != self._WARM:
+            return
+        from torch.profiler import ProfilerActivity, profile as torch_profile
+
+        self.ctx = torch_profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+        self.ctx.__enter__()
+        torch.cuda.synchronize()  # the window's wall must not inherit queued work
+        self.t0 = time.perf_counter()
+
+    def maybe_stop(self, step: int) -> None:
+        """End the window. Cheap — no aggregation, so the ranks stay in lockstep."""
+        # `step` is the one just FINISHED, so the window closes at _WARM+_SPAN-1.
+        if not self.enabled or self.ctx is None or step + 1 < self._WARM + self._SPAN:
+            return
+        torch.cuda.synchronize()
+        self.wall = time.perf_counter() - self.t0
+        self.ctx.__exit__(None, None, None)
+        self.enabled = False  # one window per run
+
+    def final_report(self, rank: int) -> None:
+        if self.ctx is None:
+            return
+        from parallm.train.profile import kernel_report
+
+        # Every rank aggregated the same volume; only one of them needs to say so.
+        report = kernel_report(self.ctx, self.wall, self._SPAN) if rank == 0 else ""
+        self.ctx = None
+        _log(rank, report)
 
 
 def _describe_plan(plan, tracks_per_rank: int) -> str:
@@ -328,6 +410,52 @@ def main() -> int:
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--mem-report", action="store_true")
+    p.add_argument("--compile", choices=["off", "mixer", "mlp", "both"], default="off",
+                   help="torch.compile the decoder-layer seam halves. The profiled step "
+                        "is ~75%% BACKWARD, and compiling the forward gives inductor the "
+                        "backward too, so this is the lever that reaches the dominant "
+                        "phase. 'mixer' skips the MLP, for a sparse-MoE whose "
+                        "data-dependent expert sort will not hold a graph. Costs a "
+                        "one-time warmup on the first steps.")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "max-autotune-no-cudagraphs"],
+                   help="Inductor mode for --compile. The cudagraph modes are "
+                        "absent because the track walk cannot use them: a graph's "
+                        "memory pool is reused by the next per-layer invocation while "
+                        "the backward still needs those tensors, and plain "
+                        "'max-autotune' turns cudagraphs on.")
+    p.add_argument("--tf-ckpt-min-segment", type=int, default=2,
+                   help="Longest own-carry segment (in layers) the teacher-forced loop "
+                        "holds WITHOUT activation checkpointing. That loop backwards at "
+                        "every boundary, so its live graph is one segment and a short "
+                        "one is cheaper to hold than to recompute — at D=2 (segment 2) "
+                        "checkpointing saved no memory and cost a whole extra forward. "
+                        "Numerically inert either way; 0 restores the old always-on "
+                        "behaviour. Raise it only against a --mem-report peak.")
+    p.add_argument("--moe-experts", choices=["auto", "dense", "grouped_mm"],
+                   default="auto",
+                   help="How a per-track MoE evaluates its experts. 'grouped_mm' sorts "
+                        "tokens by expert; below SM90 that is a LOOP of E GEMMs plus "
+                        "gathers whose backward was 39%% of all GPU time at N=64. "
+                        "'dense' runs every expert on every token and lets the zero "
+                        "routing weights drop the rest: E/top_k more FLOPs, but two "
+                        "plain GEMMs and no indexing. 'auto' picks by per-expert width "
+                        "(parallm.model.moe_dense.DENSE_WIDTH_MAX). Equivalent, not "
+                        "bit-equal — the reduction order differs.")
+    p.add_argument("--profile", action="store_true",
+                   help="Device-synced per-phase step timers on --log-every steps "
+                        "(teacher_fwd / tf_block_loop / tf_backward / fr_forward / "
+                        "ce_chunked / fr_backward / grad_sync / optim). The syncs "
+                        "serialize overlap, so a profiled step reads HIGHER than an "
+                        "unprofiled one — compare phase SHARES between profiled runs "
+                        "and take totals from unprofiled ones.")
+    p.add_argument("--profile-kernels", action="store_true",
+                   help="torch.profiler over steps 8-10 on rank 0: GPU-busy time vs "
+                        "wall, kernels/step, mean kernel duration, and the top 20 by "
+                        "self device time. Answers the question --profile cannot — "
+                        "whether the step is starved for launches (cuda graphs) or "
+                        "device-busy on kernels too small to fill the SMs "
+                        "(concurrency). Supersedes --profile's syncs for that window.")
     p.add_argument("--ledge-probe", action="store_true",
                    help="Diagnostics for the block-loss crossing: per-tap relMSE "
                         "([taps]) and distance from the warm start ([dist]). The "
@@ -404,6 +532,30 @@ def main() -> int:
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
                f"fuse={args.fuse_tracks} -> {_describe_plan(plan, tracks_per_rank)}")
 
+    # Before any per-track config is built — `build_per_track_text_config` reads the
+    # policy to stamp `_experts_implementation`, and the model is constructed below.
+    from parallm.model.moe_dense import set_experts_policy
+
+    set_experts_policy(args.moe_experts)
+
+    if args.compile != "off":
+        from parallm.model.seam import enable_seam_compile
+
+        # Inductor codegen must not land on /dev/md0 (= "/", 9766M USER quota, and
+        # it holds /tmp). A run with recompiles wrote 6.2 GB across 150k files
+        # there, filled the quota, and broke the login shell itself — bash could
+        # not write temp files, so every command exited 1. Redirect unless the
+        # caller has deliberately pointed it somewhere off "/" already.
+        cache = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "")
+        if not cache or cache.startswith("/tmp"):
+            cache = str(Path.home() / ".cache" / "inductor")
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache
+        Path(cache).mkdir(parents=True, exist_ok=True)
+        _log(rank, f"[init] inductor cache: {cache}")
+        enable_seam_compile(args.compile, inductor_mode=args.compile_mode)
+        _log(rank, f"[init] torch.compile seam halves: {args.compile} "
+                   f"(inductor mode={args.compile_mode})")
+
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
 
     # Data: identical stream on every rank (the SyncBoundary contract).
@@ -422,6 +574,13 @@ def main() -> int:
                              sync_layers, args.sync_phase, F, merge_group, exec_groups)
     student.use_checkpoint = not args.no_checkpoint
     student.train()
+    # Report the RESOLVED choice, not the policy: under `auto` it depends on the
+    # per-track expert width, which is only known once the config is built. A 2.8x
+    # step-time lever that silently picks the other branch is worth one log line.
+    _impl = getattr(student.text_models[0].config, "_experts_implementation", None)
+    if _impl is not None:
+        _log(rank, f"[init] MoE experts: {_impl} (--moe-experts {args.moe_experts}, "
+                   f"per-track width {student.text_models[0].config.intermediate_size})")
 
     if args.teacher_stream:
         teacher_model, streamer = _build_teacher_streamed(
@@ -580,6 +739,7 @@ def main() -> int:
         lambda_mag=args.lambda_mag,
         intra_window_mse=args.intra_window_mse,
         ce_chunk_size=args.ce_chunk_size,
+        tf_ckpt_min_segment=args.tf_ckpt_min_segment,
     )
     out_dir = Path(args.out_dir)
     best_macro = float("-inf")
@@ -607,14 +767,22 @@ def main() -> int:
         # on every rank; the train stream is an already-constructed seeded
         # interleave and student-forcing draws from a per-step local RNG, so
         # neither is perturbed.
-        results = run_lm_eval(
-            make_student_forward_fn(student), tokenizer,
-            tasks=eval_tasks, is_owner=is_lm_head_owner(student),
-            limit=args.eval_limit, batch_size=args.eval_batch_size,
-            max_length=args.eval_max_length, num_fewshot=args.eval_num_fewshot,
-            seed=args.seed, log_samples=False,
-            quiet=True,  # the training log gets the numbers, not progress bars
-        )
+        #
+        # RUN EVAL EAGER. Training has ONE shape (B x seq_len), so the compiled
+        # seam holds a single graph; lm-eval feeds ragged contexts at
+        # --eval-batch-size, which re-traces on every new (batch, length) pair.
+        # Measured: that blows dynamo's recompile_limit of 8 within one eval and
+        # then SIGSEGVs a rank. Nothing here is a step-time path, so compiling it
+        # buys nothing even when it works.
+        with _eval_compile_guard():
+            results = run_lm_eval(
+                make_student_forward_fn(student), tokenizer,
+                tasks=eval_tasks, is_owner=is_lm_head_owner(student),
+                limit=args.eval_limit, batch_size=args.eval_batch_size,
+                max_length=args.eval_max_length, num_fewshot=args.eval_num_fewshot,
+                seed=args.seed, log_samples=False,
+                quiet=True,  # the training log gets the numbers, not progress bars
+            )
         student.train()
         per_task = macro_metrics(results)  # populated on rank 0 only
         score = sum(per_task.values()) / len(per_task) if per_task else 0.0
@@ -626,21 +794,33 @@ def main() -> int:
                    + " ".join(f"{k}={v:.4f}" for k, v in per_task.items()))
         return t.item()
 
+    # A kernel trace wants phase NAMES in the trace but not the phase timers' syncs,
+    # which serialize the very overlap the busy-vs-wall ratio is measuring.
+    prof = PhaseTimer(enabled=args.profile and not args.profile_kernels,
+                      record=args.profile_kernels)
+    kprof = _KernelWindow(args.profile_kernels)
+
     while step < args.max_steps:
-        batch = next(train_iter)
-        batch = {k: v.to(torch.cuda.current_device()) for k, v in batch.items()}
+        kprof.maybe_start(step)
+        prof.reset()
+        prof.start_step()
+        with prof.phase("data"):
+            batch = next(train_iter)
+            batch = {k: v.to(torch.cuda.current_device()) for k, v in batch.items()}
         cur_lr[0] = lr_at(step)  # the in-backward hooks read this as they fire
         gsq.zero_()
         losses = distill_step(
             student, teacher, lm_head, batch, dcfg,
             loss_scale=1.0 / args.grad_accum_steps,
+            prof=prof,
         )
         accum += 1
         if accum < args.grad_accum_steps:
             continue
         accum = 0
 
-        sync_replicated_grads(plan)
+        with prof.phase("grad_sync"):
+            sync_replicated_grads(plan)
         if args.optim_in_backward:
             # Hooked params already stepped and freed, so no moment holds the whole
             # gradient to clip against; gsq is this rank's running sum, diagnostic
@@ -654,13 +834,16 @@ def main() -> int:
                     if p_.grad is not None:
                         p_.grad.mul_(clip)
         if optim is not None:
-            for g in optim.param_groups:
-                g["lr"] = lr_at(step)
-            optim.step()
-            optim.zero_grad(set_to_none=True)
+            with prof.phase("optim"):
+                for g in optim.param_groups:
+                    g["lr"] = lr_at(step)
+                optim.step()
+                optim.zero_grad(set_to_none=True)
         if args.optim_in_backward:
             fire_prev = dict(fire_cur)  # this batch's counts normalize the next
             fire_cur.clear()
+
+        kprof.maybe_stop(step)
 
         if step % args.log_every == 0:
             dt = (time.perf_counter() - t0) / max(1, step + 1)
@@ -669,6 +852,8 @@ def main() -> int:
                        f"ce={losses['ce'].item():.4f} "
                        + f"gnorm={gnorm.item():.2f} lr={lr_at(step):.2e} "
                          f"{dt:.2f}s/step")
+            if args.profile:
+                _log(rank, prof.report())
             if args.ledge_probe:
                 # Per-tap relMSE is already computed and returned by distill_step;
                 # gnorm is a rank-local non-deduplicated sum under
@@ -699,6 +884,7 @@ def main() -> int:
                              {"step": step, "sync_layer_indices": sync_layers,
                               "sync_phase": args.sync_phase, "args": vars(args)}, rank)
 
+    kprof.final_report(rank)  # after the loop: no collective is pending
     macro = run_eval(f"[final] step {step}")
     if macro > best_macro and not args.no_save:
         _save_checkpoint(student, manifest, layout, out_dir / args.best_name,

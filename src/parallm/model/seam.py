@@ -47,6 +47,54 @@ def seam_mlp(layer, h_attn: torch.Tensor) -> torch.Tensor:
     return h_attn + (y[0] if isinstance(y, tuple) else y)
 
 
+_COMPILED: dict[str, object] = {}
+
+
+def enable_seam_compile(
+    mode: str = "both", dynamic: bool | None = False, inductor_mode: str = "default"
+) -> None:
+    """Compile the two seam halves ONCE, for every caller.
+
+    Compiled here rather than on the layer modules for three reasons: the walks call
+    ``layer.self_attn`` / ``layer.mlp`` directly and never ``layer.forward``, so a
+    module-level compile would not engage; ``torch.compile(module)`` renames
+    state_dict keys to ``_orig_mod.*`` and breaks checkpoint I/O; and a free function
+    is compiled once instead of once per layer instance.
+
+    ``mode``: ``"mixer"`` compiles only the token-mixer half. A sparse-MoE MLP sorts
+    tokens by expert, which is data-dependent and may not hold a graph — so the MLP
+    half is separable, and a family whose MoE will not compile can still take the
+    attention win.
+
+    The profiled step is ~75% BACKWARD, which is the point: compiling the forward
+    gives inductor the backward too, so this is the only built lever that touches the
+    dominant phase.
+    """
+    if mode not in ("mixer", "mlp", "both"):
+        raise ValueError(f"compile mode must be mixer|mlp|both, got {mode!r}")
+    if inductor_mode == "reduce-overhead":
+        raise ValueError(
+            "reduce-overhead (CUDA graphs) is not supported for the track walk: a "
+            "graph's output pool is reused by the next per-layer invocation while the "
+            "backward still needs those tensors."
+        )
+    kw = {"dynamic": dynamic}
+    if inductor_mode != "default":
+        kw["mode"] = inductor_mode
+    if mode in ("mixer", "both"):
+        _COMPILED["mixer"] = torch.compile(seam_token_mixer, **kw)
+    if mode in ("mlp", "both"):
+        _COMPILED["mlp"] = torch.compile(seam_mlp, **kw)
+
+
+def _mixer_fn():
+    return _COMPILED.get("mixer", seam_token_mixer)
+
+
+def _mlp_fn():
+    return _COMPILED.get("mlp", seam_mlp)
+
+
 def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):
     """``(run_mixer, run_mlp)`` bound to this forward's no-grad scaffolding.
 
@@ -56,15 +104,17 @@ def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):
     keeps the residual input the only checkpointed tensor. Shared by the model's
     lever-B walk and the distill TF block loop.
     """
+    mixer_fn, mlp_fn = _mixer_fn(), _mlp_fn()
+
     def _mixer(layer, x, mask):
-        return seam_token_mixer(layer, x, position_embeddings, mask, position_ids)
+        return mixer_fn(layer, x, position_embeddings, mask, position_ids)
 
     if not use_ckpt:
-        return _mixer, seam_mlp
+        return _mixer, mlp_fn
 
     from torch.utils.checkpoint import checkpoint
 
     return (
         lambda layer, x, mask: checkpoint(_mixer, layer, x, mask, use_reentrant=False),
-        lambda layer, x: checkpoint(seam_mlp, layer, x, use_reentrant=False),
+        lambda layer, x: checkpoint(mlp_fn, layer, x, use_reentrant=False),
     )
