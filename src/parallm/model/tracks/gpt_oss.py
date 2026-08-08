@@ -12,6 +12,16 @@ overrides of the shared base:
 - **`_resolve_position_ids`.** The base implementation expands to the 4-way
   (text/temporal/height/width) form Qwen3.5's mrope wants; gpt-oss rotary takes plain
   2-D position ids.
+
+**Merged tracks (`fuse_size` > 1) are supported and are the fast path.** Unlike the
+track-major stacking refuted for the 35B MoE in 2026-07-20, concatenating F shards
+widens each EXPERT and leaves the expert COUNT alone — `experts.gate_up_proj` is
+`Colwise(dim=2)` and `experts.down_proj` is `Rowwise(dim=1)` — so one merged
+`grouped_mm` issues E group-dispatches at F times the width where the looped path
+issues F*E at 1/F the width. It also collapses F redundant `router` evaluations into
+one. The interleaved gate/up lanes survive because each member's slab has even width,
+so `cat` keeps whole pairs and `[..., ::2]`/`[..., 1::2]` stay member-major on both
+sides of the elementwise product.
 """
 from __future__ import annotations
 
@@ -43,14 +53,9 @@ class PTTrackTextModel(PTTrackTextModelBase):
 
 
 def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
-    if fuse_size > 1:
-        # Same reason as qwen3_5_moe: the merged-track representation's concatenation
-        # rule for the 3-D expert slabs is unverified, and the MoE MLP is
-        # expert-group-bound rather than track-launch-bound so there is nothing to
-        # win. The adapter declares `supports_merged_tracks=False`; this is the
-        # backstop if something calls in anyway.
-        raise ValueError("fuse_size > 1 (merged tracks) is not supported for gpt_oss")
-    cfg = apply_common_per_track_sizing(text_config, n_tracks, attn_implementation="eager")
+    cfg = apply_common_per_track_sizing(
+        text_config, n_tracks, fuse_size, attn_implementation="eager"
+    )
     inter = int(cfg.intermediate_size)
     if inter % n_tracks != 0:
         # Zero-padding IS exact for the gate ((up+1)*glu(0) = 0) and the slicer does
@@ -62,7 +67,13 @@ def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
     # expert width is padded up to a multiple of 8 so `torch._grouped_mm` accepts the
     # contracted dim's stride (see `slicer.gpt_oss.EXPERT_WIDTH_ALIGN`). 2880/16 = 180
     # becomes 184; the 4 extra lanes are zeros and contribute exactly 0.0.
-    cfg.intermediate_size = align_chunk(inter // n_tracks, EXPERT_WIDTH_ALIGN)
+    #
+    # `align_chunk(...) * fuse_size`, NOT `align_chunk(... * fuse_size)`: a merged
+    # track is F ALIGNED per-track slabs concatenated, so its width must be F times
+    # the width the shards on disk actually have. Aligning after multiplying would
+    # give a slab the shards cannot fill (and would shift members 1..F-1 off their
+    # gate/up lane boundaries).
+    cfg.intermediate_size = align_chunk(inter // n_tracks, EXPERT_WIDTH_ALIGN) * fuse_size
     # The reference `GptOssExperts.forward` is a Python loop over every hit expert
     # (all 32/128 of them at training seq lengths). `grouped_mm` sorts tokens by expert
     # and does one grouped GEMM per expert: same math (it honours the class's own

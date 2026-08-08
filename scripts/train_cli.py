@@ -34,6 +34,7 @@ from transformers import AutoConfig, AutoTokenizer
 
 from parallm.adapters import get_adapter_for_config
 from parallm.dist.groups import build_groups
+from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.data import (
     CalibrationDataConfig,
@@ -58,6 +59,27 @@ from parallm.utils.checkpoint import load_manifest, load_track, load_track_keys,
 def _log(rank: int, msg: str) -> None:
     if rank == 0:
         print(msg, flush=True)
+
+
+def _describe_plan(plan, tracks_per_rank: int) -> str:
+    """One-line account of how F was realised, so a run's log says which of the
+    four grouping mechanisms is live rather than just the requested number."""
+    parts = [f"{tracks_per_rank} shards/rank"]
+    if plan.merge_group > 1:
+        n_local = tracks_per_rank // plan.merge_group
+        parts.append(
+            f"merged {plan.merge_group}x"
+            + (f" ({n_local} merged tracks/rank, looped)" if n_local > 1 else "")
+        )
+    if plan.exec_groups > 1:
+        parts.append(
+            f"run as {plan.exec_groups} streams x {plan.merge_group // plan.exec_groups}"
+        )
+    if plan.fuse_size > 1:
+        parts.append(f"summed-fuse {plan.fuse_size}")
+    if plan.fuse_ranks > 1:
+        parts.append(f"CROSS-RANK over {plan.fuse_ranks} ranks")
+    return ", ".join(parts) + f" => effective fuse {plan.effective_fuse}"
 
 
 def _load_states(text_cfg, layout, ckpt_dir: str, merge_group: int):
@@ -92,6 +114,9 @@ def _build_student(text_cfg, manifest, layout, ckpt_dir: str, sync_layers, sync_
         fuse_size=fuse_size,
         merge_group=merge_group,
         exec_groups=exec_groups,
+        fuse_group=layout.fuse_group,
+        fuse_ranks=layout.fuse_ranks,
+        fuse_rank=layout.fuse_rank,
     )
     states = _load_states(text_cfg, layout, ckpt_dir, merge_group)
     model.load_track_state_dicts(states, strict=True)
@@ -217,14 +242,16 @@ def main() -> int:
     p.add_argument("--sync-phase", default="post-attn", choices=["post-attn"],
                    help="Only lever B is built — the program's schedule")
     p.add_argument("--fuse-tracks", type=int, default=1,
-                   help="F rank-local tracks pool their partials at every non-sync "
-                        "sublayer, so a group computes as one F-wide track between "
-                        "syncs (an N/F-track model on N shards). Groups must sit whole "
-                        "on a rank: n_tracks/world_size must be a multiple of F. This "
-                        "is a SEMANTIC knob only — the rank's tracks are merged into "
-                        "one wide track for speed regardless, and F picks how many "
-                        "INDEPENDENT streams that track runs as (tracks/rank / F). "
-                        "F > 1 needs one q head and one kv head per member.")
+                   help="F shards pool their partials at every non-sync sublayer, so "
+                        "a group computes as one F-wide track between syncs (an "
+                        "N/F-track model on N shards). Valid F = the divisors of "
+                        "tracks-per-rank K, plus its multiples up to N: at or below K "
+                        "a group is rank-local, above K it spans F/K whole ranks via a "
+                        "subgroup all-reduce. How F is realised depends on the family "
+                        "(see `parallm.model.merge.plan_track_layout`) — on a dense "
+                        "family it is a semantic knob only, on an MoE it is also the "
+                        "MERGE WIDTH, so step time improves with F. The [init] line "
+                        "logs which mechanism is live.")
     p.add_argument("--no-merge-fused", action="store_true",
                    help="Run the rank's tracks as separate narrow modules instead of "
                         "merging their slabs into one wide track. Same function, ~2x "
@@ -335,22 +362,34 @@ def main() -> int:
     # applied to every merged run; they are why the looped path is the equivalence
     # reference and not a step-for-step trajectory reference.
     #
-    # Families whose per-track slabs have no verified concatenation rule (the MoE
-    # ones) declare `supports_merged_tracks=False` and keep the looped path — the
-    # alternative is failing deep inside `build_per_track_text_config`.
-    F = args.fuse_tracks
-    tracks_per_rank = manifest.n_tracks // dist.get_world_size()
-    merge_group = exec_groups = 1
+    # Families whose per-track slabs have no verified concatenation rule declare
+    # `supports_merged_tracks=False` and keep the looped path — the alternative is
+    # failing deep inside `build_per_track_text_config`. Families with no batched
+    # fold (the MoE ones) declare `supports_batched_exec=False` and express F as the
+    # MERGE WIDTH instead, looping over K/F merged tracks. `plan_track_layout` owns
+    # the whole policy; see `parallm.model.merge`.
+    world_size = dist.get_world_size()
+    tracks_per_rank = manifest.n_tracks // world_size
     can_merge = adapter.supports_merged_tracks and not args.no_merge_fused
-    if tracks_per_rank > 1 and tracks_per_rank % F == 0 and can_merge:
-        if args.sync_attention_heads:
-            raise SystemExit(
-                "--sync-attention-heads cannot be merged: it keeps each kv-group's "
-                "copies bit-identical across tracks, but merged they are one tensor. "
-                "Pass --no-merge-fused."
-            )
-        merge_group, exec_groups, F = tracks_per_rank, tracks_per_rank // F, 1
-    layout = build_groups(n_tracks=manifest.n_tracks // merge_group)
+    if can_merge and tracks_per_rank > 1 and args.sync_attention_heads:
+        raise SystemExit(
+            "--sync-attention-heads cannot be merged: it keeps each kv-group's "
+            "copies bit-identical across tracks, but merged they are one tensor. "
+            "Pass --no-merge-fused."
+        )
+    try:
+        plan = plan_track_layout(
+            manifest.n_tracks, world_size, args.fuse_tracks,
+            supports_merged_tracks=adapter.supports_merged_tracks,
+            supports_batched_exec=adapter.supports_batched_exec,
+            allow_merge=not args.no_merge_fused,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e))
+    merge_group, exec_groups, F = plan.merge_group, plan.exec_groups, plan.fuse_size
+    layout = build_groups(
+        n_tracks=plan.n_logical_tracks, fuse_ranks=plan.fuse_ranks
+    )
     teacher_dir = args.teacher_dir or args.checkpoint_dir
 
     num_layers = text_cfg.num_hidden_layers
@@ -363,11 +402,7 @@ def main() -> int:
 
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
-               f"fuse={args.fuse_tracks}"
-               + (f" (merged {merge_group}x, run as "
-                  + ("1 wide track" if exec_groups == 1
-                     else f"{exec_groups} streams x {merge_group // exec_groups}") + ")"
-                  if merge_group > 1 else ""))
+               f"fuse={args.fuse_tracks} -> {_describe_plan(plan, tracks_per_rank)}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.hf_model)
 

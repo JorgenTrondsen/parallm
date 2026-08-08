@@ -50,9 +50,15 @@ GPT_OSS_ADAPTER = ModelAdapter(
     build_masks=build_masks,
     full_text_model_cls=GptOssModel,
     constraints=_gpt_oss_constraints,
-    # MoE expert slabs have no verified merge rule, and the batched fold in
-    # `parallm.model.batched` assumes a dense SwiGLU MLP — see `tracks/gpt_oss.py`.
-    supports_merged_tracks=False,
+    # Merging (concatenated slabs) IS supported and is the fast path — see the
+    # `tracks/gpt_oss.py` docstring for why widening experts beats stacking tracks.
+    supports_merged_tracks=True,
+    # The batched fold in `parallm.model.batched` is not: `engine._batched_mlp` is a
+    # dense SwiGLU, and under G > 1 each stream carries its own residual, so the
+    # shared router picks a DIFFERENT top-k per stream and there is no single
+    # `grouped_mm` to issue. `train_cli` therefore expresses F as the merge width
+    # instead of as `exec_groups` for this family.
+    supports_batched_exec=False,
 )
 
 register_model_adapter(GPT_OSS_ADAPTER)

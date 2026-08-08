@@ -52,6 +52,9 @@ class PTWrappedModel(nn.Module):
         fuse_size: int = 1,
         merge_group: int = 1,
         exec_groups: int = 1,
+        fuse_group: "torch.distributed.ProcessGroup | None" = None,
+        fuse_ranks: int = 1,
+        fuse_rank: int = 0,
     ):
         super().__init__()
         # Late import: parallm.adapters imports its registered adapters,
@@ -98,8 +101,24 @@ class PTWrappedModel(nn.Module):
                     f"(n_tracks={n_tracks} → {ok}), or pass build_groups a "
                     f"tracks_per_rank_list whose blocks are {fuse_size}-aligned."
                 )
+        # Cross-rank fusion pools WHOLE ranks, so a block member must hold its
+        # tracks as one group: either the rank has a single logical track, or its
+        # whole set is one rank-local group already.
+        if fuse_ranks > 1:
+            k = len(self.local_track_ids)
+            if fuse_size not in (1, k):
+                raise ValueError(
+                    f"fuse_ranks {fuse_ranks} pools whole ranks, so this rank's "
+                    f"{k} tracks must form ONE group; got fuse_size {fuse_size}. "
+                    f"Pass fuse_size=1 (merged) or fuse_size={k} (looped)."
+                )
         self.sync_module = SyncBoundary(
-            track_group=track_group, n_tracks=n_tracks, fuse_size=fuse_size
+            track_group=track_group,
+            n_tracks=n_tracks,
+            fuse_size=fuse_size,
+            fuse_group=fuse_group,
+            fuse_ranks=fuse_ranks,
+            fuse_rank=fuse_rank,
         )
         self.text_models = nn.ModuleList(
             [
@@ -132,6 +151,17 @@ class PTWrappedModel(nn.Module):
             )
         self.exec_groups = exec_groups
         self.shadow = None
+        if exec_groups > 1 and len(self.local_track_ids) != 1:
+            # `MergedShadow` is built from text_models[0] and `_run_batched_stack`
+            # never reads text_models[1:], so a second logical track would be
+            # trained by the optimizer but dropped from the forward. `train_cli`
+            # only ever produces exec_groups > 1 with merge_group == tracks_per_rank
+            # (hence one logical track); this is the guard for everyone else.
+            raise ValueError(
+                f"exec_groups {exec_groups} needs exactly one logical track per rank "
+                f"(the batched fold runs a single merged module); this rank holds "
+                f"{len(self.local_track_ids)}. Use merge_group == tracks_per_rank."
+            )
         if exec_groups > 1:
             # Late import: `parallm.model.batched` pulls in `parallm.engine`, which
             # imports this module at top level.
@@ -174,14 +204,22 @@ class PTWrappedModel(nn.Module):
         against a per-head loop). A ``sync=False`` param that is NOT applied per-head
         would be silently wrong here, which is why the merged path is validated
         per family by the equivalence rail rather than assumed.
+
+        A family may legitimately have NONE — gpt-oss has no ``q_norm``/``k_norm``,
+        and its k/v projections are `KVReplicatedColwise`, a different spec. So the
+        guard below fires on a spec-map/module DISAGREEMENT (the specs declare some
+        and no module carries them), not on an empty declaration.
         """
         from parallm.slicer.base import Replicated
         from parallm.slicer.convert import resolve_param_specs
 
+        declared = [
+            name
+            for name, spec in resolve_param_specs(self._adapter, self.text_config).items()
+            if isinstance(spec, Replicated) and not spec.sync
+        ]
         widened = 0
-        for name, spec in resolve_param_specs(self._adapter, self.text_config).items():
-            if not (isinstance(spec, Replicated) and not spec.sync):
-                continue
+        for name in declared:
             module_path, _, param_name = name.rpartition(".")
             for tm in self.text_models:
                 try:
@@ -197,10 +235,11 @@ class PTWrappedModel(nn.Module):
                     nn.Parameter(p.detach().unsqueeze(0).repeat(merge_group, 1)),
                 )
                 widened += 1
-        if widened == 0:
+        if declared and widened == 0:
             raise RuntimeError(
-                "merge_group > 1 but no Replicated(sync=False) params were found — "
-                "the spec map and the built modules disagree"
+                f"merge_group > 1 and the spec map declares {len(declared)} "
+                f"Replicated(sync=False) params (e.g. {declared[0]!r}) but none were "
+                f"found on the built modules — the spec map and the modules disagree"
             )
 
     def embed(self, input_ids: torch.LongTensor) -> torch.Tensor:
@@ -225,7 +264,16 @@ class PTWrappedModel(nn.Module):
                         dtype=tm.norm.weight.dtype,
                     )
                 )
-        return self.sync_module(embeds_per_track, torch.zeros_like(embeds_per_track[0]))
+        # `block_shared=False`: this is a broadcast, not a boundary. No sublayer has
+        # run, so no fusion block holds a shared delta yet — every rank contributes
+        # its own tracks (zeros for non-owners of embed_tokens) and the sum is the
+        # embedding. Routing it through the leader-only rule would be a no-op today
+        # (peers hold zeros anyway) but only by accident of rank 0 leading block 0.
+        return self.sync_module(
+            embeds_per_track,
+            torch.zeros_like(embeds_per_track[0]),
+            block_shared=False,
+        )
 
     def set_sync_phase(self, phase: str) -> None:
         """Sync placement. ``"post-mlp"`` (default): the legacy after-layer
@@ -238,6 +286,10 @@ class PTWrappedModel(nn.Module):
         if phase not in ("post-mlp", "post-attn", "exact"):
             raise ValueError(f"sync_phase must be 'post-mlp', 'post-attn' or 'exact', got {phase!r}")
         self.sync_phase = phase
+        # At `exact` every sublayer syncs globally, so ANY grouping sums the same
+        # deltas and the cross-rank fuse is a semantic no-op — pure collective cost.
+        # This is what keeps the frozen-slice teacher (pinned to `exact`) free.
+        self.sync_module.cross_rank_enabled = phase != "exact"
 
     def forward(
         self,
@@ -284,11 +336,14 @@ class PTWrappedModel(nn.Module):
                 capture_post_mlp=capture_post_mlp,
             )
         else:
-            if self.sync_module.fuse_size > 1 or self.exec_groups > 1:
-                # Silently ignoring the flag here would report a fused number for
-                # an unfused run; nothing trains on post-mlp, so just refuse.
+            if (self.sync_module.fuse_size > 1 or self.exec_groups > 1
+                    or self.sync_module.fuse_ranks > 1):
+                # The post-mlp walk never calls `fuse`, so every grouping mechanism
+                # is silently inert here. Reporting a fused number for an unfused
+                # run is the failure mode; nothing trains on post-mlp, so refuse.
                 raise ValueError(
-                    "fuse_size/exec_groups > 1 are implemented for post-attn/exact only"
+                    "fuse_size/exec_groups/fuse_ranks > 1 are implemented for "
+                    "post-attn/exact only"
                 )
             block_start = h
             per_track_h = [h for _ in self.text_models]

@@ -17,10 +17,131 @@ canonical-name dispatch over ``resolve_param_specs``.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from parallm.slicer.base import OwnerOnly
 from parallm.slicer.convert import resolve_param_specs
+
+
+@dataclass(frozen=True)
+class TrackLayoutPlan:
+    """How a requested fusion width F is realised on ``world_size`` ranks.
+
+    Four numbers, three of which are implementations of the SAME grouping — F
+    consecutive shards computing as one track between global syncs:
+
+    - ``merge_group`` m: shards CONCATENATED into one wide module. The only one that
+      changes step time (fewer, wider GEMMs; one residual stream instead of m).
+    - ``exec_groups`` G: that merged module RUN as G independent streams
+      (`parallm.model.batched`), which UNDOES m/G members' worth of fusion. Buys the
+      merged step time back at a smaller F. Dense families only.
+    - ``fuse_size``: rank-local SUMMING of logical tracks' partials
+      (`SyncBoundary.fuse`). The original, speed-neutral implementation.
+    - ``fuse_ranks`` R: logical tracks pooled ACROSS ranks by a subgroup all-reduce.
+      The only way to reach F > tracks-per-rank, and the only one that costs a
+      collective.
+
+    Their product is the effective fusion width: ``m / G * fuse_size * R == F``.
+    """
+
+    merge_group: int = 1
+    exec_groups: int = 1
+    fuse_size: int = 1
+    fuse_ranks: int = 1
+    n_logical_tracks: int = 1
+
+    @property
+    def effective_fuse(self) -> int:
+        return (self.merge_group // self.exec_groups) * self.fuse_size * self.fuse_ranks
+
+
+def _valid_fuse_widths(n_tracks: int, world_size: int) -> list[int]:
+    """Every F this layout can express: the divisors of K (rank-local groups) plus
+    the multiples of K up to n_tracks (whole-rank blocks)."""
+    k = n_tracks // world_size
+    below = [d for d in range(1, k + 1) if k % d == 0]
+    above = [k * r for r in range(2, world_size + 1) if world_size % r == 0]
+    return below + above
+
+
+def plan_track_layout(
+    n_tracks: int,
+    world_size: int,
+    fuse_tracks: int,
+    *,
+    supports_merged_tracks: bool = True,
+    supports_batched_exec: bool = True,
+    allow_merge: bool = True,
+) -> TrackLayoutPlan:
+    """Choose (merge_group, exec_groups, fuse_size, fuse_ranks) for F=``fuse_tracks``.
+
+    The policy, given K = n_tracks/world_size shards per rank:
+
+    ==========================  ===========================================
+    F <= K, batched-capable     m=K, G=K/F  — merged storage at any F
+    F <= K, merge-only (MoE)    m=F, G=1    — K/F merged tracks/rank, looped
+    F >  K                      m=K, G=1, R=F/K — cross-rank fusion groups
+    merging refused             m=1, fuse_size=min(F,K), R=F/K
+    ==========================  ===========================================
+
+    Why ``m=F`` rather than ``m=K, G=K/F`` for an MoE: `exec_groups` needs a batched
+    fold, and an MoE has none — under G > 1 each stream carries its own residual, so
+    the shared router picks a different top-k per stream and no single ``grouped_mm``
+    exists. Merging only F shards still collapses F kernels into one F-times-wider
+    one; the rank just loops over K/F of them instead of 1.
+    """
+    if n_tracks % world_size:
+        raise ValueError(
+            f"n_tracks {n_tracks} not divisible by world_size {world_size}"
+        )
+    k = n_tracks // world_size
+    f = int(fuse_tracks)
+    if f < 1 or n_tracks % f:
+        raise ValueError(
+            f"--fuse-tracks {f} must be >= 1 and divide n_tracks {n_tracks}"
+        )
+    if f <= k and k % f:
+        raise ValueError(
+            f"--fuse-tracks {f} must divide tracks-per-rank {k} "
+            f"(n_tracks={n_tracks}, world_size={world_size}); valid: "
+            f"{_valid_fuse_widths(n_tracks, world_size)}"
+        )
+    if f > k and f % k:
+        # A cross-rank block is R WHOLE ranks, so F must be a multiple of K. This
+        # does NOT follow from F dividing n_tracks: at n=24/world=8, K=3 and F=4
+        # divides 24 but straddles ranks 1.33 deep, which has no meaning.
+        raise ValueError(
+            f"--fuse-tracks {f} exceeds tracks-per-rank {k}, so it must be a "
+            f"MULTIPLE of {k} (a cross-rank fusion block is whole ranks); valid: "
+            f"{_valid_fuse_widths(n_tracks, world_size)}"
+        )
+
+    can_merge = supports_merged_tracks and allow_merge
+    ranks = f // k if f > k else 1
+
+    if not can_merge:
+        return TrackLayoutPlan(
+            merge_group=1,
+            exec_groups=1,
+            fuse_size=min(f, k),
+            fuse_ranks=ranks,
+            n_logical_tracks=n_tracks,
+        )
+    if f > k:
+        m = k
+    elif supports_batched_exec:
+        m = k
+    else:
+        m = f
+    return TrackLayoutPlan(
+        merge_group=m,
+        exec_groups=m // f if f <= m else 1,
+        fuse_size=1,
+        fuse_ranks=ranks,
+        n_logical_tracks=n_tracks // m,
+    )
 
 
 def _spec_for(spec_map: dict, key: str):

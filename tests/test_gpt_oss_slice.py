@@ -96,7 +96,10 @@ def test_adapter_registered_and_layer_types():
     assert set(adapter.valid_layer_types) == {"full_attention", "sliding_attention"}
     # No `get_layer_types` override needed — the default reads the config.
     assert adapter.layer_types_for(cfg) == list(cfg.layer_types)
-    assert adapter.supports_merged_tracks is False
+    # Merging (concatenated slabs) yes; the batched fold (exec_groups) no — the MoE
+    # router picks a different top-k per stream, so there is no single grouped_mm.
+    assert adapter.supports_merged_tracks is True
+    assert adapter.supports_batched_exec is False
 
 
 def test_build_masks_gives_one_mask_per_layer_type():
@@ -331,12 +334,18 @@ def test_n4_exact_schedule_matches_dense_with_padded_expert_width():
     assert rel < 1e-5, f"relL2 {rel:.3e}"
 
 
-def test_merged_tracks_refused():
+def test_merged_config_is_f_aligned_slabs():
+    """A merged track is F ALIGNED per-track slabs, not one aligned F-wide slab.
+
+    That distinction is what makes the merged module loadable from the shards on
+    disk: each shard was padded to `EXPERT_WIDTH_ALIGN` independently, so the merged
+    width must be F times the padded width, never `align(F * raw)`.
+    """
     from parallm.model.tracks.gpt_oss import build_per_track_text_config
 
-    try:
-        build_per_track_text_config(_tiny_config(), 4, fuse_size=2)
-    except ValueError as e:
-        assert "merged tracks" in str(e)
-    else:
-        raise AssertionError("expected fuse_size > 1 to be refused for gpt_oss")
+    cfg = _tiny_config()
+    one = build_per_track_text_config(cfg, 4, fuse_size=1)
+    two = build_per_track_text_config(cfg, 4, fuse_size=2)
+    assert two.intermediate_size == one.intermediate_size * 2
+    assert two.num_attention_heads == one.num_attention_heads * 2
+    assert two.num_key_value_heads == one.num_key_value_heads * 2

@@ -22,13 +22,15 @@ import pytest
 @pytest.fixture(autouse=True)
 def _force_torch_gated_delta(monkeypatch):
     import transformers.models.qwen3_5.modeling_qwen3_5 as m
+    import transformers.models.qwen3_5_moe.modeling_qwen3_5_moe as m_moe
 
-    for name in (
-        "chunk_gated_delta_rule",
-        "fused_recurrent_gated_delta_rule",
-        "causal_conv1d_fn",
-        "causal_conv1d_update",
-        "FusedRMSNormGated",
-    ):
-        monkeypatch.setattr(m, name, None, raising=False)
-    monkeypatch.setattr(m, "is_fast_path_available", False, raising=False)
+    for mod in (m, m_moe):
+        for name in (
+            "chunk_gated_delta_rule",
+            "fused_recurrent_gated_delta_rule",
+            "causal_conv1d_fn",
+            "causal_conv1d_update",
+            "FusedRMSNormGated",
+        ):
+            monkeypatch.setattr(mod, name, None, raising=False)
+        monkeypatch.setattr(mod, "is_fast_path_available", False, raising=False)

@@ -50,11 +50,13 @@ QWEN3_5_MOE_ADAPTER = ModelAdapter(
     build_masks=build_masks,
     full_text_model_cls=Qwen3_5MoeTextModel,
     constraints=_qwen3_5_moe_constraints,
-    # The merged-track speedup targets the dense 27B's per-track launch cost; the MoE
-    # MLP is expert-group-bound, so merging buys ~nothing and the expert slabs' merge
-    # rule is unverified. Declaring it here makes the trainer fall back to the looped
-    # path instead of failing inside `build_per_track_text_config`.
-    supports_merged_tracks=False,
+    # Merging (concatenated slabs) IS supported — see `tracks/qwen3_5_moe.py` for why
+    # widening experts beats stacking tracks on an expert-group-bound MLP.
+    supports_merged_tracks=True,
+    # The batched fold is not: `engine._batched_mlp` is a dense SwiGLU, and under
+    # G > 1 each stream carries its own residual, so the shared router picks a
+    # different top-k per stream and there is no single `grouped_mm` to issue.
+    supports_batched_exec=False,
 )
 
 register_model_adapter(QWEN3_5_MOE_ADAPTER)

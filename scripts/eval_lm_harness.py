@@ -47,6 +47,7 @@ from parallm.eval.lm_eval_adapter import (
     make_teacher_forward_fn,
     run_lm_eval,
 )
+from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.teacher import HookedTeacher, load_dense_reference
 from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
@@ -174,7 +175,18 @@ def main() -> int:
         _fuse_from = "flag"
 
     manifest = load_manifest(args.checkpoint_dir)
-    layout = build_groups(n_tracks=manifest.n_tracks)
+    # Eval stays on the LOOPED path (`allow_merge=False`) — it is not the bottleneck
+    # and the looped form is the equivalence reference. The plan is still needed for
+    # `fuse_ranks`: a run trained with F > tracks-per-rank has cross-rank fusion
+    # groups, and scoring it without them measures a different model.
+    try:
+        plan = plan_track_layout(
+            manifest.n_tracks, dist.get_world_size(), args.fuse_tracks,
+            allow_merge=False,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e))
+    layout = build_groups(n_tracks=manifest.n_tracks, fuse_ranks=plan.fuse_ranks)
     if args.sync_indices is not None:
         sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
     elif manifest.sync_layer_indices is not None:
@@ -217,7 +229,10 @@ def main() -> int:
             local_track_ids=layout.local_track_ids,
             sync_after_layers=sync_layers,
             track_group=layout.track_group,
-            fuse_size=args.fuse_tracks,
+            fuse_size=plan.fuse_size,
+            fuse_group=layout.fuse_group,
+            fuse_ranks=layout.fuse_ranks,
+            fuse_rank=layout.fuse_rank,
         )
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)

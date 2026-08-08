@@ -13,6 +13,12 @@ Layout:
     owner) stays on rank 0.
   - track_group = dist.group.WORLD; the cross-rank all-reduce in SyncBoundary
     spans world_size ranks, after a local sum across the K local tracks
+  - fuse_group = a contiguous block of ``fuse_ranks`` ranks, or None when
+    ``fuse_ranks == 1``. This is the CROSS-RANK fusion tier: between global
+    syncs the block's tracks pool their partials with a subgroup all-reduce, so
+    they compute as one track. It is what lets ``--fuse-tracks F`` exceed a
+    rank's own track count — without it F is capped at n_tracks/world_size, so
+    adding GPUs would LOWER the reachable F.
   - intra_track_group = None (per-track student is small enough to skip FSDP)
 
 Multi-node: ``world_size = nnodes * nproc_per_node`` = total GPUs across the
@@ -61,12 +67,17 @@ class ProcessGroupLayout:
     intra_track_size: int  # always 1 today
     intra_track_rank: int  # always 0 today
     intra_track_group: "dist.ProcessGroup | None"  # always None today
+    # Cross-rank fusion tier. `fuse_ranks` == 1 means off and `fuse_group` is None.
+    fuse_ranks: int = 1
+    fuse_rank: int = 0  # this rank's index WITHIN its fusion block; 0 = the leader
+    fuse_group: "dist.ProcessGroup | None" = None
 
 
 def build_groups(
     n_tracks: int,
     *,
     tracks_per_rank_list: Sequence[int] | None = None,
+    fuse_ranks: int = 1,
 ) -> ProcessGroupLayout:
     """Construct the per-rank track layout.
 
@@ -79,6 +90,11 @@ def build_groups(
     contiguous block sized by its entry. Used for asymmetric layouts where
     rank 0 carries embed_tokens + lm_head on top of its tracks and needs
     fewer student tracks than its peers.
+
+    ``fuse_ranks`` > 1 additionally partitions the ranks into contiguous blocks of
+    that size and builds one subgroup per block (see `SyncBoundary.fuse`). Requires
+    a uniform layout — a fusion block pools whole ranks, so its members must hold
+    equal track counts for the grouping to mean the same thing on each.
     """
     if not dist.is_initialized():
         raise RuntimeError("dist.init_process_group must be called before build_groups()")
@@ -109,6 +125,26 @@ def build_groups(
 
     local_track_ids, track_to_rank = compute_contiguous_assignment(k_list, rank)
 
+    fuse_group = None
+    if fuse_ranks > 1:
+        if world_size % fuse_ranks:
+            raise ValueError(
+                f"fuse_ranks {fuse_ranks} must divide world_size {world_size}"
+            )
+        if len(set(k_list)) != 1:
+            raise ValueError(
+                f"fuse_ranks > 1 needs a uniform layout (a fusion block pools whole "
+                f"ranks); got tracks_per_rank_list {k_list}"
+            )
+        # `dist.new_group` is itself collective: EVERY rank must construct EVERY
+        # subgroup, in the same order, or the job deadlocks. Same discipline as
+        # `train.sync_grads.build_replication_plan`.
+        for start in range(0, world_size, fuse_ranks):
+            block = list(range(start, start + fuse_ranks))
+            pg = dist.new_group(ranks=block)
+            if rank in block:
+                fuse_group = pg
+
     return ProcessGroupLayout(
         world_size=world_size,
         rank=rank,
@@ -120,4 +156,7 @@ def build_groups(
         intra_track_size=1,
         intra_track_rank=0,
         intra_track_group=None,
+        fuse_ranks=fuse_ranks,
+        fuse_rank=rank % fuse_ranks,
+        fuse_group=fuse_group,
     )

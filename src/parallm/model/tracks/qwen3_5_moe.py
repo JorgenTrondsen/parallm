@@ -6,6 +6,14 @@ shared-expert width, keeping `num_experts` / `num_experts_per_tok` intact so the
 (replicated) router picks the same top-k on every track; each track's
 `Qwen3_5MoeExperts` then builds `[E, 2*(I/N), H]` / `[E, H, I/N]` slabs and its MoE
 forward yields a partial sum completed by the cross-track all-reduce.
+
+**Merged tracks (`fuse_size` > 1) are supported.** Concatenating F shards widens each
+expert and leaves the expert COUNT alone, so one merged `grouped_mm` issues E group
+dispatches at F times the width where the looped path issues F*E at 1/F the width —
+the opposite of the track-major stacking measured at 1.03x in 2026-07-20.
+`FusedSegmentColwise` merges SEGMENT-major, so the merged slab is still
+`[gate_0..gate_{F-1} | up_0..up_{F-1}]` and the forward's split lands member-major on
+both sides of the elementwise product, matching `down_proj`'s row order.
 """
 from __future__ import annotations
 
@@ -25,18 +33,14 @@ class PTTrackTextModel(PTTrackTextModelBase):
 
 
 def build_per_track_text_config(text_config, n_tracks: int, fuse_size: int = 1):
-    if fuse_size > 1:
-        # The merged-track speedup (parallm.model.merge) targets the dense 27B's
-        # K=3 launch/elementwise cost. The MoE MLP is expert-group-bound, not
-        # track-bound, so merging buys ~nothing there and the expert slabs' merge
-        # rule is unverified — refuse rather than guess.
-        raise ValueError("fuse_size > 1 (merged tracks) is not supported for qwen3_5_moe")
-    cfg = apply_common_per_track_sizing(text_config, n_tracks)
+    cfg = apply_common_per_track_sizing(text_config, n_tracks, fuse_size)
     for field in ("moe_intermediate_size", "shared_expert_intermediate_size"):
         val = getattr(cfg, field)
         if val % n_tracks != 0:
             raise ValueError(f"{field} {val} not divisible by {n_tracks}")
-        setattr(cfg, field, val // n_tracks)
+        # Divide by the SHARD count, then scale back up by F — a merged track is F
+        # per-track slabs concatenated, not the N/F-track slicing.
+        setattr(cfg, field, (val // n_tracks) * fuse_size)
     # The standalone per-track experts default to `_experts_implementation=None`,
     # which dispatches HF's REFERENCE forward: a Python for-loop over up to 256
     # experts (~245k tiny GEMMs/opt-step at T=1024 → 334 s/step, GPU ~45% util).

@@ -61,10 +61,18 @@ class ModelAdapter:
     constraints: "Callable[[Any], ConstraintSet] | None" = None
     # ----- Capabilities -----
     # Whether a rank's tracks may be MERGED into one wide track (`parallm.model.merge`).
-    # False for families whose per-track slabs have no verified concatenation rule (the
-    # MoE expert slabs) — the trainer then keeps the looped path instead of failing deep
-    # inside `build_per_track_text_config`.
+    # False for families whose per-track slabs have no verified concatenation rule — the
+    # trainer then keeps the looped path instead of failing deep inside
+    # `build_per_track_text_config`.
     supports_merged_tracks: bool = True
+    # Whether a MERGED track may additionally be RUN as G independent streams
+    # (`exec_groups`, `parallm.model.batched`). This is what decouples step time from
+    # the fusion width F on the dense path; without it, F is expressed as the merge
+    # width itself, so a rank holds K/F merged tracks and loops over them.
+    # False for MoE families: `engine._batched_mlp` is a dense SwiGLU, and under G > 1
+    # each stream carries its own residual, so the shared router picks a different
+    # top-k per stream and there is no single `grouped_mm` to issue.
+    supports_batched_exec: bool = True
 
     def layer_types_for(self, text_cfg) -> list[str]:
         """The per-layer type list, via `get_layer_types` or the config default."""

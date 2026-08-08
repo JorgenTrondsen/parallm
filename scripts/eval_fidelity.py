@@ -38,6 +38,7 @@ from transformers import AutoConfig, AutoTokenizer
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
 from parallm.eval.fidelity import fidelity_step
+from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.data import (
     DEFAULT_PRESET,
@@ -146,6 +147,17 @@ def main() -> int:
         args.fuse_tracks, _fuse_from = train_meta_arg(args.checkpoint_dir, "fuse_tracks", 1)
     else:
         _fuse_from = "flag"
+    # Looped path (`allow_merge=False`); the plan is here for `fuse_ranks`, so a run
+    # trained with F > tracks-per-rank is scored WITH its cross-rank groups.
+    try:
+        plan = plan_track_layout(
+            manifest.n_tracks, dist.get_world_size(), args.fuse_tracks,
+            allow_merge=False,
+        )
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if plan.fuse_ranks > 1:
+        layout = build_groups(n_tracks=manifest.n_tracks, fuse_ranks=plan.fuse_ranks)
     _log(
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
@@ -186,7 +198,10 @@ def main() -> int:
         local_track_ids=layout.local_track_ids,
         sync_after_layers=sync_layers,
         track_group=layout.track_group,
-        fuse_size=args.fuse_tracks,
+        fuse_size=plan.fuse_size,
+        fuse_group=layout.fuse_group,
+        fuse_ranks=layout.fuse_ranks,
+        fuse_rank=layout.fuse_rank,
     )
     if args.sync_phase is not None:
         student.set_sync_phase(args.sync_phase)
