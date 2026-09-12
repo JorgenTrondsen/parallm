@@ -27,7 +27,8 @@ from transformers import AutoConfig, AutoTokenizer
 from parallm.dist.groups import build_groups
 from parallm.engine import DenseShadow, PackedShadow, generate, generate_draft_verify
 from parallm.model.pt_model import PTWrappedModel
-from parallm.utils.checkpoint import load_manifest, load_track
+from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
+from parallm.utils.layers import parse_layers
 
 
 class EngineDrafter:
@@ -194,11 +195,21 @@ def main() -> int:
     manifest = load_manifest(args.tracks_dir)
     layout = build_groups(n_tracks=manifest.n_tracks)
     if args.sync_indices:
-        sync = [int(x) for x in args.sync_indices.split(",") if x.strip()]
+        sync = parse_layers(args.sync_indices)
     elif manifest.sync_layer_indices:
         sync = list(manifest.sync_layer_indices)
     else:
         raise SystemExit("[error] no --sync-indices and the manifest carries no schedule")
+    # The engine walk is post-attn by construction (see parallm.engine's docstring)
+    # and never calls `set_sync_phase`, so serving a checkpoint trained on any other
+    # schedule runs a different network than the one that healed, silently.
+    _phase, _ = train_meta_arg(args.tracks_dir, "sync_phase", "post-attn")
+    if _phase != "post-attn":
+        raise SystemExit(
+            f"[error] this checkpoint trained at sync_phase={_phase!r}; the inference "
+            f"engine is post-attn only, so serving it would run a different schedule "
+            f"than it healed on."
+        )
 
     cfg = AutoConfig.from_pretrained(args.hf_model)
     text_cfg = cfg.text_config if hasattr(cfg, "text_config") else cfg

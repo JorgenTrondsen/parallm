@@ -50,6 +50,7 @@ from parallm.train.data import (
 )
 from parallm.train.teacher import HookedTeacher, load_dense_reference
 from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
+from parallm.utils.layers import format_layers, parse_layers, resolve_phases
 
 
 def _log(rank: int, msg: str) -> None:
@@ -99,10 +100,13 @@ def main() -> int:
                         "schedule-independent, so this evaluates an arbitrary (non-uniform / "
                         "depth-tapered) sync schedule on the SAME slice with NO re-slice. Both the "
                         "student SyncBoundary placement and the teacher block_mse hooks follow it.")
-    p.add_argument("--sync-phase", default=None, choices=["post-mlp", "post-attn", "exact"],
-                   help="Where in a layer the sync fires. Default: leave the model's own "
-                        "('post-mlp'). 'exact' = 2 syncs/layer, which is exactly equivalent "
-                        "to dense — use it to verify a fresh convert (expect ~zero KL).")
+    p.add_argument("--sync-phase", default=None,
+                   help="Where in a layer the sync fires. DEFAULT reads it from the "
+                        "checkpoint's train_meta.json (else post-attn) — scoring a model at "
+                        "the wrong phase is a different network. 'exact' = 2 syncs/layer, "
+                        "exactly equivalent to dense — use it to verify a fresh convert "
+                        "(expect ~zero KL). A per-layer schedule is a comma list of "
+                        "'layers:phase' segments ('0-31:post-attn,32-63:post-mlp').")
     p.add_argument("--fuse-tracks", type=int, default=None,
                    help="F rank-local tracks pool their partials at every non-sync sublayer "
                         "(N/F-track behaviour on N shards). Default: read from the "
@@ -133,7 +137,7 @@ def main() -> int:
     # Optional custom (non-uniform) sync schedule — weights are schedule-independent,
     # so this re-evaluates the SAME slice under a redistributed sync budget.
     if args.sync_indices is not None:
-        sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
+        sync_layers = parse_layers(args.sync_indices)
     elif manifest.sync_layer_indices is not None:
         sync_layers = list(manifest.sync_layer_indices)
     else:
@@ -142,6 +146,16 @@ def main() -> int:
             "output carries none — the schedule is placed at train time). Pass "
             "--sync-indices, or point --checkpoint-dir at a trained checkpoint."
         )
+    # Same recovery as eval_lm_harness: the manifest carries the sync INDICES but not
+    # the PHASE, and falling back to the model's ctor default ("post-mlp") scored a
+    # post-attn checkpoint as a different network. Resolved here so a bad spec raises
+    # before the dense teacher is loaded.
+    if args.sync_phase is None:
+        args.sync_phase, _phase_from = train_meta_arg(
+            args.checkpoint_dir, "sync_phase", "post-attn")
+    else:
+        _phase_from = "flag"
+    resolve_phases(args.sync_phase, manifest.num_layers)
     if args.fuse_tracks is None:
         args.fuse_tracks, _fuse_from = train_meta_arg(args.checkpoint_dir, "fuse_tracks", 1)
     else:
@@ -161,9 +175,11 @@ def main() -> int:
         rank,
         f"[init] world={layout.world_size} n_tracks={manifest.n_tracks} "
         f"K={layout.tracks_per_rank} num_layers={manifest.num_layers} "
-        f"fuse={args.fuse_tracks} (from {_fuse_from})",
+        f"fuse={args.fuse_tracks} (from {_fuse_from}) "
+        f"sync_phase={args.sync_phase} (from {_phase_from})",
     )
-    _log(rank, f"[init] sync schedule: {len(sync_layers)} syncs at {sync_layers}"
+    _log(rank, f"[init] sync schedule: {len(sync_layers)} boundaries at "
+               f"{format_layers(sync_layers)}"
                + ("  (OVERRIDE)" if args.sync_indices is not None else ""))
     _log(rank, f"[init] rank={rank} local_track_ids={layout.local_track_ids}")
 
@@ -204,8 +220,7 @@ def main() -> int:
         fuse_ranks=layout.fuse_ranks,
         fuse_rank=layout.fuse_rank,
     )
-    if args.sync_phase is not None:
-        student.set_sync_phase(args.sync_phase)
+    student.set_sync_phase(args.sync_phase)
     track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
     student.load_track_state_dicts(track_states, strict=True)
     # Cast BEFORE the move (as train_cli and eval_lm_harness do): the tracks are

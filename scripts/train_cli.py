@@ -39,7 +39,7 @@ from parallm.dist.groups import build_groups
 # this stays cheap and a train-only install (no [eval] extra) still imports.
 from parallm.eval.downstream import DEFAULT_TASKS, EVAL_TASK_PATH
 from parallm.model.merge import plan_track_layout
-from parallm.model.pt_model import PTWrappedModel
+from parallm.model.pt_model import PTWrappedModel, sync_sets_for
 from parallm.train.probe import ActivationProbe, summary_lines
 from parallm.train.profile import PhaseTimer
 from parallm.train.data import (
@@ -61,6 +61,7 @@ from parallm.train.sync_grads import (
     sync_replicated_grads,
 )
 from parallm.utils.checkpoint import load_manifest, load_track, load_track_keys, save_manifest
+from parallm.utils.layers import format_layers, parse_layers
 
 
 def _log(rank: int, msg: str) -> None:
@@ -321,8 +322,9 @@ def main() -> int:
                    help="Keep the frozen embed table on CPU (~8 MB/step of H2D) so rank 0 does "
                         "not carry embed+lm_head over its peers' budget")
     p.add_argument("--sync-indices", default=None,
-                   help="Comma-separated boundary layers (default: every layer = the d1b schedule)")
-    p.add_argument("--sync-phase", default="post-attn", choices=["post-attn", "post-mlp"],
+                   help="Boundary layers as a range/comma list ('0-31', '3,7,11'; ranges "
+                        "INCLUSIVE). Default: every layer = the d1b schedule")
+    p.add_argument("--sync-phase", default="post-attn",
                    help="WHICH sublayer's sync a boundary is. 'post-attn' (lever B, "
                         "the program's schedule): sync after the boundary layer's token "
                         "mixer, so its MLP reads the TRUE residual and its delta is "
@@ -330,7 +332,13 @@ def main() -> int:
                         "head, so d1b costs L+1 all-reduces. 'post-mlp' (SPD's placement): "
                         "the ATTENTION sync is the one dropped and a whole layer runs "
                         "own-carry, so d1b costs L. The two are NOT budget-matched (65 vs "
-                        "64 at 64 layers). See PTWrappedModel.sync_sets().")
+                        "64 at 64 layers). 'exact': both syncs at every layer, the base an "
+                        "isolation cell is carved out of. A PER-LAYER schedule is a comma "
+                        "list of 'layers:phase' segments applied in order, so a leading "
+                        "bare phase is the default the rest override: "
+                        "'0-31:post-attn,32-63:post-mlp' (front half lever B, back half "
+                        "SPD), 'exact,40-47:post-attn' (the isolation cell). Every layer "
+                        "must be named. See PTWrappedModel.sync_sets().")
     p.add_argument("--fuse-tracks", type=int, default=1,
                    help="F shards pool their partials at every non-sync sublayer, so "
                         "a group computes as one F-wide track between syncs (an "
@@ -502,8 +510,8 @@ def main() -> int:
                         "(B,T,H) teacher tensors and ~2 collectives/layer ON THOSE "
                         "STEPS ONLY.")
     p.add_argument("--probe-detail", default="",
-                   help="Comma-separated layers to dump the UN-REDUCED breakdown at "
-                        "(e.g. '8,42,43,44,45,63'). Every other probe number is an "
+                   help="Layers to dump the UN-REDUCED breakdown at, as a range/comma "
+                        "list (e.g. '8,42-45,63'). Every other probe number is an "
                         "average over the (B, T) axes, which can show that an error is "
                         "CONCENTRATED but never WHERE. At these layers the merged rows "
                         "additionally carry per-position err/den/cos/nr vectors and the "
@@ -576,21 +584,24 @@ def main() -> int:
 
     num_layers = text_cfg.num_hidden_layers
     if args.sync_indices is not None:
-        sync_layers = sorted(int(x) for x in args.sync_indices.split(",") if x.strip())
+        sync_layers = sorted(set(parse_layers(args.sync_indices)))
     else:
         sync_layers = list(range(num_layers))  # d1b: every layer a boundary
     if sync_layers[-1] != num_layers - 1:
         sync_layers.append(num_layers - 1)  # the head needs the final post-MLP sync
 
-    # post-attn: one all-reduce per boundary PLUS the head's post-MLP sync at the
-    # final layer. post-mlp: one per boundary, the final layer already being one.
-    # (`PTWrappedModel.sync_sets` is the authority; this only reports it before the
-    # model is built.)
-    n_syncs = len(sync_layers) + (1 if args.sync_phase == "post-attn" else 0)
+    # Resolve the schedule HERE, before any weight is loaded: `set_sync_phase` does
+    # not run until _build_student, and a typo'd spec that only raises there costs
+    # the minutes a multi-GPU job spends loading first. `sync_sets_for` is the same
+    # authority the model reads, so this reports the schedule rather than
+    # re-deriving it — the old hand-computed count could not express a per-layer one.
+    sync_attn, sync_mlp = sync_sets_for(args.sync_phase, sync_layers, num_layers)
     _log(rank, f"[init] n_tracks={manifest.n_tracks} world={layout.world_size} "
                f"boundaries={len(sync_layers)} phase={args.sync_phase} "
-               f"syncs={n_syncs} "
                f"fuse={args.fuse_tracks} -> {_describe_plan(plan, tracks_per_rank)}")
+    _log(rank, f"[init] schedule: post-attn {format_layers(sync_attn)} | "
+               f"post-MLP {format_layers(sync_mlp)} = "
+               f"{len(sync_attn) + len(sync_mlp)} all-reduces")
 
     # Before any per-track config is built — `build_per_track_text_config` reads the
     # policy to stamp `_experts_implementation`, and the model is constructed below.
@@ -842,7 +853,7 @@ def main() -> int:
             teacher_layers=teacher.text_models[0].layers,
             sync_phase=args.sync_phase,
             block_walk=args.block_walk,
-            detail_layers={int(x) for x in args.probe_detail.split(",") if x.strip()},
+            detail_layers=set(parse_layers(args.probe_detail)),
         )
         _log(rank, f"[init] activation probe at steps {sorted(probe_steps)} -> "
                    f"{args.probe_dir or (out_dir / 'probe')} "

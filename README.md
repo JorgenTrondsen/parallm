@@ -92,8 +92,8 @@ torchrun --standalone --nproc-per-node=8 scripts/eval_fidelity.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks --num-batches 200
 
 # downstream retention (the metric that matters — proxies hid failures before).
-# --tasks defaults to the 5-task macro: arc_easy, arc_challenge, mmlu_math_mc,
-# mmlu_cs_mc, codemmlu_fim. Any lm-eval built-in, or any YAML in configs/eval_tasks.
+# --tasks defaults to the 4-task macro: arc_easy, arc_challenge, mmlu_math_mc,
+# mmlu_cs_mc. Any lm-eval built-in, or any YAML in configs/eval_tasks.
 torchrun --standalone --nproc-per-node=8 scripts/eval_lm_harness.py \
     --hf-model <teacher> --checkpoint-dir ./pt_tracks
 

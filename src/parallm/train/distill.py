@@ -472,6 +472,19 @@ def distill_step(
                     # track — a 64x inflation of the drift at N=64, which read as
                     # relMSE 190-1292 and looked like a diverging model.
                     probe.record(i, "mlp", block_input, share(carry), pre_shared=carry)
+                if mlp_sync:
+                    # This layer syncs at BOTH sublayers — an `exact` layer, which
+                    # only a per-layer spec can put next to a partial one. Uniform
+                    # `exact` is the teacher and trains nothing, so until specs
+                    # existed this branch was unreachable and the loop simply carried
+                    # the boundary MLP's per-track output un-summed while
+                    # `_run_stack` reduced it: a schedule drift between the walk that
+                    # deploys and the loop that supervises.
+                    # `block_start` advances WITH the sync. Leaving it at `carry`
+                    # while the states already hold the summed residual makes the
+                    # next boundary re-add this delta once per track.
+                    block_start = sync(block_input, carry)
+                    block_input = share(block_start)
             else:
                 block_input = share(carry)
         elif i == last:

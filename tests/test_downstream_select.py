@@ -20,6 +20,14 @@ def _results(**task_metrics):
 
 # The task list a real recorded eval was scored on, before mmlu_cs_mc joined the
 # macro. The historical numbers below are only meaningful against THIS list.
+#
+# ⚠ NOT "macro4". Two different four-task means exist and they are different numbers:
+#   RECORDED_FOUR (here) = arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim
+#                          — a pre-2026-08-22 log, before mmlu_cs_mc joined.
+#   macro4 / DEFAULT_TASKS = arc_easy, arc_challenge, mmlu_math_mc, mmlu_cs_mc
+#                          — fim-FREE, the bridge metric (scripts/macro4.py).
+# Score a historical log against RECORDED_FOUR; never compare the two means directly
+# just because both average four rows.
 RECORDED_FOUR = "arc_easy,arc_challenge,mmlu_math_mc,codemmlu_fim"
 
 
@@ -31,6 +39,10 @@ def _ledger(arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim, mmlu_cs_mc=0.79
     mmlu_pro_math_mc — the macro is the same mean either way. ``mmlu_cs_mc`` has a
     default because it postdates those recordings; tests pinning a historical
     number score against ``RECORDED_FOUR`` so the extra row cannot shift it.
+
+    The table still carries a ``codemmlu_fim`` row even though the current macro
+    does not score it: RECORDED_FOUR needs it, and leaving it in makes every
+    default-scored test an implicit check that a dropped task cannot leak back in.
     """
     return _results(
         arc_easy={"acc,none": arc_easy, "acc_norm,none": arc_easy + 0.02},
@@ -44,8 +56,14 @@ def _ledger(arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim, mmlu_cs_mc=0.79
 # ----- the task set -----
 
 def test_default_tasks_are_the_recorded_macro():
+    # codemmlu_fim left the macro on 2026-09-12. ⚡ This list is now exactly `macro4`
+    # — the fim-free bridge metric (scripts/macro4.py) that the whole historical
+    # archive was re-scored on after the fim slot turned out to be a copy test that
+    # REWARDED estimator damage. So the default is the number that DOES compare to
+    # the archive; it is the 5-task macro= readings in logs/ that do not.
     assert DEFAULT_TASKS.split(",") == [
-        "arc_easy", "arc_challenge", "mmlu_math_mc", "mmlu_cs_mc", "codemmlu_fim"]
+        "arc_easy", "arc_challenge", "mmlu_math_mc", "mmlu_cs_mc"]
+    assert "codemmlu_fim" not in DEFAULT_TASKS
 
 
 def test_task_spec_accepts_a_string_or_a_list():
@@ -73,7 +91,7 @@ def test_acc_is_the_metric_not_acc_norm():
     # ledger. The ``,none`` filter suffix must be stripped.
     m = macro_metrics(_ledger(0.7550, 0.5500, 0.4350, 0.8450))
     assert m == {"arc_easy": 0.7550, "arc_challenge": 0.5500, "mmlu_math_mc": 0.4350,
-                 "mmlu_cs_mc": 0.7900, "codemmlu_fim": 0.8450}
+                 "mmlu_cs_mc": 0.7900}
 
 
 def test_macro_off_rank0_is_zero():
@@ -96,7 +114,7 @@ def test_a_partial_result_raises_instead_of_averaging_the_survivors():
         macro_metrics(partial)
     assert "mmlu_math_mc" in str(e.value)
     # and the number it would have reported is HIGHER than the true macro.
-    survivors = [0.7550, 0.5500, 0.7900, 0.8450]
+    survivors = [0.7550, 0.5500, 0.7900]  # arc_easy, arc_challenge, mmlu_cs_mc
     assert sum(survivors) / len(survivors) > macro(full)
 
 

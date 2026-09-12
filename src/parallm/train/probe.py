@@ -623,13 +623,22 @@ def summary_lines(digest: dict, step: int, every: int = 8,
     residual — while every downstream number is free-running. `amp` is how much a layer
     inflates the drift it is handed over its error given a perfect input.
     """
-    seam = 1 if sync_phase == "post-mlp" else 0   # which column is the own-carry one
+    # Which column is the own-carry (SEAM) one. A per-layer spec drops the question:
+    # each layer has its own seam, so neither column is a rail and the run reports
+    # both rather than labelling one with the other's meaning.
+    mixed = ":" in sync_phase
+    seam = 1 if sync_phase == "post-mlp" else 0
     layers = sorted(digest)
     last = layers[-1]
     picked = [i for i in layers if i % every == 0 or i == last]
     body = " ".join(f"{i}:{digest[i][0]:.4f}/{digest[i][1]:.5f}" for i in picked)
     worst = max(digest[i][1] for i in layers)
-    if sync_phase == "post-mlp":
+    if mixed:
+        tail = (f"[probe] step {step} max merged post-mlp relMSE over all "
+                f"{len(layers)} layers = {worst:.2e} — sync_phase={sync_phase} is "
+                f"PER-LAYER, so NEITHER column is a rail: read each layer's seam "
+                f"against the schedule")
+    elif sync_phase == "post-mlp":
         tail = (f"[probe] step {step} post-mlp seam: max merged relMSE over all "
                 f"{len(layers)} layers = {worst:.2e} (the dropped sync — NOT a rail)")
     elif block_walk != "tf":
@@ -650,6 +659,14 @@ def summary_lines(digest: dict, step: int, every: int = 8,
     fr = {i: digest[i][2 + seam] for i in layers if digest[i][2 + seam] == digest[i][2 + seam]}
     if fr:
         shown = [i for i in picked if i in fr]
+        if mixed:
+            # No single seam column, so no single amp ratio either — report the pair.
+            fr_body = " ".join(f"{i}:{digest[i][2]:.4f}/{digest[i][3]:.4f}" for i in shown)
+            lines.append(
+                f"[probe] step {step} FREE-RUNNING attn/mlp "
+                f"@L{{{','.join(str(i) for i in shown)}}}: {fr_body} "
+                f"| amp N/A — sync_phase is per-layer")
+            return lines
         fr_body = " ".join(f"{i}:{fr[i]:.4f}" for i in shown)
         head = f"[probe] step {step} FREE-RUNNING seam @L{{{','.join(str(i) for i in shown)}}}: {fr_body}"
         if block_walk != "tf":

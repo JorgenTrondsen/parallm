@@ -204,6 +204,14 @@ def amplification(rows: list[dict], step: int, sync_phase: str) -> None:
     teacher-exact by construction, so it has no free-running counterpart worth a
     ratio).
     """
+    if ":" in sync_phase:
+        # The seam is per-layer under a spec, so there is no one column to pull here.
+        # Printing the attn column as "the seam" would be a mislabelled number, which
+        # is the failure this file's header warns about.
+        print(f"\n[amplification] sync_phase={sync_phase} is per-layer — the seam "
+              f"column differs by layer, so this view is not well defined. Read the "
+              f"per-layer FR/TF rows in the JSONL against the schedule.")
+        return
     seam = "mlp" if sync_phase == "post-mlp" else "attn"
     by = {(r["walk"], r["layer"]): r for r in rows
           if r["step"] == step and r["track"] == -1 and r["phase"] == seam
@@ -328,9 +336,16 @@ def main() -> int:
           f"{meta.get('num_layers')} layers, "
           f"{meta.get('shards_per_stream')} shard(s) per track, "
           f"sync_phase={phase}")
-    rail, seam = ("attn", "mlp") if phase == "post-mlp" else ("mlp", "attn")
-    print(f"  rail column = post-{rail} (~0 at every layer while untrained); "
-          f"seam column = post-{seam} (the dropped sync — compare seam to seam)")
+    if ":" in phase:
+        # A per-layer spec: the seam is whichever sync THAT layer drops, so no column
+        # is a rail stack-wide. Labelling one anyway is how a plausible number gets
+        # printed as "~0 while untrained" (see the warning at the top of this file).
+        print("  sync_phase is PER-LAYER: neither column is a rail stack-wide — read "
+              "each layer's seam against the schedule")
+    else:
+        rail, seam = ("attn", "mlp") if phase == "post-mlp" else ("mlp", "attn")
+        print(f"  rail column = post-{rail} (~0 at every layer while untrained); "
+              f"seam column = post-{seam} (the dropped sync — compare seam to seam)")
 
     tok = None
     if args.hf_model:

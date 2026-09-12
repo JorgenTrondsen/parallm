@@ -21,6 +21,47 @@ import torch
 from torch import nn
 
 from parallm.model.sync import SyncBoundary
+from parallm.utils.layers import resolve_phases
+
+
+def sync_sets_for(spec: str, boundaries, L: int) -> tuple[set[int], set[int]]:
+    """``(post-attn sync layers, post-MLP sync layers)`` for a sync-phase spec.
+
+    Module-level because the trainer has to report and validate the schedule BEFORE
+    the model exists, and because "is this spec all-exact" is then one call rather
+    than a string comparison that a segment form would break.
+
+    ``spec`` is a bare phase or a ``layers:phase`` list — see `resolve_phases`. The
+    phase says which sublayer a BOUNDARY's sync is, so ``post-attn`` / ``post-mlp``
+    only act at layers in ``boundaries``; ``exact`` syncs both sublayers of its
+    layers whatever the schedule says, which is what makes it the base an isolation
+    cell is carved out of.
+
+    | spec       | post-attn         | post-MLP            | all-reduces (d1b) |
+    |------------|-------------------|---------------------|-------------------|
+    | post-attn  | boundaries        | {last}              | L + 1             |
+    | post-mlp   | {}                | boundaries ∪ {last} | L                 |
+    | exact      | every layer       | every layer         | 2L                |
+
+    ``last`` is seeded into the post-MLP set: the head needs a synced state to
+    project, so a schedule that names no boundary there still gets one. That seed
+    reproduces the ``| {last}`` union the two non-exact cases used to carry
+    explicitly, and the exact case subsumes it.
+
+    ⚠ A boundary outside ``0..L-1`` is DROPPED here (it is never reached), where the
+    old `set(self.sync_after_layers)` passed it through to corrupt
+    `distill._max_segment_layers` and the teacher capture. Do not "fix" that back.
+    """
+    boundaries = set(boundaries)
+    attn: set[int] = set()
+    mlp: set[int] = {L - 1}
+    for i, phase in enumerate(resolve_phases(spec, L)):
+        if phase == "exact":
+            attn.add(i)
+            mlp.add(i)
+        elif i in boundaries:
+            (attn if phase == "post-attn" else mlp).add(i)
+    return attn, mlp
 
 
 @dataclass
@@ -275,48 +316,46 @@ class PTWrappedModel(nn.Module):
             block_shared=False,
         )
 
-    def set_sync_phase(self, phase: str) -> None:
+    def set_sync_phase(self, spec: str) -> None:
         """Sync placement. A phase name is only a shorthand for the two sync sets
-        `sync_sets` resolves it to; one walk serves all three (see that method)."""
-        if phase not in ("post-mlp", "post-attn", "exact"):
-            raise ValueError(f"sync_phase must be 'post-mlp', 'post-attn' or 'exact', got {phase!r}")
-        self.sync_phase = phase
-        # At `exact` every sublayer syncs globally, so ANY grouping sums the same
-        # deltas and the cross-rank fuse is a semantic no-op — pure collective cost.
-        # This is what keeps the frozen-slice teacher (pinned to `exact`) free.
-        self.sync_module.cross_rank_enabled = phase != "exact"
+        `sync_sets` resolves it to; one walk serves every schedule (see that method).
+
+        ``spec`` is a bare phase or a per-layer ``layers:phase`` list — the grammar
+        is `parallm.utils.layers.resolve_phases`, which is also what validates it
+        (the call below raises on a bad spec before anything is changed)."""
+        L = len(self.text_models[0].layers)
+        attn, mlp = sync_sets_for(spec, self.sync_after_layers, L)
+        self.sync_phase = spec
+        # When EVERY sublayer syncs globally, any grouping sums the same deltas and
+        # the cross-rank fuse is a semantic no-op — pure collective cost. This is what
+        # keeps the frozen-slice teacher (pinned to `exact`) free. Read off the SETS,
+        # not the name: a spec that is exact only on a band still carries MLP deltas
+        # un-summed across the fuse group at the band edges, so the fuse is
+        # load-bearing there and must stay on.
+        full = set(range(L))
+        self.sync_module.cross_rank_enabled = not (attn == full and mlp == full)
 
     def sync_sets(self) -> tuple[set[int], set[int]]:
-        """``(post-attn sync layers, post-MLP sync layers)`` for the active phase.
+        """``(post-attn sync layers, post-MLP sync layers)`` for the active spec.
 
-        The phase does not pick a WALK, it picks two SETS — one loop serves all
-        three, so the model walk and the trainer's teacher-forced block loop cannot
-        drift on the schedule (they both read this):
-
-        | phase      | post-attn         | post-MLP            | all-reduces (d1b) |
-        |------------|-------------------|---------------------|-------------------|
-        | post-attn  | boundaries        | {last}              | L + 1             |
-        | post-mlp   | {}                | boundaries ∪ {last} | L                 |
-        | exact      | every layer       | every layer         | 2L                |
+        The phase does not pick a WALK, it picks two SETS — one loop serves every
+        schedule, so the model walk and the trainer's teacher-forced block loop
+        cannot drift on it (they both read this). `sync_sets_for` is the mapping;
+        this is the bound form.
 
         ``post-attn`` is lever B: the sync lands after the boundary layer's token
         mixer, so that layer's MLP reads the TRUE residual and its delta is then
         carried un-summed. ``post-mlp`` is SPD's placement — the attention sync is
         the one dropped, and a whole layer runs own-carry between boundaries.
         ``exact`` is the dense forward up to fp summation order (the frozen-slice
-        teacher's schedule).
+        teacher's schedule). A ``layers:phase`` spec mixes them per layer.
 
         ``last`` is always in the post-MLP set: the head needs a synced state to
         project, so a schedule that names no boundary there still gets one.
         """
-        L = len(self.text_models[0].layers)
-        last = L - 1
-        if self.sync_phase == "exact":
-            return set(range(L)), set(range(L))
-        boundaries = set(self.sync_after_layers)
-        if self.sync_phase == "post-mlp":
-            return set(), boundaries | {last}
-        return boundaries, {last}
+        return sync_sets_for(
+            self.sync_phase, self.sync_after_layers, len(self.text_models[0].layers)
+        )
 
     def forward(
         self,

@@ -600,3 +600,43 @@ def test_block_walk_fr_is_identity_when_the_student_is_the_teacher():
         out = distill_step(pt, teacher, pt.lm_head, _batch(cfg),
                            DistillConfig(**kw, block_walk=walk))
         assert out["block_mse"].item() < 1e-8, f"{walk}: {out['layer_relmse']}"
+
+
+def test_block_loop_syncs_a_layer_that_is_in_both_sets():
+    """A layer in BOTH sync sets must be carried SYNCED by the block loop.
+
+    `_run_stack` reduces such a layer twice — after the mixer and again after the
+    MLP — and carries the summed state. The TF loop took the post-attn branch and
+    then re-ran the boundary MLP own-carry, carrying the per-track partial into the
+    next layer: a schedule drift between the walk that deploys and the loop that
+    supervises. It was unreachable until a per-layer spec could put an `exact` layer
+    next to a partial one, because the only uniform both-sets schedule is `exact`,
+    which is the teacher and trains nothing.
+
+    The rail: student slices == teacher, `exact` everywhere. Every layer's input is
+    then the teacher's residual and its computation is the dense one, so every
+    supervised tap must read ~0. Carrying an un-summed residual into the next layer
+    makes that layer's state wrong at N>1 and the tap lights up.
+    """
+    L = 8
+    cfg, _dense, tracks, pt = _build(n_tracks=4, sync_after=list(range(L)), n_layers=L)
+    pt.train()
+    teacher_pt = PTWrappedModel(
+        text_config=cfg, n_tracks=4, local_track_ids=tuple(range(4)),
+        sync_after_layers=list(range(L)), track_group=None,
+    )
+    teacher_pt.load_track_state_dicts(dict(enumerate(tracks)), strict=False)
+    teacher = freeze_slice_teacher(teacher_pt)
+
+    kw = dict(sync_layer_indices=tuple(range(L)), lambda_ce=0.0)
+    for spec in ("exact", f"exact,{L - 2}-{L - 1}:post-attn", f"0-3:exact,4-{L - 1}:post-attn"):
+        pt.set_sync_phase(spec)
+        out = distill_step(pt, teacher, pt.lm_head, _batch(cfg), DistillConfig(**kw))
+        # A layer is exactly reproducible only if it syncs at BOTH points AND is
+        # HANDED the combined residual — i.e. the layer before it synced post-MLP.
+        # A post-attn predecessor carries its MLP un-summed on purpose (that is
+        # d1b's one defect), so its successor reads non-zero by design.
+        attn, mlp = pt.sync_sets()
+        band = [i for i in sorted(attn & mlp) if i == 0 or i - 1 in mlp]
+        worst = max(out["layer_relmse"][i] for i in band if i in out["layer_relmse"])
+        assert worst < 1e-8, f"{spec}: exact band {band} reads {worst}, not ~0"

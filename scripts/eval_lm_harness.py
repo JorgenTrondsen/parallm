@@ -51,6 +51,7 @@ from parallm.model.merge import plan_track_layout
 from parallm.model.pt_model import PTWrappedModel
 from parallm.train.teacher import HookedTeacher, load_dense_reference
 from parallm.utils.checkpoint import load_manifest, load_track, train_meta_arg
+from parallm.utils.layers import parse_layers, resolve_phases
 
 
 def _log(rank: int, msg: str) -> None:
@@ -148,16 +149,18 @@ def main() -> int:
                         "ordering and fewshot sampling line up across ranks. Matches the "
                         "trainer's --seed so both draw the same limited subset of each task.")
     p.add_argument("--sync-indices", default=None,
-                   help="Override the manifest sync schedule (comma-separated layer indices). "
-                        "Required when the checkpoint is a raw convert output, which carries no "
-                        "schedule.")
-    p.add_argument("--sync-phase", default=None, choices=["post-mlp", "post-attn", "exact"],
+                   help="Override the manifest sync schedule (range/comma layer list, "
+                        "'0-31' or '3,7,11'; ranges INCLUSIVE). Required when the checkpoint "
+                        "is a raw convert output, which carries no schedule.")
+    p.add_argument("--sync-phase", default=None,
                    help="Sync placement; DEFAULT reads it from the checkpoint's "
                         "train_meta.json (else post-attn). Scoring a model at the wrong phase "
                         "is a different network — a post-attn heal read as post-mlp measured "
                         "0.553 vs its true 0.700. 'post-attn'=lever B, L+1 syncs; "
                         "'post-mlp'=the attention sync dropped instead, L syncs; "
-                        "'exact'=2 syncs/layer ≡ dense.")
+                        "'exact'=2 syncs/layer ≡ dense. A per-layer schedule is a comma list "
+                        "of 'layers:phase' segments, a leading bare phase being the default "
+                        "the rest override ('0-31:post-attn,32-63:post-mlp').")
     p.add_argument("--fuse-tracks", type=int, default=None,
                    help="F rank-local tracks pool their partials at every non-sync sublayer "
                         "(N/F-track behaviour on N shards). DEFAULT reads it from the "
@@ -212,11 +215,15 @@ def main() -> int:
     except ValueError as e:
         raise SystemExit(str(e))
     layout = build_groups(n_tracks=manifest.n_tracks, fuse_ranks=plan.fuse_ranks)
+    # Resolved here so a bad spec raises before the model is built, and so the
+    # all-exact fallback below is a property of the SCHEDULE rather than a string
+    # comparison that "0-63:exact" would slip past.
+    phases = resolve_phases(args.sync_phase, manifest.num_layers)
     if args.sync_indices is not None:
-        sync_layers = [int(x) for x in args.sync_indices.split(",") if x.strip() != ""]
+        sync_layers = parse_layers(args.sync_indices)
     elif manifest.sync_layer_indices is not None:
         sync_layers = list(manifest.sync_layer_indices)
-    elif args.sync_phase == "exact":
+    elif set(phases) == {"exact"}:
         sync_layers = list(range(manifest.num_layers))  # exact ignores the schedule
     else:
         raise SystemExit(
@@ -292,6 +299,16 @@ def main() -> int:
         if args.engine_replicas:
             from parallm.engine import PackedShadow, make_engine_forward_fn
 
+            # The engine walk is post-attn by construction (see its module docstring)
+            # and carries no phase of its own, so a per-layer schedule would be
+            # scored as post-attn everywhere — a different network, silently.
+            if set(phases) != {"post-attn"}:
+                raise SystemExit(
+                    f"[error] --engine-replicas scores through the engine forward, which "
+                    f"is post-attn only; this checkpoint's schedule is "
+                    f"{args.sync_phase!r}. Drop --engine-replicas to score it on the PT "
+                    f"forward."
+                )
             _log(rank, f"[init] loading packed pool {args.engine_replicas}…")
             shadow = PackedShadow(args.engine_replicas, args.checkpoint_dir,
                                   student, torch.cuda.current_device())

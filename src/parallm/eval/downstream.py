@@ -18,7 +18,7 @@ EVAL_TASK_PATH = str(Path(__file__).resolve().parents[3] / "configs" / "eval_tas
 
 # The macro task set, shared by the trainer's in-loop eval and the standalone
 # script so the two report the same number: reasoning (arc_easy / arc_challenge),
-# math (mmlu_math_mc), knowledge (mmlu_cs_mc) and code (codemmlu_fim).
+# math (mmlu_math_mc) and knowledge (mmlu_cs_mc).
 #
 # Changing this changes what "macro" means and silently voids comparability with
 # every macro= already recorded in logs/ — re-baseline rather than compare across
@@ -33,7 +33,16 @@ EVAL_TASK_PATH = str(Path(__file__).resolve().parents[3] / "configs" / "eval_tas
 # 2026-08-21, and mmlu_cs_mc joined on 2026-08-22. Every macro= in logs/ before
 # those dates is a different number. mmlu_pro_math_mc still ships in
 # configs/eval_tasks and can be scored by name for a side-by-side.
-DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_math_mc,mmlu_cs_mc,codemmlu_fim"
+#
+# ⚡ codemmlu_fim LEFT the macro on 2026-09-12, and this list is now exactly `macro4`
+# — the fim-free bridge metric. The fim slot was a COPY TEST (the gold option sat
+# verbatim in the prompt in 98.3% of docs) that correlated +1.000 with copy-rate and
+# NEGATIVELY with mmlu_cs, i.e. it paid for estimator damage; scripts/macro4.py was
+# built to re-score the archive without it. Adopting it as the default means a run
+# scored now compares to those re-scores. It is the 5-task macro= readings in logs/
+# that do not bridge. The task still ships in configs/eval_tasks and is scorable by
+# name for a side-by-side.
+DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_math_mc,mmlu_cs_mc"
 
 
 class MissingTasks(KeyError):

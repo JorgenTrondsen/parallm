@@ -7,6 +7,7 @@ K>1 forward path end-to-end without needing a distributed launcher.
 """
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -298,6 +299,200 @@ def test_sync_sets_maps_each_phase_to_two_sets():
     for phase in ("post-attn", "post-mlp", "exact"):
         pt2.set_sync_phase(phase)
         assert L - 1 in pt2.sync_sets()[1], phase
+
+
+def test_spec_forms_resolve_to_the_same_sets_as_the_bare_phase_names():
+    """The per-layer spec is a GENERALISATION, not a replacement.
+
+    The three bare names are the three uniform schedules, and every number this
+    program has on record was measured under one of them. This walks the old
+    three-branch derivation against the new one for every (phase, schedule) pair —
+    including a schedule that omits `last`, which is the case the `{last}` seed in
+    `sync_sets_for` exists to reproduce.
+    """
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+
+    def old(phase, boundaries):
+        last = L - 1
+        if phase == "exact":
+            return set(range(L)), set(range(L))
+        b = set(boundaries)
+        if phase == "post-mlp":
+            return set(), b | {last}
+        return b, {last}
+
+    schedules = [
+        list(range(L)),                       # d1b
+        [1, 3, 5, 7],                         # D=2, contains `last`
+        [1, 3, 5],                            # omits `last`
+        [0],
+        [L - 1],
+    ]
+    for sched in schedules:
+        pt = PTWrappedModel(
+            text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+            sync_after_layers=sched, track_group=None,
+        ).eval()
+        for phase in ("post-attn", "post-mlp", "exact"):
+            pt.set_sync_phase(phase)
+            assert pt.sync_sets() == old(phase, sched), (phase, sched)
+            # A fully-covering explicit segment is the same schedule as the name.
+            pt.set_sync_phase(f"0-{L - 1}:{phase}")
+            assert pt.sync_sets() == old(phase, sched), (phase, sched)
+
+
+def test_sync_phase_spec_splits_the_stack_per_layer():
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=list(range(L)), track_group=None,
+    ).eval()
+
+    # The ask: front half lever B, back half SPD. One sync per layer either way, so
+    # the budget is unchanged and only the PLACEMENT moves.
+    pt.set_sync_phase("0-3:post-attn,4-7:post-mlp")
+    attn, mlp = pt.sync_sets()
+    assert (attn, mlp) == ({0, 1, 2, 3}, {4, 5, 6, 7})
+    assert len(attn) + len(mlp) == L
+
+    # A leading bare phase is the default the segments override: the isolation cell.
+    pt.set_sync_phase("exact,4-5:post-attn")
+    attn, mlp = pt.sync_sets()
+    assert attn == set(range(L))
+    assert mlp == set(range(L)) - {4, 5}
+    assert L - 1 in mlp  # the head still gets its synced state
+
+    # A segment's layers may themselves be a comma list.
+    pt.set_sync_phase("post-mlp,1,3:post-attn")
+    assert pt.sync_sets()[0] == {1, 3}
+
+    # Segments apply in order, last write wins.
+    pt.set_sync_phase("post-attn,0-7:post-mlp")
+    assert pt.sync_sets() == (set(), set(range(L)))
+
+
+def test_sync_phase_spec_refuses_what_it_cannot_mean():
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=list(range(L)), track_group=None,
+    ).eval()
+    pt.set_sync_phase("post-attn")
+    before = pt.sync_sets()
+
+    # An uncovered layer is the failure that would silently score a different
+    # network, so it raises and NAMES the gap.
+    with pytest.raises(ValueError, match=r"4-7"):
+        pt.set_sync_phase("0-3:post-attn")
+    with pytest.raises(ValueError, match="unknown sync phase"):
+        pt.set_sync_phase("post-atn")
+    with pytest.raises(ValueError, match=r"outside 0\.\.7"):
+        pt.set_sync_phase("0-3:post-attn,4-99:exact")
+    # A refused spec changes nothing — validation happens before any assignment.
+    assert pt.sync_phase == "post-attn" and pt.sync_sets() == before
+
+
+def test_cross_rank_fuse_is_disabled_only_when_every_sublayer_syncs():
+    """`cross_rank_enabled` is read off the SETS, not the phase name.
+
+    The fuse tier is a semantic no-op exactly when every sublayer feeds a global
+    sync — that is what keeps the `exact` teacher free. A spec that is exact on only
+    a band still carries MLP deltas un-summed across the fuse group at the band
+    edges, so the fuse is load-bearing there and must stay on.
+    """
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=2, local_track_ids=(0, 1),
+        sync_after_layers=list(range(L)), track_group=None,
+    ).eval()
+    for spec, want in [
+        ("exact", False),
+        (f"0-{L - 1}:exact", False),
+        ("post-attn", True),
+        ("post-mlp", True),
+        ("0-3:post-attn,4-7:post-mlp", True),
+        ("exact,4-5:post-attn", True),
+    ]:
+        pt.set_sync_phase(spec)
+        assert pt.sync_module.cross_rank_enabled is want, spec
+
+
+def test_mixed_spec_forward_matches_a_hand_composed_reference():
+    """The mixed walk is the two placements spliced at the layer they change.
+
+    `_run_stack` is driven purely by the two sets, so this is what proves the SETS
+    are the schedule: a longhand loop that runs post-attn on the front half and
+    post-mlp on the back half, written out, must be the same function.
+    """
+    from parallm.model.seam import seam_mlp, seam_token_mixer
+
+    cfg = _tiny_config()
+    L = cfg.num_hidden_layers
+    n_tracks = 2
+    torch.manual_seed(17)
+    dense = Qwen3_5TextModel(cfg).eval()
+    dense.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+    nn.init.normal_(dense.lm_head.weight, mean=0.0, std=0.02)
+    tracks, _ = slice_model_to_tracks(
+        dense, n_tracks=n_tracks, sync_block_depth=1, text_config_attr="config"
+    )
+    pt = PTWrappedModel(
+        text_config=cfg, n_tracks=n_tracks, local_track_ids=(0, 1),
+        sync_after_layers=list(range(L)), track_group=None,
+    ).eval()
+    pt.load_track_state_dicts({0: tracks[0], 1: tracks[1]}, strict=False)
+
+    front = set(range(L // 2))  # post-attn here, post-mlp on the rest
+    pt.set_sync_phase(f"0-{L // 2 - 1}:post-attn,{L // 2}-{L - 1}:post-mlp")
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 16))
+    attention_mask = torch.ones((1, 16), dtype=torch.long)
+
+    with torch.no_grad():
+        got, _ = pt(input_ids=input_ids, attention_mask=attention_mask)
+
+        tm0 = pt.text_models[0]
+        h = pt.embed(input_ids)
+        pos_ids, text_pos_ids = tm0._resolve_position_ids(h, None)
+        masks = pt._adapter.build_masks(tm0.config, h, attention_mask, text_pos_ids)
+        pos_emb = tm0.rotary_emb(h, pos_ids)
+
+        block_start = h
+        per_track = [h for _ in pt.text_models]
+        for i in range(L):
+            mask = masks[tm0.config.layer_types[i]]
+            h_attn = [
+                seam_token_mixer(tm.layers[i], per_track[k], pos_emb, mask, text_pos_ids)
+                for k, tm in enumerate(pt.text_models)
+            ]
+            if i in front:
+                # post-attn: reduce between the halves, then carry the MLP un-summed.
+                R = pt.sync_module(h_attn, block_start)
+                block_start = R
+                per_track = [seam_mlp(tm.layers[i], R) for tm in pt.text_models]
+                if i == L - 1:
+                    h = R
+            else:
+                # post-mlp: the whole layer own-carry, one reduce after it.
+                new_h = [seam_mlp(tm.layers[i], h_attn[k])
+                         for k, tm in enumerate(pt.text_models)]
+                h = pt.sync_module(new_h, block_start)
+                block_start = h
+                per_track = [h for _ in pt.text_models]
+        want = pt.lm_head(tm0.norm(h))
+
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6)
+
+    # Non-vacuous: the split is a different network from EITHER uniform placement.
+    for phase in ("post-attn", "post-mlp"):
+        pt.set_sync_phase(phase)
+        with torch.no_grad():
+            other, _ = pt(input_ids=input_ids, attention_mask=attention_mask)
+        assert (other - want).abs().max().item() > 1e-3, phase
 
 
 def test_post_mlp_walk_matches_a_whole_layer_reference_loop():
