@@ -10,8 +10,44 @@ split itself was rail-validated there; the estimator machinery was not).
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
+
+
+class FoldRead(NamedTuple):
+    """What an MLP reads at an attention-replica layer whose ``o_proj`` is FOLDED into
+    this track's own gate/up slices (`parallm.model.attn_replica`, spec ``o:fold``).
+
+    The plain read is one tensor, ``R + Â`` with ``Â = W_o a``. RMSNorm is a per-token
+    scalar times ``γ``, so ``gate_t(norm(R + W_o a)) = [gate_t(γ⊙R) + (gate_t·diag(γ)·W_o) a]
+    / s`` — the folded ``gate``/``up`` are ``[I/N, q_dim]`` per track and ``W_o`` is never
+    stored. ``inv_s = 1/s`` is the one place ``Â`` still enters, from a sketch of it.
+
+    ``gate``/``up`` are stacked ``[K, I/N, q_dim]`` over the tracks this rank walks;
+    `track` picks one.
+    """
+
+    R: torch.Tensor       # the shared residual entering the layer, [B, T, H]
+    a: torch.Tensor       # the replica's concatenated head outputs, [B, T, q_dim]
+    inv_s: torch.Tensor   # 1/rms(R + Â_sketch) per token, fp32 [B, T, 1]
+    gate: torch.Tensor
+    up: torch.Tensor
+
+    def track(self, k: int) -> "FoldRead":
+        return self._replace(gate=self.gate[k], up=self.up[k])
+
+
+def fold_mlp(mlp, norm, fr: FoldRead) -> torch.Tensor:
+    """One track's MLP delta at a folded read: ``down(act(g)·u)`` with
+    ``g = (gate(γ⊙R) + a·Gᵀ)/s``. The scalar multiply runs in fp32 and rounds once to the
+    model dtype, as the norm's own ``hs * rsqrt(var)`` does."""
+    dt = fr.R.dtype
+    xr = norm.weight * fr.R
+    g = mlp.gate_proj(xr).float() + torch.matmul(fr.a, fr.gate.transpose(-2, -1)).float()
+    u = mlp.up_proj(xr).float() + torch.matmul(fr.a, fr.up.transpose(-2, -1)).float()
+    g, u = (g * fr.inv_s).to(dt), (u * fr.inv_s).to(dt)
+    return mlp.down_proj(mlp.act_fn(g) * u)
 
 
 def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids):
@@ -39,13 +75,22 @@ def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids
     return x + y
 
 
-def seam_mlp(layer, h_attn: torch.Tensor) -> torch.Tensor:
+def seam_mlp(layer, h_attn: torch.Tensor, x_read: "torch.Tensor | None" = None) -> torch.Tensor:
     """Second half: ``post_attention_layernorm`` → ``mlp`` → residual add.
 
     A sparse MoE block may hand back ``(hidden_states, router_scores)`` (gpt-oss)
     rather than a bare tensor; only the hidden state joins the residual.
+
+    ``x_read``: the tensor the MLP READS, when it differs from the residual its delta
+    is added to — the attention replica's shared ``R + Â``. The carry does NOT hold it,
+    so the post-MLP sync still sums the exact per-track deltas. ``None`` is the plain
+    seam, bit for bit. A `FoldRead` is the replica's folded read (`fold_mlp`); the three
+    are separate dynamo specializations, not a graph break.
     """
-    y = layer.mlp(layer.post_attention_layernorm(h_attn))
+    if isinstance(x_read, FoldRead):
+        y = fold_mlp(layer.mlp, layer.post_attention_layernorm, x_read)
+    else:
+        y = layer.mlp(layer.post_attention_layernorm(h_attn if x_read is None else x_read))
     return h_attn + (y[0] if isinstance(y, tuple) else y)
 
 
@@ -164,5 +209,6 @@ def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):
 
     return (
         lambda layer, x, mask: checkpoint(_mixer, layer, x, mask, use_reentrant=False),
-        lambda layer, x: checkpoint(mlp_fn, layer, x, use_reentrant=False),
+        lambda layer, x, x_read=None: checkpoint(
+            mlp_fn, layer, x, x_read, use_reentrant=False),
     )

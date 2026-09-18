@@ -84,6 +84,36 @@ def slicer_key(k: str) -> "str | None":
     return _TOP.get(k)
 
 
+def read_hf_tensors(hf_model: str, names) -> "dict[str, torch.Tensor]":
+    """A NAMED subset of the checkpoint's weights → bf16, keyed like the slicer.
+
+    `stream_text_state_dict` reads everything — 61 GiB at 32B — where an attention replica
+    over 32 layers needs ~5.6 GiB of it, once per rank. Raises if any name is absent.
+    """
+    want = set(names)
+    idx = os.path.join(hf_model, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        by_shard: dict[str, "list[str] | None"] = {}
+        for k, shard in json.load(open(idx))["weight_map"].items():
+            if slicer_key(k) in want:
+                by_shard.setdefault(shard, []).append(k)  # type: ignore[union-attr]
+    else:
+        by_shard = {"model.safetensors": None}
+    out: dict[str, torch.Tensor] = {}
+    for shard, ks in by_shard.items():
+        with safe_open(os.path.join(hf_model, shard), framework="pt") as f:
+            present = set(f.keys())
+            for k in (ks if ks is not None else [k for k in present if slicer_key(k) in want]):
+                base = k.rsplit(".", 1)[0]
+                sib = {s: f.get_tensor(f"{base}.{s}")
+                       for s in ("weight_scale", "weight_scale_2")
+                       if f"{base}.{s}" in present}
+                out[slicer_key(k)] = dequant_weight(f.get_tensor(k), sib)
+    if missing := sorted(want - set(out)):
+        raise KeyError(f"{hf_model} has no {missing[:3]}{' ...' if len(missing) > 3 else ''}")
+    return out
+
+
 # Some checkpoints store MoE experts UNFUSED (one 2-D Linear per expert, e.g. the
 # NVFP4 build's `experts.{e}.gate_proj/up_proj/down_proj`) rather than the fused 3-D
 # slabs the slicer expects. Detect those and fuse after dequant.

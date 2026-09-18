@@ -225,6 +225,10 @@ class PTWrappedModel(nn.Module):
         # Sync placement phase (see `set_sync_phase` / `sync_sets`). "post-mlp" =
         # sync after every boundary layer's MLP, the whole layer run own-carry.
         self.sync_phase = "post-mlp"
+        # Optional attention replica (see `set_attn_replica`): at post-MLP-only layers a
+        # compressed copy of the dense attention feeds every track's MLP read. None = off.
+        self._attn_replica = None
+        self._attn_replica_layers: frozenset = frozenset()
         # Optional HostResidentLayers: when set, the walk pages each decoder
         # layer in from pinned host DRAM and drops it again (the streamed
         # teacher). None = every layer stays resident, the normal path.
@@ -357,6 +361,87 @@ class PTWrappedModel(nn.Module):
             self.sync_phase, self.sync_after_layers, len(self.text_models[0].layers)
         )
 
+    @property
+    def global_tracks(self) -> int:
+        """N — the number of tracks the CONVERT was sliced into, whatever this rank runs.
+
+        ⚠ Not ``n_tracks``: a merged track holds ``merge_group`` of them, so ``n_tracks`` is 1
+        there. Anything sized per track — an attention replica's fold — must divide by THIS.
+        """
+        return self.n_tracks * self.merge_group
+
+    def check_attn_replica_layers(self, layers) -> list:
+        """Sorted ``layers``, or ValueError where the shared-``R`` identity fails.
+
+        Two conditions make an attention replica well-defined at layer ``i``, and each is
+        silent if violated:
+
+        - ``i`` has NO post-attn sync. With one, the MLP already reads the true ``R + A`` and
+          the replica's ``Â`` would be counted on top of it.
+        - ``i-1`` HAS a post-MLP sync. Without it the tracks do not share ``R``, so an
+          attention recomputed from a local copy is not a function of a state this node holds.
+
+        Validated against `sync_sets` rather than against the phase STRING, so a per-layer
+        spec is checked by what it actually resolves to. Public so a caller can refuse the
+        cell BEFORE reading gigabytes of attention off the teacher.
+        """
+        from parallm.utils.layers import format_layers
+
+        if self.exec_groups > 1 or self.merge_group > 1:
+            # `_run_batched_stack` has no replica branch, so installing one there would drop
+            # it silently and score a different network. Eval runs merge_group 1.
+            raise ValueError(
+                f"attn replica runs on the looped walk only; this model is merged "
+                f"(merge_group={self.merge_group}, exec_groups={self.exec_groups}).")
+        L = len(self.text_models[0].layers)
+        layers = sorted(set(layers))
+        attn, mlp = self.sync_sets()
+        if not layers:
+            raise ValueError("attn replica was asked for with no layers")
+        if bad := [i for i in layers if not 1 <= i < L]:
+            raise ValueError(f"attn replica layers {format_layers(bad)} outside 1..{L - 1}")
+        if bad := [i for i in layers if i in attn]:
+            raise ValueError(
+                f"attn replica needs layers with NO post-attn sync, but {format_layers(bad)} "
+                f"sync post-attn under --sync-phase {self.sync_phase!r} — their MLPs already "
+                f"read the true R + A, so Â would be counted on top of it.")
+        if bad := [i for i in layers if i - 1 not in mlp]:
+            raise ValueError(
+                f"attn replica needs a post-MLP sync BEFORE each layer, but "
+                f"{format_layers(bad)} follow a layer that has none under --sync-phase "
+                f"{self.sync_phase!r} — without a shared R a local copy cannot reproduce the "
+                f"attention. Give layer i-1 a post-MLP sync (e.g. an `exact` segment at the "
+                f"seam).")
+        return layers
+
+    def set_attn_replica(self, replica) -> None:
+        """Install (or clear, with ``replica=None``) an attention replica over
+        ``replica.layer_ids`` — see `parallm.model.attn_replica`.
+
+        Every track's MLP reads the shared ``R + Â``, and each track still runs its own
+        attention slice into the carry, so the post-MLP sync writes the exact ``A`` into the
+        residual and the replica's error never compounds. `check_attn_replica_layers` holds
+        the preconditions.
+        """
+        if replica is None:
+            self._attn_replica, self._attn_replica_layers = None, frozenset()
+            return
+        layers = self.check_attn_replica_layers(replica.layer_ids)
+        # The fold needs THIS student's gate/up slices — built here, not at load.
+        replica.bind_fold(self)
+        self._attn_replica, self._attn_replica_layers = replica, frozenset(layers)
+
+    def _attn_replica_state(self, li: int, block_start, position_embeddings, layer_mask):
+        """``R + Â`` at a replica layer (a `seam.FoldRead` where o is folded), else None.
+        Called in the WALK, outside every compiled unit; ``block_start`` is the shared
+        ``[B, T, H]`` the preconditions guarantee there."""
+        if li not in self._attn_replica_layers:
+            return None
+        # No `no_grad`: a frozen replica has no parameter that wants gradient, so autograd
+        # records nothing unless `block_start` carries graph — and there the path through Â
+        # is part of the true gradient.
+        return self._attn_replica.read(li, block_start, position_embeddings, layer_mask)
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -460,7 +545,7 @@ class PTWrappedModel(nn.Module):
         schedule that computes both); ``(-1, "mlp")`` holds the embedding, so
         layer 0 has a pre-state to difference against.
         """
-        from parallm.model.seam import checkpointed_halves
+        from parallm.model.seam import FoldRead, checkpointed_halves
 
         L = len(self.text_models[0].layers)
         last = L - 1
@@ -502,6 +587,7 @@ class PTWrappedModel(nn.Module):
             layer_mask = layer_masks[self.text_models[0].config.layer_types[i]]
             if self.layer_stream is not None:
                 self.layer_stream.acquire(i)
+            x_hat = self._attn_replica_state(i, block_start, position_embeddings, layer_mask)
             # Fuse after every sublayer, and feed a global sync one leader per
             # group: at a boundary the group members share their pre-state, so
             # summing all F would count it F times. No-ops at fuse_size=1.
@@ -527,8 +613,13 @@ class PTWrappedModel(nn.Module):
                 # residual, so its delta is all there is to sum.
                 mlp_pre = R
             else:
+                # The MLP READS the replica's shared `R + Â`; the carry its delta joins does
+                # NOT hold it, so the post-MLP sync still sums the exact Σ_k d_k. Two
+                # tensors, never add-then-subtract.
                 new_h = self.sync_module.fuse(
-                    [run_mlp(tm.layers[i], h_attn[k]) for k, tm in enumerate(self.text_models)],
+                    [run_mlp(tm.layers[i], h_attn[k],
+                             x_hat.track(k) if isinstance(x_hat, FoldRead) else x_hat)
+                     for k, tm in enumerate(self.text_models)],
                     h_attn,
                 )
                 mlp_pre = block_start

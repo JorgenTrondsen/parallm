@@ -166,6 +166,24 @@ def main() -> int:
                         "(N/F-track behaviour on N shards). DEFAULT reads it from the "
                         "checkpoint's train_meta.json (else 1) — same trap as --sync-phase: "
                         "scoring a fused model unfused is a different network.")
+    p.add_argument("--read-attn-replica", default=None, metavar="SPEC",
+                   help="At post-MLP-only layers, run ONE copy of the dense attention on "
+                        "every track (parallm.model.attn_replica), no collective: every "
+                        "track holds the same synced R, so each MLP reads R + Â and the "
+                        "per-track angle defect is gone. SPEC is `exact`, or a comma list of "
+                        "q|k|v|o:RANK, :sPCT (Wanda-pruned) or :RANK/sPCT (pruned factors) — "
+                        "a projection not named stays exact. `o:fold[/sPCT],norm:X` folds o "
+                        "into each track's own gate/up (exact o, no o_proj stored) and keeps "
+                        "only what the post-attention norm's scalar needs: X = exact (the "
+                        "rail) | r<RANK> (a rank sketch of W_o; r0 = rms(R)), optionally +c "
+                        "(bias-corrected). Eval-only.")
+    p.add_argument("--read-attn-replica-layers", default="32-63",
+                   help="Layer range for --read-attn-replica (inclusive).")
+    p.add_argument("--read-attn-replica-bases", default=None,
+                   help="bases.safetensors from scripts/calib_attn_replica.py, comma-joined "
+                        "with x_rms.safetensors when SPEC prunes q/k/v, o_rms.safetensors when "
+                        "it prunes o or the fold, z_rms.safetensors for RANK/sPCT and "
+                        "norm_c.safetensors for a `+c` scalar; required unless SPEC is `exact`.")
     p.add_argument("--engine-replicas", default=None,
                    help="Path to a packed replica pool: score the student through the "
                         "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
@@ -269,9 +287,40 @@ def main() -> int:
         track_states = {tid: load_track(args.checkpoint_dir, tid) for tid in layout.local_track_ids}
         student.load_track_state_dicts(track_states, strict=True)
         student.set_sync_phase(args.sync_phase)
+        if args.read_attn_replica:
+            if args.engine_replicas:
+                raise SystemExit("[error] --read-attn-replica runs the plain PT walk; the "
+                                 "engine forward knows nothing about it")
+            _rl = parse_layers(args.read_attn_replica_layers)
+            try:  # refuse the cell BEFORE reading ~5 GiB of attention off the teacher
+                student.check_attn_replica_layers(_rl)
+            except ValueError as e:
+                raise SystemExit(f"[error] --read-attn-replica: {e}")
         # bf16 on the HOST first — see the same note in train_cli._build_student.
         student = student.to(torch.bfloat16).to(torch.cuda.current_device())
         student.eval()
+        if args.read_attn_replica:
+            from parallm.model.attn_replica import fold_spec, load_replica, replica_memory
+
+            try:
+                # `set_attn_replica` checks the cell and binds a fold to THIS student's
+                # slices (its provenance rail raises).
+                student.set_attn_replica(load_replica(
+                    args.hf_model, text_cfg, _rl, args.read_attn_replica,
+                    args.read_attn_replica_bases, torch.cuda.current_device()))
+            except (ValueError, KeyError, RuntimeError) as e:
+                raise SystemExit(f"[error] --read-attn-replica: {e}")
+            _mem = replica_memory(text_cfg, args.read_attn_replica, len(_rl), sum(
+                f.stat().st_size for f in Path(args.hf_model).glob("*.safetensors")),
+                n_tracks=student.global_tracks)
+            _fold = (f"; o folded into each track's gate/up {_mem['gib_fold']:.3f} + norm "
+                     f"sketch {_mem['gib_sketch']:.3f}" if fold_spec(args.read_attn_replica)
+                     else "")
+            _log(rank, f"[init] attn replica: {args.read_attn_replica} over "
+                       f"{args.read_attn_replica_layers} — {_mem['gib']:.3f} GiB "
+                       f"({_mem['pct']:.2f}% mdl; {_mem['gib_net']:.3f} net of the track's "
+                       f"own kv head{_fold}), KV {_mem['kv_per_token'] / 1024:.0f} "
+                       f"KiB/tok (latent {_mem['kv_per_token_latent'] / 1024:.0f})")
 
     if want_teacher:
         _log(rank, "[init] loading frozen dense teacher…")
