@@ -40,7 +40,13 @@ from transformers import AutoConfig, AutoTokenizer
 
 from parallm.dist.fsdp_setup import wrap_teacher_with_fsdp
 from parallm.dist.groups import build_groups
-from parallm.eval.downstream import DEFAULT_TASKS, EVAL_TASK_PATH, MissingTasks, macro_metrics
+from parallm.eval.downstream import (
+    DEFAULT_TASKS,
+    EVAL_TASK_PATH,
+    MissingTasks,
+    macro_metrics,
+    slim_samples,
+)
 from parallm.eval.lm_eval_adapter import (
     is_lm_head_owner,
     make_student_forward_fn,
@@ -143,7 +149,10 @@ def main() -> int:
                         "prompts the in-loop macro truncated, and the two numbers would diverge.")
     p.add_argument("--output-json", default=None,
                    help="Optional path to dump per-target lm-eval results dict (rank 0 only). "
-                        "In 'both' mode the file contains a top-level {student, teacher} dict.")
+                        "In 'both' mode the file contains a top-level {student, teacher} dict. "
+                        "What scripts/paired_macro.py reads — pairing per doc_id resolves "
+                        "~0.010 against ~±0.017 for a point estimate. Samples are trimmed to "
+                        "the fields read back (eval.downstream.slim_samples).")
     p.add_argument("--seed", type=int, default=42,
                    help="lm-eval random/numpy/torch seed. Identical on every rank so request "
                         "ordering and fewshot sampling line up across ranks. Matches the "
@@ -392,7 +401,8 @@ def main() -> int:
             print()
         if args.output_json:
             Path(args.output_json).write_text(
-                json.dumps(all_results, indent=2, default=str)
+                json.dumps({tgt: slim_samples(r) for tgt, r in all_results.items()},
+                           indent=2, default=str)
             )
             print(f"full results → {args.output_json}")
 

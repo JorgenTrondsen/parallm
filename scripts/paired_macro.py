@@ -39,10 +39,9 @@ def per_doc(path: str, tasks: list[str] = TASKS) -> dict[str, dict[int, float]]:
 def mcnemar(A: dict, B: dict, tasks: list[str] = TASKS):
     """``(rows, macro_diff, macro_SE, z, p)`` for two per-doc dicts over `tasks`.
 
-    Factored out of `main` so the fim-free macro (`scripts/macro4.py`) computes its statistics
-    with THIS implementation rather than a second copy — one set of maths, one place to be
-    wrong. `tasks` is a parameter for exactly that reason: dropping `codemmlu_fim` must not
-    mean re-deriving the paired SE.
+    Factored out of `main` so a rescore over a different task set uses THIS implementation
+    rather than a second copy — one set of maths, one place to be wrong. That is what `tasks`
+    is a parameter for: dropping `codemmlu_fim` must not mean re-deriving the paired SE.
     """
     tot_d, var, rows = 0.0, 0.0, []
     for t in tasks:

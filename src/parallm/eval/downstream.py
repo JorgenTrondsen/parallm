@@ -37,11 +37,10 @@ EVAL_TASK_PATH = str(Path(__file__).resolve().parents[3] / "configs" / "eval_tas
 # ⚡ codemmlu_fim LEFT the macro on 2026-09-12, and this list is now exactly `macro4`
 # — the fim-free bridge metric. The fim slot was a COPY TEST (the gold option sat
 # verbatim in the prompt in 98.3% of docs) that correlated +1.000 with copy-rate and
-# NEGATIVELY with mmlu_cs, i.e. it paid for estimator damage; scripts/macro4.py was
-# built to re-score the archive without it. Adopting it as the default means a run
-# scored now compares to those re-scores. It is the 5-task macro= readings in logs/
-# that do not bridge. The task still ships in configs/eval_tasks and is scorable by
-# name for a side-by-side.
+# NEGATIVELY with mmlu_cs, i.e. it paid for estimator damage, and the archive was
+# re-scored without it. Adopting it as the default means a run scored now compares to
+# those re-scores. It is the 5-task macro= readings in logs/ that do not bridge. The
+# task still ships in configs/eval_tasks and is scorable by name for a side-by-side.
 DEFAULT_TASKS = "arc_easy,arc_challenge,mmlu_math_mc,mmlu_cs_mc"
 
 
@@ -94,3 +93,26 @@ def macro_metrics(
     if missing:
         raise MissingTasks(f"expected tasks did not score: {missing} (got {sorted(table)})")
     return out
+
+
+# ⚠ A DROP list, not a keep list: an unlisted field costs bytes, but a keep list would have
+# to name every metric and would silently drop the score of a task that reports something
+# other than acc.
+_DROP_SAMPLE_FIELDS = frozenset(
+    {"doc", "arguments", "resps", "filtered_resps", "filter",
+     "doc_hash", "prompt_hash", "target_hash"}
+)
+
+
+def slim_samples(results: "dict | None") -> "dict | None":
+    """``results`` with each sample cut to doc_id, target and its metrics: 13.9 MB -> 0.6 MB.
+
+    Everything dropped is recomputed by re-running the eval. Shape is unchanged, so
+    `scripts/paired_macro.py` reads old and new dumps alike.
+    """
+    if not results or not results.get("samples"):
+        return results
+    return dict(results, samples={
+        task: [{k: v for k, v in rec.items() if k not in _DROP_SAMPLE_FIELDS} for rec in recs]
+        for task, recs in results["samples"].items()
+    })

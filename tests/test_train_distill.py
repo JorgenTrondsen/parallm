@@ -640,3 +640,100 @@ def test_block_loop_syncs_a_layer_that_is_in_both_sets():
         band = [i for i in sorted(attn & mlp) if i == 0 or i - 1 in mlp]
         worst = max(out["layer_relmse"][i] for i in band if i in out["layer_relmse"])
         assert worst < 1e-8, f"{spec}: exact band {band} reads {worst}, not ~0"
+
+
+# --------------------------------------------------------------------------- #
+# --train-layers: freeze everything outside an isolation cell's trained half
+# --------------------------------------------------------------------------- #
+
+def test_train_layers_freezes_everything_outside_the_range():
+    """Exactly the named layers trainable, and a real step moves those and ONLY those.
+
+    ⚠ Both halves are load-bearing: "nothing frozen moved" passes trivially if nothing
+    trains at all, so the kept layers must be shown to MOVE.
+    """
+    from parallm.train.distill import freeze_outside_layers
+
+    cfg, pt, teacher, sync_after = _d2_step_fixture()
+    keep = [0, 1, 2, 3]  # of 8; boundaries at 1 and 3 supervise them
+    frozen, live, outside = freeze_outside_layers(pt, keep)
+
+    # 1. requires_grad is exactly the kept layers — nothing else, layer or not.
+    for n, p in pt.named_parameters():
+        want = any(f".layers.{i}." in n for i in keep)
+        assert p.requires_grad == want, f"{n}: requires_grad={p.requires_grad}, expected {want}"
+    assert frozen > 0 and live > 0
+    # The non-layer tensors are reported by name so the log can never be silent about them.
+    assert outside and all(".layers." not in n for n in outside)
+    assert any(n.endswith("embed_tokens.weight") for n in outside)
+    assert any(n.endswith("norm.weight") for n in outside)
+
+    before = {n: p.detach().clone() for n, p in pt.named_parameters()}
+    distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                 DistillConfig(sync_layer_indices=sync_after, lambda_ce=0.0, lambda_block=4.0))
+
+    # 2. No gradient was even ACCUMULATED outside the range — not merely discarded.
+    for n, p in pt.named_parameters():
+        if not p.requires_grad:
+            assert p.grad is None, f"{n} is frozen but took a gradient"
+
+    trainable = [p for p in pt.parameters() if p.requires_grad]
+    torch.optim.AdamW(trainable, lr=1e-2).step()
+
+    moved = {n for n, p in pt.named_parameters() if not torch.equal(p.detach(), before[n])}
+    assert moved, "nothing moved at all — the step is a no-op and this test proves nothing"
+    for n in moved:
+        assert any(f".layers.{i}." in n for i in keep), f"{n} moved but is outside --train-layers"
+
+
+def test_train_layers_prunes_the_replicated_grad_plan():
+    """An all-frozen group costs an all-reduce a step for a gradient nothing reads, because
+    `sync_replicated_grads` zero-ALLOCATES a `.grad` per member before reducing."""
+    from parallm.adapters import get_adapter_for_config
+    from parallm.dist.groups import ProcessGroupLayout
+    from parallm.train.distill import freeze_outside_layers
+    from parallm.train.sync_grads import build_replication_plan
+
+    cfg, _dense, _tracks, pt = _build(n_tracks=4, n_layers=8)
+    layout = ProcessGroupLayout(
+        world_size=1, rank=0, n_tracks=4, tracks_per_rank=4,
+        local_track_ids=(0, 1, 2, 3), track_to_rank=(0, 0, 0, 0), track_group=None,
+        intra_track_size=1, intra_track_rank=0, intra_track_group=None,
+    )
+    kw = dict(adapter=get_adapter_for_config(cfg), text_cfg=cfg, layout=layout)
+    full = build_replication_plan(pt, **kw)
+    assert full, "no replicated groups to filter — the fixture cannot test this"
+
+    freeze_outside_layers(pt, [0, 1, 2, 3])
+    kept = [cg for cg in full if any(p.requires_grad for p in cg.local_params)]
+    # By identity: a ReplicationCoordGroup holds tensors, so `in` would compare them.
+    kept_ids = {id(cg) for cg in kept}
+    dropped = [cg for cg in full if id(cg) not in kept_ids]
+
+    assert 0 < len(kept) < len(full), "the filter dropped nothing or everything"
+    for cg in dropped:
+        assert not any(p.requires_grad for p in cg.local_params), "dropped a live group"
+    # Groups span tracks at ONE layer, so none can straddle the boundary and lose half
+    # its members' gradients.
+    for cg in full:
+        assert len({p.requires_grad for p in cg.local_params}) == 1
+
+
+def test_train_layers_matches_by_identity_not_by_name():
+    """A Parameter reachable both inside and outside the kept range must stay TRAINABLE.
+
+    Not hypothetical: a merged track re-points `post_attention_layernorm` at the merged
+    layer's own norm.
+    """
+    from parallm.train.distill import freeze_outside_layers
+
+    cfg, _dense, _tracks, pt = _build(n_tracks=2, n_layers=8)
+    shared = pt.text_models[0].layers[0].post_attention_layernorm.weight
+    # Alias it somewhere OUTSIDE the kept range: layer 7 now holds the same Parameter.
+    pt.text_models[0].layers[7].post_attention_layernorm.weight = shared
+
+    freeze_outside_layers(pt, [0, 1, 2, 3])
+
+    assert shared.requires_grad, (
+        "the shared Parameter was frozen through its layer-7 name, so layer 0 — which "
+        "--train-layers says is training — silently lost it")

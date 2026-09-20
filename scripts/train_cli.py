@@ -52,6 +52,7 @@ from parallm.train.data import (
 from parallm.train.distill import (
     DistillConfig,
     distill_step,
+    freeze_outside_layers,
     freeze_slice_teacher,
 )
 from parallm.train.sync_grads import (
@@ -368,6 +369,13 @@ def main() -> int:
                         "2026-07-30 as divergent — a verdict VOIDED by the block_mse "
                         "clamp bug it ran under (see distill_step). ⚠ under 'fr' the "
                         "probe's post-attn-phase rail is no longer a rail.")
+    p.add_argument("--train-layers", default=None, metavar="A-B",
+                   help="Train ONLY these decoder layers (inclusive range or comma list); "
+                        "EVERYTHING else freezes, including embed_tokens and the final norm, "
+                        "and is logged by name. For an isolation cell whose other half runs "
+                        "`exact` and so has nothing to learn: its block loss sits at the bf16 "
+                        "floor and its gradient is noise, which a bf16 step turns into real "
+                        "moves of the half the cell holds fixed.")
     # Recipe constants (the 9B-record defaults).
     p.add_argument("--max-steps", type=int, default=4001)
     p.add_argument("--seq-len", type=int, default=2048)
@@ -433,6 +441,17 @@ def main() -> int:
     p.add_argument("--eval-max-length", type=int, default=2048)
     p.add_argument("--eval-num-fewshot", type=int, default=None,
                    help="Override fewshot count for all tasks (default: each task's standard).")
+    p.add_argument("--eval-final-limit", type=int, default=None,
+                   help="Requests per task for the FINAL eval only (default: --eval-limit): "
+                        "watch the trajectory cheaply at 200, end on a 1000-request score "
+                        "pairable against arms evaluated at 1000. Not interchangeable — "
+                        "--limit slices a fixed-seed SHUFFLE, so 200 is a subset of 1000 "
+                        "carrying ~±0.015 of noise against a ~±0.010 resolution.")
+    p.add_argument("--eval-output-json", default=None, metavar="PATH",
+                   help="Write the FINAL eval's per-document samples here, in the shape "
+                        "scripts/eval_lm_harness.py writes, for scripts/paired_macro.py. "
+                        "Without it a --no-save run leaves nothing to pair against, and an "
+                        "unpaired number resolves ~0.017 against the macro's ~0.010.")
     # Cadence.
     p.add_argument("--eval-every", type=int, default=500)
     p.add_argument("--save-every", type=int, default=0)
@@ -524,6 +543,14 @@ def main() -> int:
                         "<out-dir>/probe). Keep it OFF '/' — that filesystem is a "
                         "9766M user quota.")
     args = p.parse_args()
+    if (args.eval_final_limit and args.eval_final_limit != args.eval_limit
+            and not args.no_save and args.eval_every):
+        # best/ is `macro > best_macro` across evals, so two document counts silently
+        # promote a checkpoint rather than raising.
+        raise SystemExit(
+            "[error] --eval-final-limit differs from --eval-limit while checkpoints are being "
+            "selected: best/ compares the final macro against the in-loop ones, which would then "
+            "be scored on different document counts. Pass --no-save or keep the two equal.")
 
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -695,11 +722,29 @@ def main() -> int:
         lm_head.weight = torch.nn.Parameter(w, requires_grad=False)
         lm_head = lm_head.to(torch.bfloat16).to(torch.cuda.current_device())
 
+    if args.train_layers:
+        _keep = parse_layers(args.train_layers)
+        _L = len(student.text_models[0].layers)
+        if bad := [i for i in _keep if not 0 <= i < _L]:
+            raise SystemExit(f"[error] --train-layers {args.train_layers!r}: layers "
+                             f"{format_layers(bad)} outside 0-{_L - 1}")
+        if not _keep:
+            raise SystemExit("[error] --train-layers named no layers; nothing would train")
+        _frozen, _live, _outside = freeze_outside_layers(student, _keep)
+        _log(rank, f"[init] --train-layers {format_layers(_keep)}: froze {_frozen / 1e9:.2f}B "
+                   f"params/rank, {_live / 1e9:.2f}B still trainable"
+                   + (f"; outside the decoder layers this froze {', '.join(_outside)}"
+                      if _outside else ""))
+
     plan = build_replication_plan(
         student, adapter=adapter, text_cfg=text_cfg, layout=layout,
         force_sync=args.sync_attention_heads,
     )
-    assert_replicated_consistent(plan)
+    assert_replicated_consistent(plan)  # on the FULL plan: every rank must see the same groups
+    if args.train_layers:
+        # `sync_replicated_grads` zero-ALLOCATES a .grad per member before reducing, so a
+        # frozen layer's norms cost an all-reduce a step for a gradient nothing reads.
+        plan = [cg for cg in plan if any(p_.requires_grad for p_ in cg.local_params)]
 
     trainable = [p_ for p_ in student.parameters() if p_.requires_grad]
     n_train = sum(p_.numel() for p_ in trainable)
@@ -860,16 +905,19 @@ def main() -> int:
                    f"({n_streams} streams/rank x {shards_per_stream} shards, "
                    f"fixed held-out batch)")
 
-    def run_eval(tag: str) -> float:
+    def run_eval(tag: str, dump: "Path | None" = None, limit: "int | None" = None) -> float:
         """The lm-evaluation-harness downstream macro on the live student.
 
         Same code path as ``scripts/eval_lm_harness.py``, and the student is
         scored at the schedule it trains on, so the in-loop number is directly
         comparable to a standalone run on the saved slices.
+
+        ``dump`` writes the per-document samples, which is what makes the number PAIRABLE
+        once ``--no-save`` has left no weights to re-score. Final eval only.
         """
         # Lazy: lm_eval is the optional [eval] extra, so a train-only install
         # still imports this script.
-        from parallm.eval.downstream import MissingTasks, macro_metrics
+        from parallm.eval.downstream import MissingTasks, macro_metrics, slim_samples
         from parallm.eval.lm_eval_adapter import (
             is_lm_head_owner, make_student_forward_fn, run_lm_eval,
         )
@@ -890,13 +938,18 @@ def main() -> int:
             results = run_lm_eval(
                 make_student_forward_fn(student), tokenizer,
                 tasks=eval_tasks, is_owner=is_lm_head_owner(student),
-                limit=args.eval_limit, batch_size=args.eval_batch_size,
+                limit=limit or args.eval_limit, batch_size=args.eval_batch_size,
                 max_length=args.eval_max_length, num_fewshot=args.eval_num_fewshot,
-                seed=args.seed, log_samples=False,
+                seed=args.seed, log_samples=dump is not None,
                 quiet=True,  # the training log gets the numbers, not progress bars
                 include_path=args.eval_task_path,
             )
         student.train()
+        if dump is not None and rank == 0 and results is not None:
+            dump.parent.mkdir(parents=True, exist_ok=True)
+            dump.write_text(
+                json.dumps({"student": slim_samples(results)}, indent=2, default=str))
+            _log(rank, f"{tag} per-doc samples -> {dump}")
         try:
             per_task = macro_metrics(results, eval_tasks)  # populated on rank 0 only
             score = sum(per_task.values()) / len(per_task) if per_task else 0.0
@@ -1020,7 +1073,9 @@ def main() -> int:
                               "sync_phase": args.sync_phase, "args": vars(args)}, rank)
 
     kprof.final_report(rank)  # after the loop: no collective is pending
-    macro = run_eval(f"[final] step {step}")
+    macro = run_eval(f"[final] step {step}",
+                     Path(args.eval_output_json) if args.eval_output_json else None,
+                     limit=args.eval_final_limit)
     if macro > best_macro and not args.no_save:
         _save_checkpoint(student, manifest, layout, out_dir / args.best_name,
                          {"step": step, "macro": macro,

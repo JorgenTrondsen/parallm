@@ -25,7 +25,7 @@ def _results(**task_metrics):
 #   RECORDED_FOUR (here) = arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim
 #                          — a pre-2026-08-22 log, before mmlu_cs_mc joined.
 #   macro4 / DEFAULT_TASKS = arc_easy, arc_challenge, mmlu_math_mc, mmlu_cs_mc
-#                          — fim-FREE, the bridge metric (scripts/macro4.py).
+#                          — fim-FREE, the bridge metric.
 # Score a historical log against RECORDED_FOUR; never compare the two means directly
 # just because both average four rows.
 RECORDED_FOUR = "arc_easy,arc_challenge,mmlu_math_mc,codemmlu_fim"
@@ -57,10 +57,10 @@ def _ledger(arc_easy, arc_challenge, mmlu_math_mc, codemmlu_fim, mmlu_cs_mc=0.79
 
 def test_default_tasks_are_the_recorded_macro():
     # codemmlu_fim left the macro on 2026-09-12. ⚡ This list is now exactly `macro4`
-    # — the fim-free bridge metric (scripts/macro4.py) that the whole historical
-    # archive was re-scored on after the fim slot turned out to be a copy test that
-    # REWARDED estimator damage. So the default is the number that DOES compare to
-    # the archive; it is the 5-task macro= readings in logs/ that do not.
+    # — the fim-free bridge metric the whole historical archive was re-scored on after
+    # the fim slot turned out to be a copy test that REWARDED estimator damage. So the
+    # default is the number that DOES compare to the archive; it is the 5-task macro=
+    # readings in logs/ that do not.
     assert DEFAULT_TASKS.split(",") == [
         "arc_easy", "arc_challenge", "mmlu_math_mc", "mmlu_cs_mc"]
     assert "codemmlu_fim" not in DEFAULT_TASKS
@@ -141,3 +141,49 @@ def test_an_explicit_task_subset_is_scored_alone():
 
 def test_unlisted_tasks_default_to_acc():
     assert macro(_results(mmlu={"acc,none": 0.55}), "mmlu") == pytest.approx(0.55)
+
+
+# ----- what a dump keeps -----
+
+def _sample(doc_id, acc=1.0):
+    return {"doc_id": doc_id, "doc": {"question": "x" * 180}, "target": 1,
+            "arguments": {"gen_args_0": {"arg_0": "x" * 300}},
+            "resps": [[[-13.4, False]], [[-1.1, True]]],
+            "filtered_resps": [[-13.4, False], [-1.1, True]],
+            "filter": "none", "metrics": ["acc", "acc_norm"],
+            "doc_hash": "d" * 64, "prompt_hash": "p" * 64, "target_hash": "t" * 64,
+            "acc": acc, "acc_norm": acc}
+
+
+def test_slim_samples_keeps_what_is_read_back():
+    from parallm.eval.downstream import slim_samples
+
+    res = _ledger(0.7550, 0.5500, 0.4350, 0.8450)
+    res["samples"] = {"arc_easy": [_sample(0), _sample(1, acc=0.0)]}
+    out = slim_samples(res)
+
+    assert set(out["samples"]["arc_easy"][0]) == {"doc_id", "target", "metrics",
+                                                  "acc", "acc_norm"}
+    # paired_macro.py reads these two by name.
+    assert [(r["doc_id"], r["acc"]) for r in out["samples"]["arc_easy"]] == [(0, 1.0), (1, 0.0)]
+    assert out["results"] == res["results"]
+    assert res["samples"]["arc_easy"][0]["doc"], "the caller's dict was mutated"
+
+
+def test_slim_samples_is_a_drop_list_so_an_unknown_metric_survives():
+    """A keep list would name every metric and silently lose an `exact_match` task's score."""
+    from parallm.eval.downstream import slim_samples
+
+    res = {"results": {}, "samples": {"gen_task": [
+        {"doc_id": 0, "doc": {"q": "?"}, "exact_match": 1.0, "some_new_score": 0.5}]}}
+    rec = slim_samples(res)["samples"]["gen_task"][0]
+    assert rec == {"doc_id": 0, "exact_match": 1.0, "some_new_score": 0.5}
+
+
+def test_slim_samples_passes_through_a_dump_with_no_samples():
+    # log_samples=False in-loop, and rank != 0, both yield no samples at all.
+    from parallm.eval.downstream import slim_samples
+
+    assert slim_samples(None) is None
+    res = _ledger(0.7550, 0.5500, 0.4350, 0.8450)
+    assert slim_samples(res) is res

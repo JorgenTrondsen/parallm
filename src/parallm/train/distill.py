@@ -99,6 +99,35 @@ def freeze_slice_teacher(model: PTWrappedModel) -> PTWrappedModel:
     return model
 
 
+def freeze_outside_layers(model: PTWrappedModel, layers) -> "tuple[int, int, list[str]]":
+    """Freeze every parameter outside ``layers``' decoder layers — what ``--train-layers`` does.
+
+    Returns ``(frozen, still-trainable, names frozen outside the decoder layers)``; the caller
+    logs that third value, since a freeze catching more than its flag names reads as a
+    plausible number.
+
+    ⚠ Membership is by IDENTITY, not by name: a tensor reachable under two names (a tied
+    embedding, a re-pointed merged norm) would otherwise be frozen through one and left live
+    under the other, silently.
+    """
+    keep = set(layers)
+    keep_ids = {id(p) for tm in model.text_models
+                for i, layer in enumerate(tm.layers) if i in keep
+                for p in layer.parameters()}
+    frozen = trainable = 0
+    outside: list[str] = []
+    for name, p in model.named_parameters():
+        if id(p) in keep_ids:
+            trainable += p.numel()
+        else:
+            if p.requires_grad:
+                p.requires_grad_(False)
+                frozen += p.numel()
+            if ".layers." not in name:
+                outside.append(name)
+    return frozen, trainable, outside
+
+
 @torch.no_grad()
 def teacher_forward(
     teacher: PTWrappedModel,
