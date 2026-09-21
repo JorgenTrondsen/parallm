@@ -42,6 +42,7 @@ Wanda-prunes the folded matrices by ``o_rms``. The read is a `seam.FoldRead`.
 from __future__ import annotations
 
 import copy
+import math
 from contextlib import ExitStack
 from dataclasses import dataclass
 
@@ -49,6 +50,7 @@ import torch
 import torch.nn as nn
 
 from parallm.model.replica import wanda_prune_weight
+from parallm.model.replica_code import coded_bits, decode, encode
 from parallm.model.replica_pack import _bits_per_weight
 from parallm.model.seam import FoldRead
 
@@ -58,6 +60,9 @@ KV = ("k", "v")
 EPS = 1e-12
 # The norm-sketch ranks `scripts/calib_attn_replica.py --norm-c` fits a constant for.
 NORM_LADDER = (0, 32, 64, 128, 256, 512)
+# A coded survivor: raw sign+mantissa plus a 4-bit exponent field — an upper bound on the
+# huffman code; `AttnReplica.stored_bytes` counts the true size.
+CODE_VALUE_BITS = 12
 
 
 @dataclass(frozen=True)
@@ -87,22 +92,29 @@ def _parse_norm(r: str) -> "tuple[str, int, bool] | None":
     return (f"r{int(name[1:])}" + ("+c" if bias else ""), int(name[1:]), bias)
 
 
-def _parse(spec: str) -> "tuple[dict, dict, FoldSpec | None]":
-    """``(ranks, fracs, fold)``: ``q:256,k:s50,o:1024/s60`` → ``({"q": 256, "o": 1024},
-    {"k": 0.5, "o": 0.6}, None)``. A projection in both is cut to its rank, then its factors
-    pruned. ``o:fold[/sPCT]`` with ``norm:X`` gives a `FoldSpec` instead of an o entry."""
+def _parse(spec: str) -> "tuple[dict, dict, FoldSpec | None, bool]":
+    """``(ranks, fracs, fold, code)``: ``q:256,k:s50,o:1024/s60`` → ``({"q": 256, "o": 1024},
+    {"k": 0.5, "o": 0.6}, None, False)``. A projection in both is cut to its rank, then its
+    factors pruned. ``o:fold[/sPCT]`` with ``norm:X`` gives a `FoldSpec` instead of an o entry.
+    ``code`` losslessly entropy-codes every pruned matrix (`replica_code`)."""
     if spec == "exact":
-        return {}, {}, None
+        return {}, {}, None, False
     ranks: dict = {}
     fracs: dict = {}
     fold: "tuple | None" = None
     norm: "tuple | None" = None
+    code = False
     err = ValueError(
         f"attn replica spec {spec!r}: expected `exact` or a comma list of q|k|v|o:RANK, "
         f":sPCT (PCT% pruned), :RANK/sPCT (factors pruned), o:fold[/sPCT] with "
-        f"norm:exact|r<RANK>[+c], naming each projection at most once")
+        f"norm:exact|r<RANK>[+c], optionally `code`, naming each projection at most once")
     for part in spec.split(","):
         name, _, r = part.strip().partition(":")
+        if name == "code":
+            if r or code:
+                raise err
+            code = True
+            continue
         if name == "norm":
             if norm is not None or (norm := _parse_norm(r)) is None:
                 raise err
@@ -129,7 +141,10 @@ def _parse(spec: str) -> "tuple[dict, dict, FoldSpec | None]":
     if (fold is None) != (norm is None):
         raise ValueError(f"attn replica spec {spec!r}: o:fold and norm:… go together — the fold "
                          f"keeps no o_proj, so the norm's scalar estimator must be named")
-    return ranks, fracs, None if fold is None else FoldSpec(fold[0], *norm)
+    if code and not (fracs or (fold is not None and fold[0] is not None)):
+        raise ValueError(f"attn replica spec {spec!r}: `code` codes pruned matrices and this "
+                         f"spec prunes nothing")
+    return ranks, fracs, None if fold is None else FoldSpec(fold[0], *norm), code
 
 
 def fold_spec(spec: str) -> "FoldSpec | None":
@@ -209,31 +224,33 @@ def replica_memory(cfg, spec: str, n_layers: int, model_bytes: int = 0,
     priced packed: a survivor bitmap plus bf16 survivors, ``1 + 16(1−f)`` bits/weight.
 
     ``gib_net`` is what the node adds beyond its own track: the track already stores its kv
-    head bit-exact, so an EXACT replica k/v need not hold that head twice. It stops holding
-    the moment the replica's k/v differ from the track's — truncated or pruned.
+    head bit-exact, so the replica k/v need not hold that head twice. That survives pruning
+    (Wanda is row-separable) but not truncation (a global SVD mixes the heads).
 
     A folded o (``o:fold``) is priced per NODE: two ``[I/n_tracks, q_dim]`` matrices (packed
     when pruned) in ``gib_fold``, plus the norm sketch in ``gib_sketch`` — rank·(H + q_dim)
-    dense, the whole ``W_o`` for ``norm:exact``, nothing for ``norm:r0``.
+    dense, the whole ``W_o`` for ``norm:exact``, nothing for ``norm:r0``. That is ONE track's
+    fold: a node walking K > N·H/(2I) tracks would store ``W_o`` whole for less.
+    ``code`` prices each pruned survivor at `CODE_VALUE_BITS` instead of 16.
     """
-    ranks, fracs, fold = _parse(spec)
+    ranks, fracs, fold, code = _parse(spec)
+    vb = CODE_VALUE_BITS if code else None
     bits = own = fold_bits = sketch_bits = 0.0
     for n, (m, i) in _shapes(cfg).items():
         if n == "o" and fold is not None:
             if n_tracks is None:
                 raise ValueError("pricing o:fold needs n_tracks: the fold is [I/N, q_dim] per track")
-            per = _bits_per_weight(fold.frac, None) if fold.frac is not None else 16
+            per = _bits_per_weight(fold.frac, vb) if fold.frac is not None else 16
             fold_bits = per * 2 * (cfg.intermediate_size // n_tracks) * i
             sketch_bits = 16 * (m * i if fold.norm == "exact" else fold.rank * (m + i))
         elif n in ranks:
-            per = _bits_per_weight(fracs[n], None) if n in fracs else 16
+            per = _bits_per_weight(fracs[n], vb) if n in fracs else 16
             bits += per * ranks[n] * (m + i)
-        elif n in fracs:
-            bits += _bits_per_weight(fracs[n], None) * m * i
         else:
-            bits += 16 * m * i
+            per = _bits_per_weight(fracs[n], vb) if n in fracs else 16
+            bits += per * m * i
             if n in KV:
-                own += 16 * (m // cfg.num_key_value_heads) * i
+                own += per * (m // cfg.num_key_value_heads) * i
     bits += 16 * (cfg.hidden_size + 2 * _head_dim(cfg))  # input_layernorm, q_norm, k_norm
     bits += fold_bits + sketch_bits
     nbytes = bits / 8 * n_layers
@@ -256,7 +273,7 @@ class AttnReplica(nn.Module):
     ``forward`` maps the shared ``R`` to ``Â`` (to the concatenated heads ``a`` when o is
     folded); ``read`` gives what the MLPs read. Build one with `build_replica`."""
 
-    def __init__(self, text_cfg, layers, fold: "FoldSpec | None" = None):
+    def __init__(self, text_cfg, layers, fold: "FoldSpec | None" = None, code: bool = False):
         super().__init__()
         from transformers.models.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3RMSNorm
 
@@ -284,6 +301,10 @@ class AttnReplica(nn.Module):
         self._fold_src: dict = {}
         self._fold_norm: dict = {}
         self._fold: dict = {}
+        # `code`: pruned weights decode per layer into shared arenas; the fold gets its own,
+        # since `FoldRead` holds gate/up through every track's MLP at that layer.
+        self.code = bool(code)
+        self._arena, self._fold_arena = _Arena(), _Arena()
 
     def forward(self, li: int, R: torch.Tensor, position_embeddings, attention_mask):
         return self.attn[str(li)](
@@ -307,8 +328,18 @@ class AttnReplica(nn.Module):
         var = z.pow(2).mean(-1, keepdim=True)
         if li in self._norm_c:  # the sizing's mean tail energy, one constant per layer
             var = (var + self._norm_c[li]).clamp(min=0.0)
-        gate, up = self._fold[li]
+        gate, up = self._fold_at(li)
         return FoldRead(R, y, torch.rsqrt(var + self.eps), gate, up)
+
+    def _fold_at(self, li: int):
+        """This layer's ``[K, I/N, q_dim]`` gate/up; coded ones are valid until the next decode."""
+        G, U = self._fold[li]
+        if torch.is_tensor(G):
+            return G, U
+        buf = self._fold_arena.take((2, len(G), *G[0]["shape"].tolist()), G[0]["hi"].device)
+        for k, p in enumerate((*G, *U)):
+            decode(p, buf.flatten(0, 1)[k])
+        return buf[0], buf[1]
 
     @torch.no_grad()
     def bind_fold(self, student) -> None:
@@ -370,8 +401,19 @@ class AttnReplica(nn.Module):
                 if err > (2e-2 if dt != torch.float32 else 1e-4):
                     raise RuntimeError(f"attn replica fold at layer {li}: a·Gᵀ is {err:.3g} off "
                                        f"gate(γ⊙(W_o a)) — the fold does not reproduce the read")
+            if self.code and self.fold.frac is not None:  # coded per track, 2-D each
+                G, U = [encode(g) for g in G], [encode(u) for u in U]
             self._fold[li] = (G, U)
             self._fold_src[li] = W.cpu()
+
+    def stored_bytes(self) -> int:
+        """Bytes actually held, counted from the tensors, with one track's fold as the ledger."""
+        n = sum(p.numel() * p.element_size() for p in self.parameters())
+        n += sum(m.coded_bits() for m in self.modules() if isinstance(m, CodedLinear)) // 8
+        for G, U in self._fold.values():
+            n += sum(coded_bits(p) // 8 if isinstance(p, dict) else p.numel() * p.element_size()
+                     for p in (*G[:1], *U[:1]))
+        return n
 
 
 def _frozen(t: torch.Tensor) -> nn.Parameter:
@@ -383,6 +425,48 @@ def _frozen_linear(W: torch.Tensor) -> nn.Linear:
         lin = nn.Linear(W.shape[1], W.shape[0], bias=False)
     lin.weight = _frozen(W)
     return lin
+
+
+class _Arena:
+    """One bf16 decode buffer, grown to the largest weight asked of it."""
+
+    buf: "torch.Tensor | None" = None
+
+    def take(self, shape, device) -> torch.Tensor:
+        n = math.prod(shape)
+        if self.buf is None or self.buf.numel() < n or self.buf.device != device:
+            self.buf = torch.empty(n, dtype=torch.bfloat16, device=device)
+        return self.buf[:n].view(shape)
+
+
+class CodedLinear(nn.Module):
+    """Frozen bias-free Linear held coded, decoded bit-exactly into a shared arena. Eval only."""
+
+    HEADER = ("shape", "ebase", "ebits", "nnz", "elen")  # host-side: read with .item()
+
+    def __init__(self, w: torch.Tensor, arena: _Arena):
+        super().__init__()
+        p = encode(w)
+        self.arena, self.shape = arena, tuple(w.shape)
+        self.header = {k: p.pop(k) for k in self.HEADER if k in p}
+        for k, v in p.items():
+            self.register_buffer(k, v, persistent=False)
+
+    def packed(self) -> dict:
+        return {**self.header, **self._buffers}
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return decode(self.packed(), self.arena.take(self.shape, self.hi.device))
+
+    def coded_bits(self) -> int:
+        return coded_bits(self.packed())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if torch.is_grad_enabled():
+            raise RuntimeError("a coded attn replica is eval-only: its decode arena is shared "
+                               "across layers. Run under torch.no_grad().")
+        return nn.functional.linear(x, self.weight)
 
 
 def _norm(bases: dict, spec: str, name: str, key: str) -> torch.Tensor:
@@ -406,13 +490,14 @@ def build_replica(text_cfg, layers, weights: dict, spec: str = "exact",
     Built on ``meta`` and filled by assignment, so no multi-GiB random init runs first.
     Truncation runs in fp32 wherever the weights live and casts back to their dtype.
     """
-    ranks, fracs, fold = _parse(spec)
+    ranks, fracs, fold, code = _parse(spec)
     if (ranks or fracs or _fold_needs_bases(fold)) and bases is None:
         raise ValueError(
             f"attn replica {spec!r} compresses {sorted([*ranks, *fracs, *(['o'] if fold else [])])} "
             f"and needs bases")
     with torch.device("meta"):
-        rep = AttnReplica(text_cfg, layers, fold)
+        rep = AttnReplica(text_cfg, layers, fold, code)
+    wrap = (lambda W: CodedLinear(W, rep._arena)) if code else _frozen_linear  # pruned only
     for i in rep.layer_ids:
         attn, pre = rep.attn[str(i)], f"layers.{i}."
         for name in PROJS:
@@ -443,9 +528,10 @@ def build_replica(text_cfg, layers, weights: dict, spec: str = "exact",
                                            _norm(bases, spec, name, f"{pre}{rms_key(name)}"))
                     A = wanda_prune_weight(A, fracs[name], _norm(
                         bases, spec, name, f"{pre}{name}.z_rms")[:ranks[name]])
-                mod = nn.Sequential(_frozen_linear(B.to(W.dtype)), _frozen_linear(A.to(W.dtype)))
+                lin = wrap if name in fracs else _frozen_linear
+                mod = nn.Sequential(lin(B.to(W.dtype)), lin(A.to(W.dtype)))
             elif name in fracs:
-                mod = _frozen_linear(wanda_prune_weight(
+                mod = wrap(wanda_prune_weight(
                     W, fracs[name], _norm(bases, spec, name, f"{pre}{rms_key(name)}")))
             else:
                 mod = _frozen_linear(W)
@@ -469,7 +555,7 @@ def load_replica(hf_model: str, text_cfg, layers, spec: str,
 
     from parallm.slicer.loader import read_hf_tensors
 
-    ranks, fracs, fold = _parse(spec)
+    ranks, fracs, fold, _ = _parse(spec)
     names = [f"layers.{i}.{s}" for i in layers for s in (
         *(f"self_attn.{p}_proj.weight" for p in PROJS),
         "self_attn.q_norm.weight", "self_attn.k_norm.weight", "input_layernorm.weight")]

@@ -23,12 +23,24 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
 
 from parallm.model.attn_replica import (
+    CodedLinear,
     _parse,
     build_replica,
     fold_spec,
     norm_c_key,
     replica_memory,
 )
+from parallm.model.replica_code import (
+    PAIRED,
+    SCATTER_BLOCK,
+    _decode_vals,
+    _pair,
+    _unpair,
+    coded_bits,
+    decode,
+    encode,
+)
+from parallm.model.replica_pack import unpack_sparse_weight_device
 from parallm.model.pt_model import PTWrappedModel
 from parallm.model.replica import wanda_prune_weight
 from parallm.slicer.convert import slice_model_to_tracks
@@ -104,6 +116,25 @@ def _o_rms(cfg, seed=23):
     return {f"layers.{i}.o_rms": 10 * torch.rand(O, generator=g) + 0.1 for i in REP}
 
 
+def _x_rms(cfg, seed=31):
+    """The per-channel ``‖x_j‖`` a pruned q/k/v is scored with."""
+    g = torch.Generator().manual_seed(seed)
+    return {f"layers.{i}.x_rms": 10 * torch.rand(cfg.hidden_size, generator=g) + 0.1
+            for i in REP}
+
+
+def _q_bases(cfg, r=8, seed=7):
+    """A q basis + latent RMS, so ``q:RANK/sPCT`` can be built in the unit-test model."""
+    g = torch.Generator().manual_seed(seed)
+    Q = cfg.num_attention_heads * cfg.head_dim
+    out = {}
+    for i in REP:
+        out[f"layers.{i}.q.U"] = torch.linalg.qr(torch.randn(Q, Q, generator=g))[0][:, :r]
+        out[f"layers.{i}.q.z_rms"] = torch.sort(
+            torch.rand(r, generator=g) + 0.1, descending=True).values
+    return out
+
+
 def _heads_from_weights(pt, input_ids, R, li):
     """Every track's attention output at ``li`` recomputed from the shared ``R`` with that
     track's OWN module — what a node holding copies computes. No collective."""
@@ -139,11 +170,16 @@ def _mlp_delta(layer, x):
 # --------------------------------------------------------------------------- #
 
 def test_specs_are_parsed_and_refused():
-    ranks, fracs, fold = _parse("q:1024/s50,k:s60,v:s60,o:fold/s60,norm:r32+c")
-    assert ranks == {"q": 1024} and fracs == {"q": 0.5, "k": 0.6, "v": 0.6}
+    ranks, fracs, fold, code = _parse("q:1024/s50,k:s60,v:s60,o:fold/s60,norm:r32+c")
+    assert ranks == {"q": 1024} and fracs == {"q": 0.5, "k": 0.6, "v": 0.6} and not code
     assert (fold.frac, fold.norm, fold.rank, fold.bias) == (0.6, "r32+c", 32, True)
     assert fold.estimator == "r32" == norm_c_key(7, fold.estimator).rsplit(".", 1)[1]
-    assert _parse("exact") == ({}, {}, None) and fold_spec("q:8,k:s50") is None
+    assert _parse("exact") == ({}, {}, None, False) and fold_spec("q:8,k:s50") is None
+    assert _parse("q:1024/s50,code")[3] is True and _parse("k:s50")[3] is False
+    assert _parse("o:fold/s60,norm:r0,code")[3] is True
+    for bad_code in ("q:8,code", "exact,code", "k:s50,code,code", "code:1", "o:fold,norm:r0,code"):
+        with pytest.raises(ValueError):
+            _parse(bad_code)
     e = fold_spec("o:fold,norm:exact")
     assert e.frac is None and e.norm == "exact" and e.rank == 0
     assert fold_spec("o:fold,norm:r0").norm == "r0" and not fold_spec("o:fold,norm:r0").bias
@@ -175,12 +211,18 @@ def test_memory_matches_the_32b_accounting():
     assert replica_memory(c, "exact", 32)["gib"] == pytest.approx(5.625, abs=2e-3)
     base = replica_memory(c, "q:320,o:640", 32)
     assert base["gib"] == pytest.approx(1.387, abs=2e-3)
-    # Net of the track's own kv head: only an EXACT k/v holds a second copy of it.
+    # Net of the track's own kv head: the replica need not hold a second copy of it.
     assert base["gib"] - base["gib_net"] == pytest.approx(0.625 / 8, abs=1e-9)
     # Pruned: one bitmap bit per weight plus the bf16 survivors, 1 + 16(1-f).
     both = replica_memory(c, "q:320,o:640,k:s50,v:s50", 32)
     assert both["gib"] == pytest.approx(base["gib"] - 0.625 + 0.625 * 9 / 16, abs=1e-9)
-    assert both["gib_net"] == both["gib"]
+    # The kv dedup survives pruning (row-separable), not truncation.
+    assert both["gib"] - both["gib_net"] == pytest.approx(0.625 * 9 / 16 / 8, abs=1e-9)
+    trunc = replica_memory(c, "q:320,o:640,k:256,v:256", 32)
+    assert trunc["gib_net"] == trunc["gib"]
+    # Coded: 1 + 12(1-f) where pruned; the unpruned q/o factors stay at 16.
+    assert replica_memory(c, "q:320,o:640,k:s50,v:s50,code", 32)["gib"] == pytest.approx(
+        base["gib"] - 0.625 + 0.625 * 7 / 16, abs=1e-9)
     # Rank, then density: the rank-r factors pay the pruned bits per weight.
     assert replica_memory(c, "q:1024/s60,o:1024/s60", 32)["gib"] == pytest.approx(
         5.625 - 5.0 + 1.625 * 7.4 / 16, abs=2e-3)
@@ -190,13 +232,124 @@ def test_memory_matches_the_32b_accounting():
     assert best["gib"] == pytest.approx(0.952, abs=5e-4)
     assert best["gib_fold"] == pytest.approx(0.181, abs=5e-4)
     assert best["gib_sketch"] == pytest.approx(0.025, abs=5e-4)
-    assert best["gib_net"] == best["gib"] and best["kv_per_token"] == 128 * 1024
+    assert best["kv_per_token"] == 128 * 1024
+    assert best["gib"] - best["gib_net"] == pytest.approx(0.289 / 8, abs=5e-4)  # k+v at s60
+    coded = replica_memory(c, "q:1024/s50,k:s60,v:s60,o:fold/s60,norm:r32+c,code", 32,
+                           n_tracks=64)
+    assert coded["gib"] == pytest.approx(0.749, abs=5e-4)
+    assert coded["gib_net"] == pytest.approx(0.721, abs=5e-4)
+    assert coded["gib_sketch"] == best["gib_sketch"]  # dense, never coded
+    assert coded["gib_fold"] == pytest.approx(best["gib_fold"] * 5.8 / 7.4, abs=5e-4)
     # The fold is [I/N, q_dim] PER TRACK, so it cannot be priced without knowing N. The
     # trap this closes: `n_tracks` is 1 on a merged track, so a default would be silent.
     assert replica_memory(c, "o:fold,norm:r0", 32, n_tracks=128)["gib_fold"] == pytest.approx(
         best["gib_fold"] / 2 * 16 / 7.4, abs=2e-3)
     with pytest.raises(ValueError, match="needs n_tracks"):
         replica_memory(c, "o:fold,norm:r0", 32)
+
+
+def test_the_codec_is_lossless_and_only_the_exponent_is_coded():
+    """`decode(encode(w))` is bit-exact under both coders, and only the exponent is coded."""
+    g = torch.Generator().manual_seed(11)
+    w = wanda_prune_weight(torch.randn(256, 512, generator=g), 0.5,
+                           torch.rand(512, generator=g) + 0.1).to(torch.bfloat16)
+    nnz = int((w != 0).sum())
+    field, huff = encode(w, "field"), encode(w, "huffman")
+    assert torch.equal(decode(field), w) and torch.equal(decode(huff), w)
+    assert "mask" in field and int(field["ebits"]) <= 4 and int(huff["ebits"]) == PAIRED
+    pre = 32 * -(-w.numel() // SCATTER_BLOCK)
+    assert pre == 32 * field["pre"].numel() and pre <= 0.02 * w.numel()
+    assert coded_bits(field) == w.numel() + nnz * (8 + int(field["ebits"])) + pre
+    assert coded_bits(huff) < coded_bits(field) < w.numel() + 16 * nnz
+    assert huff["hi"].numel() == field["hi"].numel() == nnz
+
+    d = (torch.randn(64, 64, generator=g) * torch.exp(
+        torch.randn(64, 1, generator=g) * 3)).to(torch.bfloat16)
+    pd, hd = encode(d, "field"), encode(d, "huffman")
+    assert "mask" not in pd and int(pd["ebits"]) == 8 and int(hd["ebits"]) == 0
+    assert torch.equal(decode(pd), d) and torch.equal(decode(hd), d)
+
+    for n in (2048, 2049, 3):  # odd tail
+        off = torch.randint(0, 13, (n,), generator=g, dtype=torch.uint8)
+        assert torch.equal(_unpair(torch.from_numpy(_pair(off.numpy())), n), off)
+
+    for p, plane in ((field, "hi"), (field, "epack"), (huff, "hi"), (huff, "epack")):
+        bad = dict(p, **{plane: p[plane].clone()})  # mutation: one flipped bit
+        bad[plane][0] ^= 1
+        assert not torch.equal(decode(bad), w)
+    with pytest.raises(ValueError, match="bf16"):
+        encode(torch.zeros(4, 4))
+    with pytest.raises(ValueError, match="entirely zero"):
+        encode(torch.zeros(4, 4, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="coder must be"):
+        encode(w, "lzma")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_the_fused_scatter_kernel_matches_the_torch_oracle():
+    """Planes on the device, header on the host, fused kernel equal to the torch path."""
+    g = torch.Generator().manual_seed(23)
+    for shape, frac in (((128, 256), 0.5), ((77, 611), 0.6), ((3, SCATTER_BLOCK + 7), 0.4)):
+        w = wanda_prune_weight(torch.randn(*shape, generator=g), frac,
+                               torch.rand(shape[1], generator=g) + 0.1).to(torch.bfloat16)
+        p = encode(w.cuda())
+        assert all(p[k].is_cuda for k in ("hi", "epack", "mask", "pre"))
+        assert not any(p[k].is_cuda for k in ("shape", "ebase", "ebits", "nnz"))
+        oracle = unpack_sparse_weight_device(
+            {"shape": p["shape"], "mask": p["mask"], "vals": _decode_vals(p)}, torch.bfloat16)
+        assert torch.equal(decode(p), oracle) and torch.equal(decode(p).cpu(), w), shape
+        bad = dict(p, pre=p["pre"].clone())  # mutation: a wrong prefix
+        bad["pre"][-1] += 1
+        assert not torch.equal(decode(bad).cpu(), w), shape
+
+
+def test_wanda_pruning_is_row_separable_so_a_node_rebuilds_its_own_kv_head():
+    """Wanda thresholds each row alone, so a node regenerates its own kv head's pruned rows."""
+    g = torch.Generator().manual_seed(3)
+    W = torch.randn(128, 64, generator=g)
+    rms = torch.rand(64, generator=g) + 0.1
+    whole = wanda_prune_weight(W, 0.6, rms)
+    for lo in (0, 32, 96):
+        rows = slice(lo, lo + 32)
+        assert torch.equal(whole[rows], wanda_prune_weight(W[rows], 0.6, rms))
+    assert not torch.equal(whole[0:32], wanda_prune_weight(W[0:32], 0.6, rms.flip(0)))
+
+
+def test_a_coded_replica_is_bit_identical_to_the_dense_one():
+    """`code` changes the bytes only: projections, both q factors, the fold and the read."""
+    cfg, dense = _dense()
+    sd = {k: v.to(torch.bfloat16) for k, v in dense.state_dict().items()}
+    bases = {**_o_rms(cfg), **_x_rms(cfg), **_q_bases(cfg)}
+    arm = "q:8/s50,k:s50,v:s50,o:fold/s50,norm:r0"
+    plain = build_replica(cfg, REP, sd, arm, bases)
+    coded = build_replica(cfg, REP, sd, arm + ",code", bases)
+    assert coded.code and not plain.code
+    for i in REP:
+        for name in ("q_proj", "k_proj", "v_proj"):
+            a, b = getattr(plain.attn[str(i)], name), getattr(coded.attn[str(i)], name)
+            for pm, cm in (zip(a, b) if isinstance(a, nn.Sequential) else [(a, b)]):
+                assert isinstance(cm, CodedLinear) and torch.equal(cm.weight, pm.weight)
+    with pytest.raises(ValueError, match="stores bf16"):
+        _pt(dense, cfg).set_attn_replica(build_replica(cfg, REP, sd, arm + ",code", bases))
+    pt = _pt(dense, cfg).to(torch.bfloat16)
+    pt.set_attn_replica(coded)
+    pt.set_attn_replica(plain)
+    for i in REP:
+        assert isinstance(coded._fold[i][0], list)
+        for c, p in zip(coded._fold_at(i), plain._fold_at(i)):
+            assert torch.equal(c, p)
+
+    ids = _ids(cfg)
+    with torch.no_grad():
+        R = pt(input_ids=ids, return_sync_hiddens=True)[1][REP[0]]
+        pe, mask = _scaffold(pt, ids, REP[1])
+        for a, b in zip(plain.read(REP[1], R, pe, mask), coded.read(REP[1], R, pe, mask)):
+            assert torch.equal(a, b)
+
+    quoted = replica_memory(cfg, arm + ",code", len(REP), n_tracks=N_TRACKS)["gib"] * 2**30
+    assert coded.stored_bytes() <= quoted and coded.stored_bytes() < plain.stored_bytes()
+    with pytest.raises(RuntimeError, match="eval-only"):
+        coded.attn[str(REP[0])].k_proj(torch.zeros(1, cfg.hidden_size, dtype=torch.bfloat16))
 
 
 # --------------------------------------------------------------------------- #

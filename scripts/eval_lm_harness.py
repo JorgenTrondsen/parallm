@@ -311,12 +311,14 @@ def main() -> int:
         if args.read_attn_replica:
             from parallm.model.attn_replica import fold_spec, load_replica, replica_memory
 
+            _hbm0 = torch.cuda.memory_allocated()
             try:
                 # `set_attn_replica` checks the cell and binds a fold to THIS student's
                 # slices (its provenance rail raises).
-                student.set_attn_replica(load_replica(
+                _rep = load_replica(
                     args.hf_model, text_cfg, _rl, args.read_attn_replica,
-                    args.read_attn_replica_bases, torch.cuda.current_device()))
+                    args.read_attn_replica_bases, torch.cuda.current_device())
+                student.set_attn_replica(_rep)
             except (ValueError, KeyError, RuntimeError) as e:
                 raise SystemExit(f"[error] --read-attn-replica: {e}")
             _mem = replica_memory(text_cfg, args.read_attn_replica, len(_rl), sum(
@@ -330,6 +332,10 @@ def main() -> int:
                        f"({_mem['pct']:.2f}% mdl; {_mem['gib_net']:.3f} net of the track's "
                        f"own kv head{_fold}), KV {_mem['kv_per_token'] / 1024:.0f} "
                        f"KiB/tok (latent {_mem['kv_per_token_latent'] / 1024:.0f})")
+            _log(rank, f"[init] replica counted {_rep.stored_bytes() / 2**30:.3f} GiB (ledger "
+                       f"{_mem['gib']:.3f}); resident "
+                       f"{(torch.cuda.memory_allocated() - _hbm0) / 2**30:.3f} GiB over "
+                       f"{len(student.local_track_ids)} track(s)")
 
     if want_teacher:
         _log(rank, "[init] loading frozen dense teacher…")
