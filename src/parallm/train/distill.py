@@ -99,8 +99,14 @@ def freeze_slice_teacher(model: PTWrappedModel) -> PTWrappedModel:
     return model
 
 
-def freeze_outside_layers(model: PTWrappedModel, layers) -> "tuple[int, int, list[str]]":
+def freeze_outside_layers(model: PTWrappedModel, layers,
+                          skip: "tuple[str, ...]" = ()) -> "tuple[int, int, list[str]]":
     """Freeze every parameter outside ``layers``' decoder layers — what ``--train-layers`` does.
+
+    ``skip`` names decoder-layer submodules (``"self_attn"``, ``"mlp"``) frozen even INSIDE
+    ``layers`` — what ``--freeze-sublayer`` adds. A hybrid stack's layers each hold ONE of
+    ``self_attn``/``linear_attn``, so a name a layer lacks is passed over; a ``skip`` that
+    matches no kept layer at all raises rather than freezing nothing.
 
     Returns ``(frozen, still-trainable, names frozen outside the decoder layers)``; the caller
     logs that third value, since a freeze catching more than its flag names reads as a
@@ -111,9 +117,13 @@ def freeze_outside_layers(model: PTWrappedModel, layers) -> "tuple[int, int, lis
     under the other, silently.
     """
     keep = set(layers)
-    keep_ids = {id(p) for tm in model.text_models
-                for i, layer in enumerate(tm.layers) if i in keep
-                for p in layer.parameters()}
+    kept = [layer for tm in model.text_models for i, layer in enumerate(tm.layers) if i in keep]
+    keep_ids = {id(p) for layer in kept for p in layer.parameters()}
+    skipped = {id(p) for layer in kept for s in skip
+               if (m := getattr(layer, s, None)) is not None for p in m.parameters()}
+    if skip and not skipped:
+        raise ValueError(f"no kept layer holds any of {skip}: the sublayer freeze is a no-op")
+    keep_ids -= skipped
     frozen = trainable = 0
     outside: list[str] = []
     for name, p in model.named_parameters():

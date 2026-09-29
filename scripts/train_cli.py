@@ -27,6 +27,7 @@ import re
 import time
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -376,6 +377,11 @@ def main() -> int:
                         "`exact` and so has nothing to learn: its block loss sits at the bf16 "
                         "floor and its gradient is noise, which a bf16 step turns into real "
                         "moves of the half the cell holds fixed.")
+    p.add_argument("--freeze-sublayer", choices=["attn", "mlp"], default=None,
+                   help="Also freeze this sublayer INSIDE --train-layers: 'attn' = self_attn "
+                        "(q/k/v/o + q_norm/k_norm; linear_attn on a hybrid stack), 'mlp' = "
+                        "gate/up/down. The layernorms stay "
+                        "trainable. Splits a trained half into which projections carry it.")
     # Recipe constants (the 9B-record defaults).
     p.add_argument("--max-steps", type=int, default=4001)
     p.add_argument("--seq-len", type=int, default=2048)
@@ -551,8 +557,13 @@ def main() -> int:
             "[error] --eval-final-limit differs from --eval-limit while checkpoints are being "
             "selected: best/ compares the final macro against the in-loop ones, which would then "
             "be scored on different document counts. Pass --no-save or keep the two equal.")
+    if args.freeze_sublayer and not args.train_layers:
+        raise SystemExit("[error] --freeze-sublayer needs --train-layers: it freezes a sublayer "
+                         "INSIDE the trained layers")
 
-    dist.init_process_group(backend="nccl")
+    # 30 min, not the 10 min default: the data streams from the HF hub on every rank, and a
+    # flaky hub has stalled one rank >10 min at final-eval setup, killing a finished run.
+    dist.init_process_group(backend="nccl", timeout=timedelta(minutes=30))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
     rank = dist.get_rank()
@@ -730,8 +741,12 @@ def main() -> int:
                              f"{format_layers(bad)} outside 0-{_L - 1}")
         if not _keep:
             raise SystemExit("[error] --train-layers named no layers; nothing would train")
-        _frozen, _live, _outside = freeze_outside_layers(student, _keep)
-        _log(rank, f"[init] --train-layers {format_layers(_keep)}: froze {_frozen / 1e9:.2f}B "
+        _skip = {"attn": ("self_attn", "linear_attn"),
+                 "mlp": ("mlp",)}.get(args.freeze_sublayer, ())
+        _frozen, _live, _outside = freeze_outside_layers(student, _keep, skip=_skip)
+        _log(rank, f"[init] --train-layers {format_layers(_keep)}"
+                   + (f" --freeze-sublayer {args.freeze_sublayer}" if _skip else "")
+                   + f": froze {_frozen / 1e9:.2f}B "
                    f"params/rank, {_live / 1e9:.2f}B still trainable"
                    + (f"; outside the decoder layers this froze {', '.join(_outside)}"
                       if _outside else ""))

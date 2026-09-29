@@ -686,6 +686,43 @@ def test_train_layers_freezes_everything_outside_the_range():
         assert any(f".layers.{i}." in n for i in keep), f"{n} moved but is outside --train-layers"
 
 
+@pytest.mark.parametrize("skip, other", [(("self_attn", "linear_attn"), ".mlp."),
+                                         (("mlp",), "_attn.")])
+def test_train_layers_skip_freezes_one_sublayer_inside_the_range(skip, other):
+    """`--freeze-sublayer`: the kept layers train EXCEPT the skipped sublayer, and the other
+    sublayer must MOVE — "the skipped one stayed put" passes trivially if nothing trains."""
+    from parallm.train.distill import freeze_outside_layers
+
+    cfg, pt, teacher, sync_after = _d2_step_fixture()
+    keep = [0, 1, 2, 3]
+    freeze_outside_layers(pt, keep, skip=skip)
+
+    def live(n):
+        return (any(f".layers.{i}." in n for i in keep)
+                and not any(f".{s}." in n for s in skip))
+
+    for n, p in pt.named_parameters():
+        assert p.requires_grad == live(n), f"{n}: requires_grad={p.requires_grad}"
+
+    before = {n: p.detach().clone() for n, p in pt.named_parameters()}
+    distill_step(pt, teacher, pt.lm_head, _batch(cfg),
+                 DistillConfig(sync_layer_indices=sync_after, lambda_ce=0.0, lambda_block=4.0))
+    torch.optim.AdamW([p for p in pt.parameters() if p.requires_grad], lr=1e-2).step()
+
+    moved = {n for n, p in pt.named_parameters() if not torch.equal(p.detach(), before[n])}
+    assert any(other in n for n in moved), f"no {other} param moved — the step proves nothing"
+    for n in moved:
+        assert live(n), f"{n} moved but is frozen"
+
+
+def test_train_layers_skip_that_matches_nothing_raises():
+    from parallm.train.distill import freeze_outside_layers
+
+    _cfg, _dense, _tracks, pt = _build(n_tracks=2, n_layers=8)
+    with pytest.raises(ValueError, match="no-op"):
+        freeze_outside_layers(pt, [0, 1], skip=("attn",))
+
+
 def test_train_layers_prunes_the_replicated_grad_plan():
     """An all-frozen group costs an all-reduce a step for a gradient nothing reads, because
     `sync_replicated_grads` zero-ALLOCATES a `.grad` per member before reducing."""
