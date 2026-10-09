@@ -100,11 +100,12 @@ def test_every_task_is_loglikelihood_shaped(path):
     assert path.stem == cfg["task"]  # include_path resolves by filename
 
 
-def test_math_tasks_are_two_shot_and_code_task_is_zero_shot():
+def test_task_shot_counts_are_pinned():
     # Pinned in the YAMLs, not on the command line: a YAML-level num_fewshot cannot
     # be overridden by --num-fewshot, and codemmlu shots would be whole code files.
+    # mmlu_math_mc went 2 -> 5 on 2026-10-07 (math-only evals from then on).
     cfgs = {_read(p)["task"]: _read(p) for p in _yamls()}
-    assert cfgs["mmlu_math_mc"]["num_fewshot"] == 2
+    assert cfgs["mmlu_math_mc"]["num_fewshot"] == 5
     assert cfgs["mmlu_cs_mc"]["num_fewshot"] == 2
     assert cfgs["mmlu_pro_math_mc"]["num_fewshot"] == 2
     assert cfgs["codemmlu_fim"]["num_fewshot"] == 0
@@ -112,10 +113,12 @@ def test_math_tasks_are_two_shot_and_code_task_is_zero_shot():
 
 def test_mmlu_cs_differs_from_mmlu_math_in_the_SUBJECT_AND_NOTHING_ELSE():
     """The control is only a control if every other knob matches. A stray difference
-    in shots/options/renderer would confound 'CS vs math' with 'task B vs task A'."""
+    in options/renderer would confound 'CS vs math' with 'task B vs task A'. Shots
+    differ since math went to 5 (2026-10-07): a cs-vs-math contrast now needs cs at 5
+    too."""
     math_cfg, cs_cfg = _read(TASK_DIR / "mmlu_math_mc.yaml"), _read(TASK_DIR / "mmlu_cs_mc.yaml")
     differing = {k for k in set(math_cfg) | set(cs_cfg) if math_cfg.get(k) != cs_cfg.get(k)}
-    assert differing == {"task", "process_docs"}
+    assert differing == {"task", "process_docs", "num_fewshot"}
 
 
 @pytest.mark.parametrize("task_name, subjects", [

@@ -128,8 +128,61 @@ def render_fn(spec: DataSourceSpec, tokenizer):
     raise ValueError(f"unknown source format {spec.format!r} (text|template|chat)")
 
 
+_BUILDERS = {".parquet": "parquet", ".jsonl": "json", ".json": "json"}
+
+
+def _is_rank0() -> bool:
+    import torch.distributed as dist
+
+    return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+
+
+def _local_files(spec: DataSourceSpec) -> tuple[str, list[str], str] | None:
+    """``(builder, files, revision)`` for ``spec`` from the local hub cache, or None.
+
+    ``load_dataset(<repo id>, streaming=True)`` reads every byte from huggingface.co even
+    when the same snapshot sits in the hub cache (``~/.cache/huggingface`` → nas2). On
+    2026-10-09 a read timeout hung one rank mid-run until NCCL killed it, and retries cost
+    a 1000-step run ~35 min. The README's ``configs:`` give the config's file globs; sorted,
+    they are the files and order the hub resolves (checked on all five cascade2 sources:
+    same files, same rows). Not loading the local directory itself: Cascade-2's README
+    declares configs that were never downloaded, and ``datasets`` resolves all of them.
+
+    ⚠ Offline by design, so nothing checks the snapshot holds every file the hub lists —
+    ``[data]`` prints the count, and a partial download would train on less.
+    """
+    from huggingface_hub import DatasetCard, snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    try:
+        snap = Path(snapshot_download(spec.dataset_name, repo_type="dataset",
+                                      local_files_only=True))
+    except LocalEntryNotFoundError:
+        return None
+    readme = snap / "README.md"
+    if not readme.is_file():
+        return None
+    configs = DatasetCard.load(readme).data.to_dict().get("configs") or []
+    cfg = next((c for c in configs
+                if c.get("config_name") == (spec.dataset_config or "default")), None)
+    if cfg is None:
+        return None
+    entries = cfg.get("data_files") or []
+    if isinstance(entries, str) or isinstance(entries[0], str):
+        entries = [{"split": "train", "path": entries}]
+    patterns = [p for e in entries if e.get("split") == spec.split
+                for p in ([e["path"]] if isinstance(e["path"], str) else e["path"])]
+    files = sorted({str(f) for p in patterns for f in snap.glob(p)})
+    builders = {_BUILDERS.get(Path(f).suffix) for f in files}
+    if not files or len(builders) != 1 or None in builders:
+        return None
+    return builders.pop(), files, snap.name
+
+
 def _load_rendered(spec: DataSourceSpec, tokenizer, seed: int = 42):
     """Stream one source and normalize it to a single ``"text"`` column.
+
+    Reads the local hub-cache snapshot when there is one (`_local_files`), else the hub.
 
     Dropping the original columns is not cosmetic: ``interleave_datasets`` requires
     a shared feature schema, so this is what lets a chat corpus and a plain-text
@@ -140,9 +193,18 @@ def _load_rendered(spec: DataSourceSpec, tokenizer, seed: int = 42):
     """
     from datasets import load_dataset  # local: avoid hard dep at module load
 
-    ds = load_dataset(
-        spec.dataset_name, spec.dataset_config, split=spec.split, streaming=True,
-    )
+    local = _local_files(spec)
+    if local is not None:
+        builder, files, rev = local
+        ds = load_dataset(builder, data_files=files, split="train", streaming=True)
+        where = f"local snapshot {rev[:7]}, {len(files)} files"
+    else:
+        ds = load_dataset(
+            spec.dataset_name, spec.dataset_config, split=spec.split, streaming=True,
+        )
+        where = "streaming from the hub (no local snapshot)"
+    if _is_rank0():
+        print(f"[data] {spec.label()}: {where}", flush=True)
     if spec.shuffle_buffer:
         # Shuffles shard ORDER as well as buffering rows, which is the half that
         # matters for a corpus grouped by sub-source across shards.
@@ -198,9 +260,7 @@ def _log_mixture(sources, lengths, probs) -> None:
     Printed because nominal weights and realized weights came apart badly once and
     nothing in the run surfaced it: a nominal 34/33/33 trained as 66/32/2.
     """
-    import torch.distributed as dist
-
-    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+    if not _is_rank0():
         return
     tok_total = sum(p * n for p, n in zip(probs, lengths))
     for s, n, p in zip(sources, lengths, probs):

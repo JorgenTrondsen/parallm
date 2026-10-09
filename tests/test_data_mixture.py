@@ -377,3 +377,61 @@ def test_interleave_seed_changes_order():
     out2 = [item["input_ids"].tolist() for item, _ in zip(s2, range(8))]
     # Different seeds should give a different interleave (mixed-source content differs).
     assert out1 != out2
+
+
+# --------------------------------------------------------------------------- #
+# Local hub-cache snapshot instead of streaming from huggingface.co
+# --------------------------------------------------------------------------- #
+
+_README = """---
+configs:
+- config_name: a
+  data_files:
+    - split: train
+      path: a/*
+- config_name: never_downloaded
+  data_files:
+    - split: train
+      path: gone/*
+---
+"""
+
+
+def _fake_hub_cache(root, repo="org/ds", rev="0123456789abcdef"):
+    """The hub cache layout `snapshot_download(local_files_only=True)` resolves: refs/main
+    names the revision, snapshots/<rev>/ holds the files."""
+    base = root / ("datasets--" + repo.replace("/", "--"))
+    (base / "refs").mkdir(parents=True)
+    (base / "refs" / "main").write_text(rev)
+    snap = base / "snapshots" / rev
+    (snap / "a").mkdir(parents=True)
+    (snap / "README.md").write_text(_README)
+    for name, rows in [("part_2.jsonl", ["c"]), ("part_1.jsonl", ["a", "b"])]:
+        (snap / "a" / name).write_text("".join(json.dumps({"text": t}) + "\n" for t in rows))
+    return snap
+
+
+def test_local_snapshot_is_read_in_the_hubs_file_order(tmp_path, monkeypatch):
+    pytest.importorskip("datasets")
+    import huggingface_hub.constants as hc
+    from parallm.train import data as D
+
+    monkeypatch.setattr(hc, "HF_HUB_CACHE", str(tmp_path))
+    snap = _fake_hub_cache(tmp_path)
+    spec = DataSourceSpec(dataset_name="org/ds", dataset_config="a")
+    builder, files, rev = D._local_files(spec)
+    assert (builder, rev) == ("json", "0123456789abcdef")
+    assert files == [str(snap / "a" / "part_1.jsonl"), str(snap / "a" / "part_2.jsonl")]
+    assert [r["text"] for r in D._load_rendered(spec, tokenizer=None)] == ["a", "b", "c"]
+
+
+def test_uncached_repos_and_configs_fall_back_to_the_hub(tmp_path, monkeypatch):
+    import huggingface_hub.constants as hc
+    from parallm.train import data as D
+
+    monkeypatch.setattr(hc, "HF_HUB_CACHE", str(tmp_path))
+    _fake_hub_cache(tmp_path)
+    for spec in (DataSourceSpec(dataset_name="org/other"),
+                 DataSourceSpec(dataset_name="org/ds", dataset_config="never_downloaded"),
+                 DataSourceSpec(dataset_name="org/ds", dataset_config="unknown")):
+        assert D._local_files(spec) is None
