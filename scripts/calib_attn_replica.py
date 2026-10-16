@@ -34,6 +34,16 @@ that constant — a SECOND pass, because it reads the bases the first pass write
 
 ⚡ Its error table SIZES the estimator and never ranks arms — no offline statistic on this
 path has ever predicted the macro. The scalar measured FREE at every rung, r0 included.
+
+``--mlp`` instead measures what compresses an MLP READ BASE (`parallm.model.mlp_read`) at the
+given layers, writing ``mlp_stats.safetensors``:
+
+    C_x = E[x xᵀ],  x = post_attention_layernorm(R)   → x_rms (Wanda on gate/up)
+    S_y = E[y yᵀ],  y = Σ_k MLP_k(x) over every track  → y_U (the fold's norm sketch)
+
+    torchrun --standalone --nproc-per-node=8 scripts/calib_attn_replica.py --mlp \\
+        --hf-model <teacher> --checkpoint-dir convert_out/qwen3/32b_n64_even \\
+        --layers 0-31 --out-dir logs/qwen3/mlp_read
 """
 from __future__ import annotations
 
@@ -80,6 +90,7 @@ X_RMS = "x_rms.safetensors"
 O_RMS = "o_rms.safetensors"
 Z_RMS = "z_rms.safetensors"
 NORM_C = "norm_c.safetensors"
+MLP_STATS = "mlp_stats.safetensors"
 
 
 def _log(rank: int, msg: str) -> None:
@@ -132,6 +143,53 @@ class _Taps:
     def close(self):
         for h in self.handles:
             h.remove()
+
+
+class _MlpTaps:
+    """One forward's MLP INPUT (track 0; under ``exact`` every track reads the same synced
+    ``R``) and MLP OUTPUTS summed over this rank's tracks (fp32)."""
+
+    def __init__(self, student, layers):
+        self.x: dict[int, torch.Tensor] = {}
+        self.y: dict[int, torch.Tensor] = {}
+        self.handles = []
+        for k, tm in enumerate(student.text_models):
+            for li in layers:
+                mlp = tm.layers[li].mlp
+                self.handles.append(mlp.register_forward_hook(self._out(li)))
+                if k == 0:
+                    self.handles.append(mlp.register_forward_pre_hook(self._inp(li)))
+
+    def _out(self, li):
+        def hook(_mod, _inp, out):
+            y = (out[0] if isinstance(out, tuple) else out).detach().float().flatten(0, 1)
+            self.y[li] = y if li not in self.y else self.y[li] + y
+        return hook
+
+    def _inp(self, li):
+        def hook(_mod, args):
+            self.x[li] = args[0].detach().flatten(0, 1)
+        return hook
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+
+
+def check_mlp_capture(student, probe: dict, x: torch.Tensor, y: torch.Tensor, li: int) -> float:
+    """``x`` must be the synced post-attn ``R`` through this layer's post-attention norm, bit
+    for bit; ``y`` must point where the synced post-MLP state minus ``R`` points (cosine: bf16
+    differencing is lossy, and a rank-local sum reads far below the bar)."""
+    R = probe[(li, "attn")]
+    if not torch.equal(x, student.text_models[0].layers[li].post_attention_layernorm(R).flatten(0, 1)):
+        raise SystemExit(f"[rail] layer {li}: captured MLP input is not "
+                         f"post_attention_layernorm(R)")
+    diff = (probe[(li, "mlp")].float() - R.float()).flatten(0, 1)
+    cos = float(F.cosine_similarity(y, diff, dim=-1).mean())
+    if cos < 0.9:
+        raise SystemExit(f"[rail] layer {li}: summed MLP output has cos {cos:.4f} with the "
+                         f"synced post-MLP delta — not the whole layer's y")
+    return cos
 
 
 def check_capture(student, probe: dict, x: torch.Tensor, A: torch.Tensor, li: int) -> float:
@@ -293,6 +351,102 @@ def _outer(X: torch.Tensor) -> torch.Tensor:
     return (X.T @ X).cpu()
 
 
+def calib_mlp(args) -> int:
+    """`--mlp`: the moments an MLP read base compresses with (module docstring)."""
+    dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    rank = dist.get_rank()
+    dev = torch.cuda.current_device()
+    manifest = load_manifest(args.checkpoint_dir)
+    layout = build_groups(n_tracks=manifest.n_tracks)
+    layers = parse_layers(args.layers)
+    plan = plan_track_layout(manifest.n_tracks, dist.get_world_size(), 1, allow_merge=False)
+    cfg = AutoConfig.from_pretrained(args.hf_model)
+    text_cfg = getattr(cfg, "text_config", cfg)
+    student = PTWrappedModel(
+        text_config=text_cfg, n_tracks=manifest.n_tracks,
+        local_track_ids=layout.local_track_ids,
+        sync_after_layers=list(range(manifest.num_layers)),
+        track_group=layout.track_group, fuse_size=plan.fuse_size,
+    )
+    student.set_sync_phase("exact")
+    student.load_track_state_dicts(
+        {t: load_track(args.checkpoint_dir, t) for t in layout.local_track_ids}, strict=True)
+    student = student.to(torch.bfloat16).to(dev).eval()
+    _log(rank, f"[init] --mlp n_tracks={manifest.n_tracks} layers={format_layers(layers)} "
+               f"batches={args.batches}x{args.seq_len} max_rank={args.max_rank}")
+    tok = AutoTokenizer.from_pretrained(args.hf_model)
+    sources = ([parse_source_spec(s) for s in args.data_source] if args.data_source
+               else preset_sources(args.data_preset))
+    loader = DataLoader(PackedTokenStream(tok, CalibrationDataConfig(
+        sources=sources, seq_len=args.seq_len, seed=args.seed,
+    )), batch_size=1, num_workers=0)
+
+    C_x: dict[int, torch.Tensor] = {}
+    S_y: dict[int, torch.Tensor] = {}
+    n_tok = 0
+    for n, batch in enumerate(loader):
+        if n >= args.batches:
+            break
+        ids = batch["input_ids"].to(dev)
+        if ids.ndim == 1:
+            ids = ids.unsqueeze(0)
+        taps = _MlpTaps(student, layers)
+        probe = {} if n == 0 else None
+        with torch.no_grad():
+            student(input_ids=ids, probe_capture=probe)
+        taps.close()
+        cos = []
+        for li in layers:
+            y = taps.y[li]
+            dist.all_reduce(y, group=layout.track_group)   # Σ over EVERY rank's tracks
+            if probe is not None:
+                cos.append(check_mlp_capture(student, probe, taps.x[li], y, li))
+            if rank == 0:
+                for acc, X in ((C_x, taps.x[li]), (S_y, y)):
+                    G = _outer(X)
+                    if li in acc:
+                        acc[li].add_(G)
+                    else:
+                        acc[li] = G
+        if cos:
+            _log(rank, f"[rail] capture ok: MLP input bit-exact, y vs synced delta cos "
+                       f"min {min(cos):.4f} mean {sum(cos) / len(cos):.4f}")
+        n_tok += ids.numel()
+        del taps, probe
+        _log(rank, f"[calib] batch {n + 1}/{args.batches}")
+
+    dist.barrier()
+    dist.destroy_process_group()
+    if rank != 0:
+        return 0
+    del student
+    torch.cuda.empty_cache()
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    stats, energy = {}, {}
+    for li in layers:
+        pre = f"layers.{li}."
+        x = input_rms(C_x[li] / n_tok).float()
+        if not (torch.isfinite(x).all() and (x > 0).all()):
+            raise SystemExit(f"[rail] layer {li}: x_rms has a zero or non-finite entry")
+        stats[pre + "x_rms"] = x.cpu().contiguous()
+        U, ev = top_basis((S_y[li] / n_tok).to(dev, torch.float64), args.max_rank)
+        stats[pre + "y_U"] = U.float().cpu().contiguous()
+        energy[str(li)] = {str(r): round(float(ev[:r].sum() / ev.sum().clamp(min=EPS)), 6)
+                           for r in RANK_LADDER if r <= ev.numel()}
+    save_file(stats, str(out / MLP_STATS), metadata={"n_tokens": str(n_tok), "sync_phase": "exact"})
+    (out / "mlp_stats.json").write_text(json.dumps({
+        "layers": layers, "max_rank": args.max_rank, "n_tokens": n_tok, "sync_phase": "exact",
+        "batches": args.batches, "seq_len": args.seq_len, "energy": energy}, indent=1))
+    print(f"\n===== MLP-sum energy in its top-r directions, mean over {format_layers(layers)} =====")
+    print(" ".join(f"{'r' + str(r):>8}" for r in RANK_LADDER))
+    print(" ".join(f"{sum(energy[str(li)][str(r)] for li in layers) / len(layers):8.4f}"
+                   for r in RANK_LADDER))
+    print(f"\n  wrote {out / MLP_STATS}", flush=True)
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -303,6 +457,9 @@ def main() -> int:
                    help="Second pass: fit the per-layer bias constant a `norm:r<RANK>+c` fold "
                         "adds under the root, off the o bases already in --out-dir. Writes "
                         "norm_c.safetensors and leaves every other artifact alone.")
+    p.add_argument("--mlp", action="store_true",
+                   help="Measure the MLP read base's statistics instead (module docstring); "
+                        "writes mlp_stats.safetensors + mlp_stats.json only.")
     p.add_argument("--layers", default="32-63")
     p.add_argument("--data-preset", default=DEFAULT_MIXTURE)
     p.add_argument("--data-source", action="append", default=None,
@@ -315,6 +472,10 @@ def main() -> int:
                         "want now: re-cutting means re-running the forward pass.")
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
+    if args.mlp and args.norm_c:
+        raise SystemExit("[error] --mlp and --norm-c are separate passes")
+    if args.mlp:
+        return calib_mlp(args)
 
     dist.init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))

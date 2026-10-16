@@ -38,6 +38,41 @@ class FoldRead(NamedTuple):
         return self._replace(gate=self.gate[k], up=self.up[k])
 
 
+class FoldedAttnRead(NamedTuple):
+    """What a self-attention layer reads after a FOLDED mlp read base
+    (`parallm.model.mlp_read.MlpReadBase.bind_fold`): the base's estimate never forms in hidden
+    space. ``q``/``k``/``v`` are its contributions to those projections' outputs, already
+    scaled by ``1/s``; ``inv_s`` is the per-token ``1/s`` the read is normalised by, or None
+    to normalise by the carry's own RMS (``input_layernorm(x)``)."""
+
+    inv_s: "torch.Tensor | None"
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+
+
+def folded_attention(layer, x, fr: FoldedAttnRead, position_embeddings, attention_mask,
+                     position_ids) -> torch.Tensor:
+    """The mixer output at a folded read: ``input_layernorm`` of the carry ``x`` at the read's
+    scale, with ``fr``'s q/k/v contributions added to the projections' outputs (forward hooks,
+    so q_norm, rotary and the attention kernel run unchanged). Eager, eval-only."""
+    if getattr(layer, "block_type", None) == "linear_attention":
+        raise ValueError("a folded mlp read needs a self-attention layer after it")
+    norm = layer.input_layernorm
+    h_ln = norm(x) if fr.inv_s is None else norm.weight * (x.float() * fr.inv_s).to(x.dtype)
+    attn = layer.self_attn
+    handles = [getattr(attn, f"{p}_proj").register_forward_hook(
+        lambda _m, _i, out, d=d: out + d.to(out.dtype)) for p, d in (("q", fr.q), ("k", fr.k),
+                                                                       ("v", fr.v))]
+    try:
+        y, _ = attn(hidden_states=h_ln, attention_mask=attention_mask, position_ids=position_ids,
+                    past_key_values=None, position_embeddings=position_embeddings)
+    finally:
+        for h in handles:
+            h.remove()
+    return y
+
+
 def fold_mlp(mlp, norm, fr: FoldRead) -> torch.Tensor:
     """One track's MLP delta at a folded read: ``down(act(g)·u)`` with
     ``g = (gate(γ⊙R) + a·Gᵀ)/s``. The scalar multiply runs in fp32 and rounds once to the
@@ -50,16 +85,25 @@ def fold_mlp(mlp, norm, fr: FoldRead) -> torch.Tensor:
     return mlp.down_proj(mlp.act_fn(g) * u)
 
 
-def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids):
+def seam_token_mixer(layer, x, position_embeddings, attention_mask, position_ids,
+                     x_read: "torch.Tensor | None" = None):
     """First half of a pre-norm decoder layer: ``input_layernorm`` → token mixer →
     residual add. Returns ``h_attn = x + Y`` where ``Y`` is the per-track mixer
     output (self-attn or gated-delta).
+
+    ``x_read``: the tensor the mixer READS, when it differs from the residual its output is
+    added to — a local estimate of the unsynced MLP sum (`parallm.model.mlp_read`), or a
+    `FoldedAttnRead` when that estimate is folded into the projections. ``None`` is the plain
+    seam, bit for bit.
 
     ``block_type`` is Qwen3.5's hybrid marker; a family with only self-attention
     (gpt-oss) has no such attribute, hence the ``getattr`` — same guard
     `train.teacher.HookedTeacher._attn_submodule` uses.
     """
-    h_ln = layer.input_layernorm(x)
+    if isinstance(x_read, FoldedAttnRead):
+        return x + folded_attention(layer, x, x_read, position_embeddings, attention_mask,
+                                    position_ids)
+    h_ln = layer.input_layernorm(x if x_read is None else x_read)
     if getattr(layer, "block_type", None) == "linear_attention":
         y = layer.linear_attn(
             hidden_states=h_ln, cache_params=None, attention_mask=attention_mask
@@ -199,8 +243,8 @@ def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):
     """
     mixer_fn, mlp_fn = _mixer_fn(), _mlp_fn()
 
-    def _mixer(layer, x, mask):
-        return mixer_fn(layer, x, position_embeddings, mask, position_ids)
+    def _mixer(layer, x, mask, x_read=None):
+        return mixer_fn(layer, x, position_embeddings, mask, position_ids, x_read)
 
     if not use_ckpt:
         return _mixer, mlp_fn
@@ -208,7 +252,8 @@ def checkpointed_halves(use_ckpt: bool, position_embeddings, position_ids):
     from torch.utils.checkpoint import checkpoint
 
     return (
-        lambda layer, x, mask: checkpoint(_mixer, layer, x, mask, use_reentrant=False),
+        lambda layer, x, mask, x_read=None: checkpoint(
+            _mixer, layer, x, mask, x_read, use_reentrant=False),
         lambda layer, x, x_read=None: checkpoint(
             mlp_fn, layer, x, x_read, use_reentrant=False),
     )

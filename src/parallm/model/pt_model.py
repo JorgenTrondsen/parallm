@@ -229,6 +229,11 @@ class PTWrappedModel(nn.Module):
         # compressed copy of the dense attention feeds every track's MLP read. None = off.
         self._attn_replica = None
         self._attn_replica_layers: frozenset = frozenset()
+        # Optional MLP read base (see `set_mlp_read`): at post-attn-only layers each track's
+        # next attention reads its carry plus a local estimate of the other tracks' MLP
+        # outputs. None = off.
+        self._mlp_read = None
+        self._mlp_read_layers: frozenset = frozenset()
         # Optional HostResidentLayers: when set, the walk pages each decoder
         # layer in from pinned host DRAM and drops it again (the streamed
         # teacher). None = every layer stays resident, the normal path.
@@ -442,6 +447,61 @@ class PTWrappedModel(nn.Module):
         # is part of the true gradient.
         return self._attn_replica.read(li, block_start, position_embeddings, layer_mask)
 
+    def check_mlp_read_layers(self, layers) -> list:
+        """Sorted ``layers``, or ValueError where a local MLP read estimate is ill-defined.
+
+        At layer ``i`` it needs a post-attn sync (the MLP reads the shared ``R_i`` the base is
+        recomputed from) and NO post-MLP sync (else the next attention already reads the true
+        sum and the base would be counted on top of it); ``i`` is not the last layer. Looped and
+        unfused: a carry holding several tracks' channels cannot have them subtracted by the
+        base's per-track ownership.
+        """
+        from parallm.utils.layers import format_layers
+
+        fuse = self.sync_module.fuse_size * self.sync_module.fuse_ranks
+        if self.merge_group > 1 or fuse > 1:
+            raise ValueError(f"mlp read runs on the looped, unfused walk (merge_group="
+                             f"{self.merge_group}, fusion={fuse}).")
+        L = len(self.text_models[0].layers)
+        layers = sorted(set(layers))
+        attn, mlp = self.sync_sets()
+        if not layers:
+            raise ValueError("mlp read was asked for with no layers")
+        if bad := [i for i in layers if not 0 <= i < L - 1]:
+            raise ValueError(f"mlp read layers {format_layers(bad)} outside 0..{L - 2}")
+        if bad := [i for i in layers if i not in attn]:
+            raise ValueError(
+                f"mlp read needs a post-attn sync at each layer, but {format_layers(bad)} have "
+                f"none under --sync-phase {self.sync_phase!r}: the tracks share no R to "
+                f"recompute the MLP from.")
+        if bad := [i for i in layers if i in mlp]:
+            raise ValueError(
+                f"mlp read needs layers with NO post-MLP sync, but {format_layers(bad)} sync "
+                f"post-MLP under --sync-phase {self.sync_phase!r} — the next attention already "
+                f"reads the true sum.")
+        return layers
+
+    def set_mlp_read(self, base) -> None:
+        """Install (or clear, with ``base=None``) a `parallm.model.mlp_read.MlpReadBase` over
+        ``base.layer_ids``: at each, every local track's next token mixer reads
+        ``carry_k + base − own overlap`` while its output joins ``carry_k``."""
+        if base is None:
+            self._mlp_read, self._mlp_read_layers = None, frozenset()
+            return
+        layers = self.check_mlp_read_layers(base.layer_ids)
+        if base.n_local != len(self.local_track_ids):
+            raise ValueError(f"mlp read base was built for {base.n_local} local tracks, this "
+                             f"rank walks {len(self.local_track_ids)}")
+        self._mlp_read, self._mlp_read_layers = base, frozenset(layers)
+
+    def mlp_read_at(self, i: int, R, carries):
+        """The next token mixer's read after post-attn-only layer ``i`` (``R`` the synced state
+        its MLPs read, ``carries`` their per-track outputs), or None where no base sits."""
+        if i not in self._mlp_read_layers:
+            return None
+        lay = self.text_models[0].layers[i]
+        return self._mlp_read.reads(i, R, carries, lay.post_attention_layernorm, lay.mlp.act_fn)
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -581,6 +641,7 @@ class PTWrappedModel(nn.Module):
 
         block_start = h
         per_track_h = [h for _ in self.text_models]
+        mixer_read = None  # set by an mlp read layer for the NEXT layer's token mixer
         for i in range(L):
             # layer_types[i] is identical on every track, so the mixer mask is
             # per-layer.
@@ -592,10 +653,12 @@ class PTWrappedModel(nn.Module):
             # group: at a boundary the group members share their pre-state, so
             # summing all F would count it F times. No-ops at fuse_size=1.
             h_attn = self.sync_module.fuse(
-                [run_mixer(tm.layers[i], per_track_h[k], layer_mask)
+                [run_mixer(tm.layers[i], per_track_h[k], layer_mask,
+                           None if mixer_read is None else mixer_read[k])
                  for k, tm in enumerate(self.text_models)],
                 per_track_h,
             )
+            mixer_read = None
             if i in sync_attn_set:
                 # Post-attention sync delivers the real cross-track content to
                 # this layer's MLP.
@@ -637,6 +700,9 @@ class PTWrappedModel(nn.Module):
                     sync_hiddens[i] = self.sync_module(
                         self.sync_module.leaders(new_h), mlp_pre)
                 per_track_h = new_h
+                if i in sync_attn_set:
+                    # `mlp_pre` is the synced R this layer's MLPs read.
+                    mixer_read = self.mlp_read_at(i, mlp_pre, new_h)
             if self.layer_stream is not None:
                 self.layer_stream.release(i)
         return h

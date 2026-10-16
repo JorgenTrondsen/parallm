@@ -193,6 +193,26 @@ def main() -> int:
                         "with x_rms.safetensors when SPEC prunes q/k/v, o_rms.safetensors when "
                         "it prunes o or the fold, z_rms.safetensors for RANK/sPCT and "
                         "norm_c.safetensors for a `+c` scalar; required unless SPEC is `exact`.")
+    p.add_argument("--read-mlp-base", default=None, metavar="PATH",
+                   help="At post-attn-only layers, each track's next token mixer reads its carry "
+                        "plus a local estimate of the other tracks' MLP outputs: the top-r exact "
+                        "channels of scripts/build_trunc_estimator.py, recomputed from the "
+                        "shared R, minus the track's own (parallm.model.mlp_read). No "
+                        "collective; read-only. Looped walk, eval-only.")
+    p.add_argument("--read-mlp-compress", default=None, metavar="SPEC",
+                   help="Prune --read-mlp-base's gate/up as it loads (parallm.model.mlp_read."
+                        "compress_layer): gu:sPCT Wanda, gu:N:M, gu:A+sPCT. Needs --read-mlp-stats.")
+    p.add_argument("--read-mlp-stats", default=None, metavar="PATH",
+                   help="mlp_stats.safetensors from scripts/calib_attn_replica.py --mlp.")
+    p.add_argument("--read-mlp-fold", default=None, metavar="exact|r<M>",
+                   help="Fold --read-mlp-base's output projection into each track's next-layer "
+                        "q/k/v (MlpReadBase.bind_fold): `exact` keeps the read's true RMS scale "
+                        "(the rail); `r<M>` takes it from a rank-M sketch of the estimate (needs "
+                        "--read-mlp-stats); `r<M>+c` adds the calibrated per-layer constant of "
+                        "--read-mlp-fold-c; `r0` is the carry's own RMS (collapses the front).")
+    p.add_argument("--read-mlp-fold-c", default=None, metavar="PATH",
+                   help="Per-layer norm constants from scripts/calib_fold_norm.py, calibrated on "
+                        "the same base and --read-mlp-compress spec (checked).")
     p.add_argument("--engine-replicas", default=None,
                    help="Path to a packed replica pool: score the student through the "
                         "sparse-replica ENGINE forward (parallm.engine.replay_chunk) instead "
@@ -305,9 +325,35 @@ def main() -> int:
                 student.check_attn_replica_layers(_rl)
             except ValueError as e:
                 raise SystemExit(f"[error] --read-attn-replica: {e}")
+        if args.read_mlp_base and args.engine_replicas:
+            raise SystemExit("[error] --read-mlp-base runs the plain PT walk; the engine "
+                             "forward knows nothing about it")
         # bf16 on the HOST first — see the same note in train_cli._build_student.
         student = student.to(torch.bfloat16).to(torch.cuda.current_device())
         student.eval()
+        if args.read_mlp_base:
+            from parallm.model.mlp_read import load_mlp_read_base
+            from parallm.utils.layers import format_layers
+
+            _hbm0 = torch.cuda.memory_allocated()
+            try:
+                _base = load_mlp_read_base(
+                    args.read_mlp_base, None, student.local_track_ids, student.global_tracks,
+                    torch.cuda.current_device(), compress=args.read_mlp_compress,
+                    stats=args.read_mlp_stats)
+                if args.read_mlp_fold:
+                    _base.bind_fold(student, args.read_mlp_fold, stats=args.read_mlp_stats,
+                                    norm_c=args.read_mlp_fold_c)
+                student.set_mlp_read(_base)
+            except ValueError as e:
+                raise SystemExit(f"[error] --read-mlp-base: {e}")
+            _ledger = (f"ledger {_base.ledger_bytes / 2**30:.3f} GiB ({_base.spec}), "
+                       if _base.ledger_bytes is not None else "")
+            _log(rank, f"[init] mlp read: r{_base.rank} over {format_layers(_base.layer_ids)} "
+                       f"from {args.read_mlp_base} — {_ledger}stored "
+                       f"{_base.stored_bytes() / 2**30:.3f} GiB, one copy shared by this rank's "
+                       f"{len(student.local_track_ids)} track(s); resident "
+                       f"{(torch.cuda.memory_allocated() - _hbm0) / 2**30:.3f} GiB")
         if args.read_attn_replica:
             from parallm.model.attn_replica import fold_spec, load_replica, replica_memory
 

@@ -163,9 +163,10 @@ def test_slim_samples_keeps_what_is_read_back():
     out = slim_samples(res)
 
     assert set(out["samples"]["arc_easy"][0]) == {"doc_id", "target", "metrics",
-                                                  "acc", "acc_norm"}
-    # paired_macro.py reads these two by name.
+                                                  "acc", "acc_norm", "ll"}
+    # paired_macro.py reads these two by name; letter_kl.py reads `ll`.
     assert [(r["doc_id"], r["acc"]) for r in out["samples"]["arc_easy"]] == [(0, 1.0), (1, 0.0)]
+    assert out["samples"]["arc_easy"][0]["ll"] == [-13.4, -1.1]
     assert out["results"] == res["results"]
     assert res["samples"]["arc_easy"][0]["doc"], "the caller's dict was mutated"
 

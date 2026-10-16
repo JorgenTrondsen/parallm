@@ -104,15 +104,34 @@ _DROP_SAMPLE_FIELDS = frozenset(
 )
 
 
+def _option_logliks(rec: dict) -> "list[float] | None":
+    """A multiple-choice sample's per-option loglikelihoods (``filtered_resps`` holds
+    ``[loglik, is_greedy]`` per option); None for anything else, e.g. a generation."""
+    fr = rec.get("filtered_resps")
+    if not isinstance(fr, list) or not fr:
+        return None
+    if not all(isinstance(o, (list, tuple)) and o and isinstance(o[0], (int, float)) for o in fr):
+        return None
+    return [float(o[0]) for o in fr]
+
+
 def slim_samples(results: "dict | None") -> "dict | None":
-    """``results`` with each sample cut to doc_id, target and its metrics: 13.9 MB -> 0.6 MB.
+    """``results`` with each sample cut to doc_id, target, its metrics and — for a
+    multiple-choice task — ``ll``, the per-option loglikelihoods (`scripts/letter_kl.py`):
+    13.9 MB -> 0.7 MB.
 
     Everything dropped is recomputed by re-running the eval. Shape is unchanged, so
     `scripts/paired_macro.py` reads old and new dumps alike.
     """
     if not results or not results.get("samples"):
         return results
+
+    def slim(rec):
+        out = {k: v for k, v in rec.items() if k not in _DROP_SAMPLE_FIELDS}
+        if (ll := _option_logliks(rec)) is not None:
+            out["ll"] = ll
+        return out
+
     return dict(results, samples={
-        task: [{k: v for k, v in rec.items() if k not in _DROP_SAMPLE_FIELDS} for rec in recs]
-        for task, recs in results["samples"].items()
+        task: [slim(rec) for rec in recs] for task, recs in results["samples"].items()
     })
